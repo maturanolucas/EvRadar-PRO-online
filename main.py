@@ -21,15 +21,8 @@ logging.basicConfig(
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 if not API_FOOTBALL_KEY:
     logging.error("API_FOOTBALL_KEY não configurada. Defina no ambiente.")
-    # não damos exit aqui para permitir rodar sem API em ambiente de teste
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-if not TELEGRAM_BOT_TOKEN:
-    try:
-        TELEGRAM_BOT_TOKEN = input("Digite seu TELEGRAM_BOT_TOKEN (do BotFather) e pressione ENTER: ").strip()
-    except EOFError:
-        TELEGRAM_BOT_TOKEN = ""
-
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 BANKROLL_INITIAL = float(os.getenv("BANKROLL_INITIAL", "5000"))
@@ -117,7 +110,7 @@ def is_fixture_allowed(fx: Dict[str, Any]) -> bool:
         except (TypeError, ValueError):
             return False
 
-    # 2) proteção extra contra ligas bizarras
+    # 2) proteção extra contra ligas que você não quer
     for kw in BLOCKED_KEYWORDS:
         if kw in league_name:
             return False
@@ -537,7 +530,7 @@ async def post_init(application: Application) -> None:
         application.create_task(auto_scan_loop(application))
 
 
-async def main() -> None:
+def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logging.error("TELEGRAM_BOT_TOKEN não definido. Encerrando.")
         return
@@ -556,8 +549,9 @@ async def main() -> None:
     application.add_handler(CommandHandler("links", cmd_links))
 
     logging.info("Iniciando bot do EvRadar PRO...")
-    await application.run_polling(close_loop=False)
+    # IMPORTANTE: sem asyncio.run aqui, deixa a lib cuidar do loop
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
