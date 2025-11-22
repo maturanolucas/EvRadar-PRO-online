@@ -861,7 +861,7 @@ async def post_init(application: Application) -> None:
 # MAIN
 # =========================
 
-async def main_async() -> None:
+def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -886,22 +886,8 @@ async def main_async() -> None:
     application.bot_data["model"] = model
     application.bot_data["cooldowns"] = {}
 
-    # Handlers
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("scan", cmd_scan))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("debug", cmd_debug))
-    application.add_handler(CommandHandler("links", cmd_links))
-
     logging.info("Iniciando bot do EvRadar PRO...")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-def main() -> None:
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        print("Encerrado pelo usuário.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
