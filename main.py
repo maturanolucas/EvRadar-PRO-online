@@ -164,6 +164,46 @@ BLOCKED_LEAGUE_KEYWORDS = [
     "liga classic",
     "promotion",
     "3. liga",
+    "regionalliga",
+    "tercera división",
+    "tercera division",
+    "tercera divisio",
+    "rfe f",
+]
+
+# Ligas prioritárias (nacionais fortes + principais copas)
+ALLOWED_LEAGUE_NAME_KEYWORDS = [
+    "serie a",
+    "serie b",
+    "bundesliga",
+    "premier league",
+    "la liga",
+    "laliga",
+    "ligue 1",
+    "eredivisie",
+    "primeira liga",
+    "liga portugal",
+    "brasileirão",
+    "brasil serie a",
+    "brasil série a",
+    "brasil serie b",
+    "brasil série b",
+    "championship",
+    "champions league",
+    "europa league",
+    "conference league",
+    "libertadores",
+    "sudamericana",
+    "copa do brasil",
+    "copa del rey",
+    "dfb pokal",
+    "fa cup",
+    "coppa italia",
+    "taça de portugal",
+    "taca de portugal",
+    "world cup",
+    "euro",
+    "nations league",
 ]
 
 
@@ -319,6 +359,68 @@ async def fetch_live_fixtures(cfg: Config, client: httpx.AsyncClient) -> List[Di
         return []
 
 
+async def fetch_fixture_over_odd(cfg: Config, client: httpx.AsyncClient, m: MatchStats) -> Optional[float]:
+    """
+    Busca a odd real de Over (soma + 0,5) via API-FOOTBALL para o fixture.
+    Se USE_API_FOOTBALL_ODDS estiver desligado ou der erro, retorna None.
+    """
+    if not (cfg.use_api_football_odds and cfg.bookmaker_id and cfg.api_football_key):
+        return None
+
+    headers = {"x-apisports-key": cfg.api_football_key}
+    url = f"https://v3.football.api-sports.io/odds?fixture={m.fixture_id}&bookmaker={cfg.bookmaker_id}"
+
+    desired_line = m.goals_home + m.goals_away + 0.5
+
+    try:
+        resp = await client.get(url, headers=headers, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logging.error("Erro ao buscar odds para fixture %s: %s", m.fixture_id, exc)
+        return None
+
+    response_list = data.get("response") or []
+    if not response_list:
+        return None
+
+    entry = response_list[0]
+    bookmakers = entry.get("bookmakers") or []
+
+    for bm in bookmakers:
+        bets = bm.get("bets") or []
+        for bet in bets:
+            name = (bet.get("name") or "").lower()
+            # focar em mercados de totais / over/under
+            if not any(key in name for key in ["over", "under", "total", "goals"]):
+                continue
+
+            values = bet.get("values") or []
+            for v in values:
+                label = (v.get("value") or "").lower()  # ex: "Over 2.5"
+                if not label.startswith("over"):
+                    continue
+                parts = label.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    line = float(parts[-1].replace(",", "."))
+                except ValueError:
+                    continue
+
+                if abs(line - desired_line) > 1e-6:
+                    continue
+
+                odd_str = str(v.get("odd") or "").replace(",", ".")
+                try:
+                    odd_val = float(odd_str)
+                except ValueError:
+                    continue
+                return odd_val
+
+    return None
+
+
 def parse_match(entry: Dict[str, Any]) -> Optional[MatchStats]:
     fixture = entry.get("fixture") or {}
     league = entry.get("league") or {}
@@ -368,9 +470,15 @@ def league_is_allowed(cfg: Config, m: MatchStats) -> bool:
         return False
 
     lname = m.league_name.lower()
+
+    # bloqueios explícitos (base, reservas, etc.)
     for kw in BLOCKED_LEAGUE_KEYWORDS:
         if kw in lname:
             return False
+
+    # exige que seja liga/copa relevante
+    if not any(kw in lname for kw in ALLOWED_LEAGUE_NAME_KEYWORDS):
+        return False
 
     return True
 
@@ -565,20 +673,21 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with httpx.AsyncClient() as client:
         fixtures = await fetch_live_fixtures(cfg, client)
 
-    signals: List[CandidateSignal] = []
+        signals: List[CandidateSignal] = []
 
-    for entry in fixtures:
-        m = parse_match(entry)
-        if not m:
-            continue
-        if not minute_in_window(cfg, m.minute):
-            continue
-        if not league_is_allowed(cfg, m):
-            continue
+        for entry in fixtures:
+            m = parse_match(entry)
+            if not m:
+                continue
+            if not minute_in_window(cfg, m.minute):
+                continue
+            if not league_is_allowed(cfg, m):
+                continue
 
-        sig = model.evaluate_match(m, current_odd=None)
-        if sig:
-            signals.append(sig)
+            current_odd = await fetch_fixture_over_odd(cfg, client, m)
+            sig = model.evaluate_match(m, current_odd)
+            if sig:
+                signals.append(sig)
 
     state = get_bot_state(app)
     if "bets" not in state:
@@ -698,7 +807,8 @@ async def autoscan_loop(app: Application) -> None:
                     if not league_is_allowed(cfg, m):
                         continue
 
-                    sig = model.evaluate_match(m, current_odd=None)
+                    current_odd = await fetch_fixture_over_odd(cfg, client, m)
+                    sig = model.evaluate_match(m, current_odd)
                     if sig:
                         signals.append(sig)
 
