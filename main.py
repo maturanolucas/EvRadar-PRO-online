@@ -19,9 +19,6 @@ logging.basicConfig(
 )
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
-if not API_FOOTBALL_KEY:
-    logging.error("API_FOOTBALL_KEY não configurada. Defina no ambiente.")
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -32,7 +29,7 @@ WINDOW_END = int(os.getenv("WINDOW_END", "75"))
 
 MIN_ODD = float(os.getenv("MIN_ODD", "1.47"))
 MAX_ODD = float(os.getenv("MAX_ODD", "2.30"))
-EV_MIN_PCT = float(os.getenv("EV_MIN_PCT", "1.60"))  # em % (1.60 = 1,6%)
+EV_MIN_PCT = float(os.getenv("EV_MIN_PCT", "1.60"))  # em %
 
 AUTOSTART = os.getenv("AUTOSTART", "0") == "1"
 CHECK_INTERVAL_MS = int(os.getenv("CHECK_INTERVAL", "1500"))
@@ -93,7 +90,7 @@ LAST_DEBUG_TEXT: str = "Sem debug ainda."
 
 
 # ============================================================
-# Núcleo do EvRadar PRO
+# Núcleo do EvRadar PRO – “cérebro” online
 # ============================================================
 
 
@@ -102,7 +99,7 @@ def is_fixture_allowed(fx: Dict[str, Any]) -> bool:
     league_id = league.get("id")
     league_name = (league.get("name") or "").lower()
 
-    # 1) whitelist de LEAGUE_IDS
+    # 1) whitelist de LEAGUE_IDS (grandes ligas)
     if ALLOWED_LEAGUE_IDS:
         try:
             if int(league_id) not in ALLOWED_LEAGUE_IDS:
@@ -110,34 +107,12 @@ def is_fixture_allowed(fx: Dict[str, Any]) -> bool:
         except (TypeError, ValueError):
             return False
 
-    # 2) proteção extra contra ligas que você não quer
+    # 2) proteção extra contra U19, reservas, feminino etc.
     for kw in BLOCKED_KEYWORDS:
         if kw in league_name:
             return False
 
     return True
-
-
-def estimate_goal_prob(minute: int, goals_total: int) -> float:
-    """
-    Heurística simples para probabilidade de sair +1 gol até o fim.
-    p = 1 - exp(-lambda), onde lambda depende do tempo restante e dos gols.
-    """
-    if minute is None:
-        return 0.0
-
-    minute = max(0, min(90, minute))
-    time_left = max(0, 90 - minute)
-
-    # base: quanto menos tempo, menor lambda
-    base_lambda = 0.03 * time_left
-    # jogo mais aberto → aumenta lambda
-    base_lambda += 0.28 * goals_total
-
-    base_lambda = max(0.05, min(base_lambda, 4.0))
-    p = 1.0 - math.exp(-base_lambda)
-    p = max(0.05, min(0.99, p))
-    return p
 
 
 def calcular_ev(prob_final: float, odd: float) -> float:
@@ -146,18 +121,29 @@ def calcular_ev(prob_final: float, odd: float) -> float:
 
 
 def sugerir_stake_pct(ev_pct: float) -> float:
-    """Tiering de stake aproximado em % da banca."""
+    """
+    Tier de stake aproximado, baseado no que combinamos:
+    - EV ≥ 7% → ~3% da banca
+    - 5–7%   → ~2.5%
+    - 3–5%   → ~2.0%
+    - 1.5–3% → ~1.25%
+    - <1.5%  → 1.0% (se ainda passar pelo EV_MIN_PCT)
+    """
     if ev_pct >= 7.0:
         return 3.0
     if ev_pct >= 5.0:
         return 2.5
+    if ev_pct >= 3.0:
+        return 2.0
     if ev_pct >= 1.5:
-        return 1.5
+        return 1.25
     return 1.0
 
 
-def montar_comentario_curto(minute: int, goals_home: int, goals_away: int) -> str:
+def montar_comentario_curto(minute: int, goals_home: int, goals_away: int, pressure_idx: float) -> str:
     total_gols = goals_home + goals_away
+    if pressure_idx >= 7.5 and total_gols >= 2:
+        return "pressão alta, jogo muito aberto e com espaço para pelo menos mais 1 gol."
     if minute < 55 and total_gols == 0:
         return "jogo começa a ganhar ritmo agora, ainda com tempo confortável para sair 1 gol."
     if total_gols == 0:
@@ -166,6 +152,8 @@ def montar_comentario_curto(minute: int, goals_home: int, goals_away: int) -> st
         return "partida mais aberta após o gol, cenário bom para mais uma chegada perigosa virar gol."
     if total_gols >= 3:
         return "jogo totalmente aberto, defesas expostas e ritmo alto favorecendo mais um gol."
+    if pressure_idx >= 6.0:
+        return "volume ofensivo interessante, com chegadas constantes sugerindo boa chance de 1 gol a mais."
     return "ritmo e contexto indicam boa chance de 1 gol a mais dentro da janela."
 
 
@@ -212,12 +200,7 @@ async def fetch_fixture_odd(fixture_id: int, line: float) -> Optional[float]:
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
     url = "https://v3.football.api-sports.io/odds"
-
-    params = {
-        "fixture": fixture_id,
-        "bookmaker": BOOKMAKER_ID,
-        "bet": 5,  # Over/Under FT
-    }
+    params = {"fixture": fixture_id, "bookmaker": BOOKMAKER_ID, "bet": 5}  # Over/Under FT
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -232,8 +215,7 @@ async def fetch_fixture_odd(fixture_id: int, line: float) -> Optional[float]:
     for resp in data.get("response", []) or []:
         for book in resp.get("bookmakers", []) or []:
             for bet in book.get("bets", []) or []:
-                bet_id = bet.get("id")
-                if str(bet_id) != "5":
+                if str(bet.get("id")) != "5":
                     continue
                 for val in bet.get("values", []) or []:
                     label = (val.get("value") or "").lower()
@@ -246,6 +228,87 @@ async def fetch_fixture_odd(fixture_id: int, line: float) -> Optional[float]:
                         except ValueError:
                             continue
     return None
+
+
+async def fetch_pressure_index(fixture_id: int) -> float:
+    """
+    Usa /fixtures/statistics da API-Football para montar um índice de pressão 0–10
+    baseado em chutes no gol e ataques perigosos.
+    """
+    if not API_FOOTBALL_KEY:
+        return 5.0
+
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    url = "https://v3.football.api-sports.io/fixtures/statistics"
+    params = {"fixture": fixture_id}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logging.exception("Erro ao buscar estatísticas do fixture %s: %s", fixture_id, e)
+            return 5.0
+
+    sog_total = 0.0
+    da_total = 0.0
+
+    for entry in data.get("response", []) or []:
+        stats = entry.get("statistics") or []
+        for s in stats:
+            name = (s.get("type") or "").lower()
+            val = s.get("value")
+            if val is None:
+                continue
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                continue
+
+            if "shots on goal" in name or "shots on target" in name:
+                sog_total += num
+            elif "dangerous attacks" in name:
+                da_total += num
+
+    if sog_total == 0 and da_total == 0:
+        return 5.0  # neutro se não vier estatística
+
+    # Heurística: mais chutes/ataques → maior índice
+    idx = 0.6 * sog_total + (da_total / 8.0)
+    idx = max(0.0, min(idx, 12.0))
+    idx = (idx / 12.0) * 10.0  # normaliza para 0–10
+    return idx
+
+
+def estimate_goal_prob_advanced(minute: int, goals_total: int, pressure_idx: float) -> float:
+    """
+    Versão “parruda” do modelo:
+    - base no tempo restante
+    - mais gols → mais lambda
+    - pressão (0–10) amplificando ou reduzindo
+    """
+    if minute is None:
+        return 0.0
+    minute = max(0, min(90, minute))
+    time_left = max(0, 90 - minute)
+
+    # base lambda: tempo + gols
+    base_lambda = 0.018 * time_left + 0.23 * goals_total
+
+    # fator de pressão: 5 é neutro, >5 aumenta, <5 diminui
+    pressure_factor = 1.0 + 0.07 * (pressure_idx - 5.0) / 5.0
+    pressure_factor = max(0.6, min(1.6, pressure_factor))
+    base_lambda *= pressure_factor
+
+    # penaliza 0x0 morno nos minutos finais
+    if time_left <= 8 and goals_total == 0 and pressure_idx < 5.0:
+        base_lambda *= 0.7
+
+    base_lambda = max(0.03, min(base_lambda, 4.0))
+    p = 1.0 - math.exp(-base_lambda)
+    p = max(0.05, min(0.99, p))
+    return p
 
 
 async def gerar_candidatos() -> List[Dict[str, Any]]:
@@ -270,15 +333,17 @@ async def gerar_candidatos() -> List[Dict[str, Any]]:
             away_goals = goals.get("away") or 0
             total_goals = (home_goals or 0) + (away_goals or 0)
 
-            # SUM_PLUS_HALF: linha = placar total + 0,5
+            # SUM_PLUS_HALF: sempre soma do placar + 0,5
             line_total = float(total_goals) + 0.5
 
-            # Probabilidade de 1 gol a mais (modelo simplificado)
-            p_final = estimate_goal_prob(minute, total_goals)
+            # Índice de pressão (0–10) a partir de estatísticas
+            pressure_idx = await fetch_pressure_index(fixture_info.get("id"))
+
+            # Probabilidade de 1 gol a mais (modelo parrudo)
+            p_final = estimate_goal_prob_advanced(minute, total_goals, pressure_idx)
             odd_justa = 1.0 / max(p_final, 1e-6)
 
             # Odd real de mercado
-            odd_mercado: Optional[float] = None
             if USE_API_FOOTBALL_ODDS:
                 odd_mercado = await fetch_fixture_odd(fixture_info.get("id"), line_total)
                 if odd_mercado is None:
@@ -302,8 +367,7 @@ async def gerar_candidatos() -> List[Dict[str, Any]]:
             away_name = (teams.get("away") or {}).get("name") or "Time visitante"
             league_name = league.get("name") or "Liga"
 
-            comentario = montar_comentario_curto(minute, home_goals or 0, away_goals or 0)
-
+            comentario = montar_comentario_curto(minute, home_goals or 0, away_goals or 0, pressure_idx)
             tier = "Tier A — Sinal EvRadar PRO"
 
             candidatos.append(
@@ -323,6 +387,7 @@ async def gerar_candidatos() -> List[Dict[str, Any]]:
                     "ev_pct": ev_pct,
                     "stake_pct": stake_pct,
                     "stake_reais": stake_reais,
+                    "pressure_idx": pressure_idx,
                     "comentario": comentario,
                     "tier": tier,
                 }
@@ -379,6 +444,9 @@ def formatar_alerta(cand: Dict[str, Any]) -> str:
         "🧩 Interpretação:",
         cand["comentario"],
         "",
+        "📈 Pressão (0–10): "
+        + f"{cand['pressure_idx']:.1f}",
+        "",
         "🔗 Abrir evento ("
         + BOOKMAKER_NAME
         + ") ("
@@ -404,10 +472,7 @@ async def executar_scan(origin: str = "manual") -> Dict[str, Any]:
     LAST_STATUS_TEXT = resumo
     LAST_DEBUG_TEXT = resumo + " Detalhes internos não logados aqui."
 
-    return {
-        "candidatos": candidatos,
-        "resumo": resumo,
-    }
+    return {"candidatos": candidatos, "resumo": resumo}
 
 
 # ============================================================
@@ -424,6 +489,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + f"{MIN_ODD:.2f}–{MAX_ODD:.2f}\n"
         + "EV mínimo: "
         + f"{EV_MIN_PCT:.2f}%\n"
+        + "Modelo: v0.2 Railway (pressão+EV).\n"
         + "Cooldown/global: baseado no intervalo de varredura.\n\n"
         "Comandos:\n"
         "  /scan   → rodar varredura agora\n"
@@ -549,7 +615,7 @@ def main() -> None:
     application.add_handler(CommandHandler("links", cmd_links))
 
     logging.info("Iniciando bot do EvRadar PRO...")
-    # IMPORTANTE: sem asyncio.run aqui, deixa a lib cuidar do loop
+    # Importante: sem asyncio.run aqui; a lib cuida do loop
     application.run_polling()
 
 
