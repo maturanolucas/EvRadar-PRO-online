@@ -15,15 +15,6 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ============================================================
-#  EvRadar PRO — Bot Telegram + API-FOOTBALL (versão compacta)
-#  Tudo em um arquivo só (main.py), focado em:
-#   - Varredura manual (/scan) e automática (AUTOSTART)
-#   - Filtro de ligas por LEAGUE_IDS (feito APENAS no Python)
-#   - Janela de minutos, faixa de odds, EV mínimo simples
-#  IMPORTANTE: o modelo de probabilidade é simples (tempo + gols).
-# ============================================================
-
 API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 
 
@@ -42,17 +33,21 @@ class Config:
     ev_min_pct: float
     cooldown_minutes: float
     league_ids: Set[int]
+    bookmaker_id: int
     bookmaker_name: str
     bookmaker_url: str
     use_api_football_odds: bool
+    bankroll_initial: float
+    kelly_fraction: float
+    stake_max_pct: float
 
 
-# Estado global simples (para evitar banco por enquanto)
 CONFIG: Optional[Config] = None
 HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 LAST_SUMMARY: str = "Ainda não houve nenhum scan."
 LAST_DEBUG_INFO: str = ""
 LAST_ALERT_TS_BY_FIXTURE: Dict[int, float] = {}
+BANKROLL_STATE: Dict[str, float] = {"current": 0.0}
 SCAN_LOCK = asyncio.Lock()
 
 
@@ -113,17 +108,22 @@ def load_config() -> Config:
     window_end = _parse_int(_get_env("WINDOW_END", "75"), 75)
 
     min_odd = _parse_float(_get_env("MIN_ODD", "1.47"), 1.47)
-    max_odd = _parse_float(_get_env("MAX_ODD", "2.30"), 2.30)
+    max_odd = _parse_float(_get_env("MAX_ODD", "3.50"), 3.50)
     target_odd = _parse_float(_get_env("TARGET_ODD", "1.70"), 1.70)
 
-    ev_min_pct = _parse_float(_get_env("EV_MIN_PCT", "1.60"), 1.60)
+    ev_min_pct = _parse_float(_get_env("EV_MIN_PCT", "4.00"), 4.00)
     cooldown_minutes = _parse_float(_get_env("COOLDOWN_MINUTES", "6"), 6.0)
 
     league_ids = _parse_league_ids(_get_env("LEAGUE_IDS", ""))
 
+    bookmaker_id = _parse_int(_get_env("BOOKMAKER_ID", "34"), 34)
     bookmaker_name = _get_env("BOOKMAKER_NAME", "Superbet")
     bookmaker_url = _get_env("BOOKMAKER_URL", "https://www.superbet.com/")
-    use_odds = _parse_bool(_get_env("USE_API_FOOTBALL_ODDS", "0"), default=False)
+    use_odds = _parse_bool(_get_env("USE_API_FOOTBALL_ODDS", "1"), default=True)
+
+    bankroll_initial = _parse_float(_get_env("BANKROLL_INITIAL", "5000"), 5000.0)
+    kelly_fraction = _parse_float(_get_env("KELLY_FRACTION", "0.5"), 0.5)
+    stake_max_pct = _parse_float(_get_env("STAKE_MAX_PCT", "3.0"), 3.0)
 
     cfg = Config(
         api_key=api_key,
@@ -139,12 +139,19 @@ def load_config() -> Config:
         ev_min_pct=ev_min_pct,
         cooldown_minutes=cooldown_minutes,
         league_ids=league_ids,
+        bookmaker_id=bookmaker_id,
         bookmaker_name=bookmaker_name,
         bookmaker_url=bookmaker_url,
         use_api_football_odds=use_odds,
+        bankroll_initial=bankroll_initial,
+        kelly_fraction=kelly_fraction,
+        stake_max_pct=stake_max_pct,
     )
 
+    BANKROLL_STATE["current"] = bankroll_initial
+
     logging.info("Config carregada: %s", cfg)
+    logging.info("Bankroll inicial definido em: %.2f", bankroll_initial)
     return cfg
 
 
@@ -176,17 +183,73 @@ async def api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
 
 
 async def fetch_live_fixtures() -> List[Dict[str, Any]]:
-    """
-    Busca TODOS os jogos ao vivo e o filtro de ligas é feito
-    SOMENTE aqui no Python usando CONFIG.league_ids.
-    Isso evita quebrar a API com parâmetro league inválido
-    e evita radar mudo por query errada.
-    """
     data = await api_get("/fixtures", params={"live": "all"})
     fixtures = data.get("response", []) or []
     if not isinstance(fixtures, list):
         return []
     return fixtures
+
+
+async def fetch_fixture_stats(fixture_id: int) -> Dict[str, Any]:
+    data = await api_get("/fixtures/statistics", params={"fixture": fixture_id})
+    resp = data.get("response", []) or []
+    stats_map: Dict[str, Dict[str, float]] = {}
+    for team_block in resp:
+        team = (team_block.get("team") or {}).get("name") or ""
+        stats_list = team_block.get("statistics") or []
+        stat_dict: Dict[str, float] = {}
+        for s in stats_list:
+            t = s.get("type")
+            v = s.get("value")
+            if t is None or v is None:
+                continue
+            try:
+                if isinstance(v, (int, float)):
+                    stat_dict[t] = float(v)
+                elif isinstance(v, str) and v.endswith("%"):
+                    num = float(v.strip().replace("%", ""))
+                    stat_dict[t] = num
+                else:
+                    num = float(v)
+                    stat_dict[t] = num
+            except Exception:
+                continue
+        if team:
+            stats_map[team] = stat_dict
+    return stats_map
+
+
+async def fetch_fixture_odds(fixture_id: int, bookmaker_id: int) -> Optional[float]:
+    """
+    Tenta pegar odd de Over 0.5 gols no mercado de Over/Under.
+    Se não achar, retorna None e usamos TARGET_ODD.
+    """
+    data = await api_get("/odds", params={"fixture": fixture_id, "bookmaker": bookmaker_id})
+    resp = data.get("response", []) or []
+    best_over_05: Optional[float] = None
+    for item in resp:
+        bookies = item.get("bookmakers") or []
+        for b in bookies:
+            bets = b.get("bets") or []
+            for bet in bets:
+                name = (bet.get("name") or "").lower()
+                if "over/under" not in name and "total goals" not in name:
+                    continue
+                values = bet.get("values") or []
+                for v in values:
+                    val_handicap = (v.get("value") or "").lower()
+                    try:
+                        if "0.5" not in val_handicap:
+                            continue
+                        odd_str = v.get("odd")
+                        if odd_str is None:
+                            continue
+                        odd = float(odd_str)
+                        if best_over_05 is None or odd > best_over_05:
+                            best_over_05 = odd
+                    except Exception:
+                        continue
+    return best_over_05
 
 
 def _extract_fixture_core(fx: Dict[str, Any]) -> Tuple[int, str, str, str, int, int, int]:
@@ -217,11 +280,72 @@ def _extract_fixture_core(fx: Dict[str, Any]) -> Tuple[int, str, str, str, int, 
     )
 
 
-def _model_probability(minute: int, total_goals: int) -> float:
+def _safe_get_stat(stats_map: Dict[str, Dict[str, float]], team: str, key: str) -> float:
+    team_stats = stats_map.get(team) or {}
+    return float(team_stats.get(key) or 0.0)
+
+
+def _compute_pressao_index(
+    minute: int,
+    home_team: str,
+    away_team: str,
+    total_goals: int,
+    stats_map: Dict[str, Dict[str, float]],
+) -> Tuple[float, str]:
     """
-    Modelo simples de probabilidade de sair +1 gol até os 90'.
-    Usa apenas tempo e total de gols. Não é o modelo parrudo,
-    mas já cria uma noção de valor.
+    Retorna (pressao_0_10, time_atacando)
+    Usa chutes, chutes no alvo, ataques perigosos e posse.
+    """
+    home_shots = _safe_get_stat(stats_map, home_team, "Total Shots")
+    away_shots = _safe_get_stat(stats_map, away_team, "Total Shots")
+
+    home_shots_ot = _safe_get_stat(stats_map, home_team, "Shots on Goal")
+    away_shots_ot = _safe_get_stat(stats_map, away_team, "Shots on Goal")
+
+    home_danger = _safe_get_stat(stats_map, home_team, "Dangerous Attacks")
+    away_danger = _safe_get_stat(stats_map, away_team, "Dangerous Attacks")
+
+    home_poss = _safe_get_stat(stats_map, home_team, "Ball Possession")
+    away_poss = _safe_get_stat(stats_map, away_team, "Ball Possession")
+
+    home_score = (
+        home_shots * 0.15
+        + home_shots_ot * 0.4
+        + home_danger * 0.08
+        + home_poss * 0.03
+    )
+    away_score = (
+        away_shots * 0.15
+        + away_shots_ot * 0.4
+        + away_danger * 0.08
+        + away_poss * 0.03
+    )
+
+    diff = home_score - away_score
+    if diff > 0:
+        atk_team = home_team
+    elif diff < 0:
+        atk_team = away_team
+    else:
+        atk_team = home_team
+
+    max_abs = max(abs(home_score), abs(away_score), 1.0)
+    pressao_raw = abs(diff) / max_abs
+    pressao_scaled = max(0.0, min(10.0, pressao_raw * 10.0))
+
+    return pressao_scaled, atk_team
+
+
+def _model_probability_advanced(
+    minute: int,
+    total_goals: int,
+    pressao: float,
+    news_boost: float,
+) -> float:
+    """
+    Modelo WR+:
+    - Base: tempo + total de gols
+    - Multiplicadores: pressão (0–10) e news_boost (-2..+2)
     """
     minutes_left = max(0, 90 - minute)
     base_lambda = 0.035
@@ -231,9 +355,17 @@ def _model_probability(minute: int, total_goals: int) -> float:
     elif total_goals == 1:
         base_lambda *= 1.05
     elif total_goals == 2:
-        base_lambda *= 1.15
+        base_lambda *= 1.20
     else:
-        base_lambda *= 1.25
+        base_lambda *= 1.35
+
+    pressao_factor = 1.0 + (pressao - 5.0) * 0.05
+    pressao_factor = max(0.75, min(1.25, pressao_factor))
+    base_lambda *= pressao_factor
+
+    nb_factor = 1.0 + news_boost * 0.075
+    nb_factor = max(0.7, min(1.3, nb_factor))
+    base_lambda *= nb_factor
 
     if minutes_left <= 0:
         return 0.0
@@ -243,12 +375,26 @@ def _model_probability(minute: int, total_goals: int) -> float:
     return p
 
 
+def _kelly_stake_pct(p: float, odd: float, frac: float, stake_max_pct: float) -> float:
+    if odd <= 1.0:
+        return 0.0
+    q = 1.0 - p
+    edge = p * (odd - 1.0) - q
+    if edge <= 0:
+        return 0.0
+    f_star = edge / (odd - 1.0)
+    stake_pct = max(0.0, f_star * frac * 100.0)
+    if stake_pct > stake_max_pct:
+        stake_pct = stake_max_pct
+    return stake_pct
+
+
 def _classify_tier(ev_pct: float) -> str:
     if ev_pct >= 7.0:
         return "Tier A — Sinal muito forte"
-    if ev_pct >= 4.0:
+    if ev_pct >= 5.0:
         return "Tier B — Sinal forte"
-    if ev_pct >= 2.0:
+    if ev_pct >= 3.0:
         return "Tier C — Sinal moderado"
     return "Sinal fraco"
 
@@ -268,57 +414,78 @@ async def evaluate_fixture(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         total_goals,
     ) = _extract_fixture_core(fx)
 
-    # Filtro de ligas (feito apenas aqui, NÃO na URL)
     if CONFIG.league_ids and league_id not in CONFIG.league_ids:
         return None
 
-    # Janela de minutos (2º tempo padrão 47–75)
     if minute < CONFIG.window_start or minute > CONFIG.window_end:
         return None
 
-    # Cooldown por jogo (evita spam)
     now_ts = time.time()
     last_ts = LAST_ALERT_TS_BY_FIXTURE.get(fixture_id, 0)
     if now_ts - last_ts < CONFIG.cooldown_minutes * 60.0:
-        logging.debug(
-            "Ignorando fixture %s por cooldown (%.1fs restante)",
-            fixture_id,
-            CONFIG.cooldown_minutes * 60.0 - (now_ts - last_ts),
-        )
         return None
 
-    # Modelo simples de probabilidade
-    p_goal = _model_probability(minute, total_goals)
+    stats_map = await fetch_fixture_stats(fixture_id)
+    pressao, atk_team = _compute_pressao_index(
+        minute=minute,
+        home_team=home_team,
+        away_team=away_team,
+        total_goals=total_goals,
+        stats_map=stats_map,
+    )
 
-    # Odd usada para o cálculo de EV:
-    # - se no futuro integrar odds reais da API_FOOTBALL, encaixa aqui
+    news_boost = 0.0  # placeholder pra camada de notícias no futuro
+
+    p_goal = _model_probability_advanced(
+        minute=minute,
+        total_goals=total_goals,
+        pressao=pressao,
+        news_boost=news_boost,
+    )
+
     odd = CONFIG.target_odd
-    if odd <= 1.0:
+    if CONFIG.use_api_football_odds:
+        live_odd = await fetch_fixture_odds(fixture_id, CONFIG.bookmaker_id)
+        if live_odd is not None:
+            odd = live_odd
+
+    if odd <= 1.01:
+        return None
+
+    if odd < CONFIG.min_odd or odd > CONFIG.max_odd:
         return None
 
     ev = p_goal * odd - 1.0
     ev_pct = ev * 100.0
-
     if ev_pct < CONFIG.ev_min_pct:
-        return None
-
-    # Respeita faixa de odds "esperada"
-    if odd < CONFIG.min_odd or odd > CONFIG.max_odd:
         return None
 
     LAST_ALERT_TS_BY_FIXTURE[fixture_id] = now_ts
 
-    return {
+    stake_pct = _kelly_stake_pct(
+        p=p_goal,
+        odd=odd,
+        frac=CONFIG.kelly_fraction,
+        stake_max_pct=CONFIG.stake_max_pct,
+    )
+    stake_brl = BANKROLL_STATE["current"] * (stake_pct / 100.0)
+
+    event = {
         "fixture_id": fixture_id,
         "league_name": league_name,
         "home_team": home_team,
         "away_team": away_team,
         "minute": minute,
         "total_goals": total_goals,
+        "pressao": pressao,
+        "atk_team": atk_team,
         "p_goal": p_goal,
         "odd": odd,
         "ev_pct": ev_pct,
+        "stake_pct": stake_pct,
+        "stake_brl": stake_brl,
     }
+    return event
 
 
 def format_alert(event: Dict[str, Any]) -> str:
@@ -331,8 +498,13 @@ def format_alert(event: Dict[str, Any]) -> str:
     fair_odd = 1.0 / max(1e-6, event["p_goal"])
 
     tier_label = _classify_tier(event["ev_pct"])
-
     header = tier_label
+
+    stake_pct = event["stake_pct"]
+    stake_brl = event["stake_brl"]
+
+    pressao_txt = f"{event['pressao']:.1f}/10"
+    quem_aperta = event["atk_team"]
 
     linhas = [
         f"🔔 {header}",
@@ -343,20 +515,33 @@ def format_alert(event: Dict[str, Any]) -> str:
         "",
         "📊 Probabilidade & valor:",
         f"- P_final (gol a mais): {prob_pct:.1f}%",
-        f"- Odd justa (modelo simples): {fair_odd:.2f}",
-        f"- Odd usada no cálculo: {event['odd']:.2f}",
+        f"- Odd justa (modelo WR+): {fair_odd:.2f}",
+        f"- Odd do momento (usada): {event['odd']:.2f}",
         f"- EV estimado: {event['ev_pct']:.2f}%",
         "",
-        "💰 Interpretação:",
-        "Jogo dentro da janela, com probabilidade interessante de sair mais 1 gol.",
-        "Avalie contexto, pressão em campo e news antes de clicar.",
+        "🔥 Ritmo / pressão:",
+        f"- Pressão: {pressao_txt} (time que mais aperta: {quem_aperta})",
+        "",
+        "💰 Stake sugerida (Kelly fracionado):",
+        f"- ~{stake_pct:.2f}% da banca",
+        f"- Aproximado: R${stake_brl:.2f}",
+        "",
+        "🧩 Interpretação:",
+        "Jogo quente no 2º tempo, com padrão de pressão e estatística compatível com gol a mais.",
+        "Use este sinal como guia, alinhando com seu faro e disciplina de valor.",
         "",
         f"🔗 Abrir mercado ({CONFIG.bookmaker_name}): {CONFIG.bookmaker_url}",
     ]
+
     return "\n".join(linhas)
 
 
 async def run_scan(origin: str, bot) -> str:
+    """
+    Ajuste importante:
+    - /scan (manual)        → SEMPRE manda resumo pro Telegram.
+    - loop auto (origem=auto) → SÓ manda resumo se houve pelo menos 1 alerta.
+    """
     global CONFIG, LAST_SUMMARY, LAST_DEBUG_INFO
 
     if CONFIG is None:
@@ -395,18 +580,22 @@ async def run_scan(origin: str, bot) -> str:
             f"janela={CONFIG.window_start}-{CONFIG.window_end}, "
             f"EV_MIN={CONFIG.ev_min_pct:.2f}%, "
             f"odd_ref={CONFIG.target_odd:.2f}, "
-            f"ligas_filtradas={sorted(CONFIG.league_ids) if CONFIG.league_ids else 'todas'}"
+            f"ligas_filtradas={sorted(CONFIG.league_ids) if CONFIG.league_ids else 'todas'}, "
+            f"STAKE_MAX={CONFIG.stake_max_pct:.2f}%"
         )
 
-        await bot.send_message(chat_id=CONFIG.telegram_chat_id, text=summary)
+        # 🔇 Auto-loop silencioso se não teve alerta (evita spam)
+        if origin == "auto" and alertas == 0:
+            logging.info(summary)
+            logging.info("Debug scan: %s", LAST_DEBUG_INFO)
+            return summary
 
+        # Manual (e auto com alerta) → manda resumo pro Telegram
+        await bot.send_message(chat_id=CONFIG.telegram_chat_id, text=summary)
         logging.info(summary)
         logging.info("Debug scan: %s", LAST_DEBUG_INFO)
 
         return summary
-
-
-# ===================== Comandos Telegram =====================
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -415,13 +604,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         CONFIG = load_config()
 
     linhas = [
-        "👋 EvRadar PRO online.",
+        "👋 EvRadar PRO WR+ online.",
         "",
         f"Janela padrão: {CONFIG.window_start}–{CONFIG.window_end}ʼ",
+        f"Odds alvo: {CONFIG.min_odd:.2f}–{CONFIG.max_odd:.2f}",
         f"Odd ref (TARGET_ODD): {CONFIG.target_odd:.2f}",
         f"EV mínimo: {CONFIG.ev_min_pct:.2f}%",
         f"Cooldown por jogo: {CONFIG.cooldown_minutes:.1f} min",
         f"AUTOSTART: {'ligado' if CONFIG.autostart else 'desligado'}",
+        f"Bankroll inicial: R${CONFIG.bankroll_initial:.2f}",
+        f"Kelly fracionado: {CONFIG.kelly_fraction:.2f}x (cap {CONFIG.stake_max_pct:.2f}% da banca)",
         "",
         "Comandos:",
         "  /scan   → rodar varredura agora",
@@ -429,6 +621,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /debug  → info técnica",
         "  /links  → links úteis / bookmaker",
     ]
+
     await update.message.reply_text("\n".join(linhas))
 
 
@@ -437,13 +630,18 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if CONFIG is None:
         CONFIG = load_config()
 
-    await update.message.reply_text("🔍 Iniciando varredura manual de jogos ao vivo...")
+    await update.message.reply_text("🔍 Iniciando varredura manual de jogos ao vivo (WR+)...")
     await run_scan("manual", context.bot)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_SUMMARY
-    await update.message.reply_text(LAST_SUMMARY)
+    global LAST_SUMMARY, BANKROLL_STATE
+    linhas = [
+        LAST_SUMMARY,
+        "",
+        f"Bankroll atual (em memória): R${BANKROLL_STATE['current']:.2f}",
+    ]
+    await update.message.reply_text("\n".join(linhas))
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -452,13 +650,14 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         CONFIG = load_config()
 
     linhas = [
-        "🛠 Debug EvRadar PRO",
+        "🛠 Debug EvRadar PRO WR+",
         "",
         LAST_DEBUG_INFO or "Ainda não houve nenhum scan.",
         "",
         f"LEAGUE_IDS carregadas: {sorted(CONFIG.league_ids) if CONFIG.league_ids else 'todas'}",
         f"CHECK_INTERVAL: {CONFIG.check_interval_ms} ms",
-        f"USE_API_FOOTBALL_ODDS (placeholder): {CONFIG.use_api_football_odds}",
+        f"USE_API_FOOTBALL_ODDS: {CONFIG.use_api_football_odds}",
+        f"BOOKMAKER_ID: {CONFIG.bookmaker_id} ({CONFIG.bookmaker_name})",
     ]
     await update.message.reply_text("\n".join(linhas))
 
@@ -477,9 +676,6 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(linhas))
 
 
-# ===================== Loop automático =====================
-
-
 async def auto_scan_loop(app) -> None:
     global CONFIG
     if CONFIG is None:
@@ -490,12 +686,11 @@ async def auto_scan_loop(app) -> None:
         return
 
     logging.info(
-        "Iniciando loop automático: intervalo=%d ms (%.1fs)",
+        "Iniciando loop automático WR+: intervalo=%d ms (%.1fs)",
         CONFIG.check_interval_ms,
         CONFIG.check_interval_ms / 1000.0,
     )
 
-    # Evita estourar o limite da API: comece com intervalos maiores.
     while True:
         try:
             await run_scan("auto", app.bot)
@@ -505,11 +700,6 @@ async def auto_scan_loop(app) -> None:
 
 
 async def post_init(app) -> None:
-    """
-    Executado automaticamente pelo python-telegram-bot dentro do mesmo
-    event loop do run_polling. É aqui que inicializamos o HTTP_CLIENT
-    e disparamos o loop automático se AUTOSTART=1.
-    """
     global CONFIG, HTTP_CLIENT
     if CONFIG is None:
         CONFIG = load_config()
@@ -517,7 +707,6 @@ async def post_init(app) -> None:
     HTTP_CLIENT = await build_http_client(CONFIG)
     logging.info("HTTP_CLIENT inicializado.")
 
-    # Loop automático em background (sem JobQueue)
     asyncio.create_task(auto_scan_loop(app))
 
 
@@ -545,7 +734,7 @@ def main() -> None:
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
 
-    logging.info("Iniciando EvRadar PRO (run_polling)...")
+    logging.info("Iniciando EvRadar PRO WR+ (run_polling)...")
     application.run_polling(close_loop=False)
 
 
