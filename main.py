@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, torneira mais aberta)
+EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, Render-friendly)
+
+- Funciona local (notebook) e em nuvem (Render Web Service free).
+- Usa polling do Telegram (sem webhook).
+- Abre um servidor HTTP mínimo só para o Render enxergar uma porta aberta.
+- Autoscan sem spam: só manda mensagem automática se houver alerta.
 
 Requisitos (instalar uma vez no seu Python):
     pip install python-telegram-bot==21.6 httpx python-dotenv
@@ -21,6 +26,9 @@ Principais variáveis de ambiente:
 
     LEAGUE_IDS         -> ids separados por vírgula; se vazio,
                           uso um pacote de ligas/copas relevantes.
+
+    BOOKMAKER_NAME     -> nome da casa (padrão: Superbet)
+    BOOKMAKER_URL      -> URL da casa (padrão: https://www.superbet.com/)
 """
 
 import asyncio
@@ -72,11 +80,11 @@ LEAGUE_IDS_DEFAULT: List[int] = [
     71,   # Brasileirão Série A
     72,   # Brasileirão Série B
     13,   # Argentina Liga Profesional
-    14,   # Argentina Primera Nacional / alternativas
+    14,   # Argentina segunda/próximas
     # Copas relevantes
     2,    # Champions League
     3,    # Europa League
-    4,    # Europa Conference League
+    4,    # Conference League
     5,    # Eurocopa
     180,  # Libertadores
     203,  # Sudamericana
@@ -87,7 +95,7 @@ LEAGUE_IDS_DEFAULT: List[int] = [
     94,   # Primeira Liga (POR)
     128,  # Superliga (TUR)
     136,  # Super League (GRE)
-    141,  # Süper Lig (TUR?) / ajuste
+    141,  # Outra top secundária
     144,  # Championship (ING)
     79,   # 2. Bundesliga
     253,  # MLS
@@ -113,29 +121,29 @@ class Settings:
 
     def describe(self) -> str:
         lines: List[str] = []
-        lines.append("⚙️ Configuração atual do EvRadar PRO (Notebook):")
+        lines.append("⚙️ Configuração atual do EvRadar PRO (Notebook/Nuvem):")
         lines.append("")
-        linhas_janela = "• Janela: {}–{}'".format(self.window_start, self.window_end)
-        lines.append(linhas_janela)
-        linhas_odds = "• Odds alvo: {:.2f} (min: {:.2f} | max: {:.2f})".format(
-            self.target_odd, self.min_odd, self.max_odd
+        lines.append("• Janela: {}–{}'".format(self.window_start, self.window_end))
+        lines.append(
+            "• Odds alvo: {:.2f} (min: {:.2f} | max: {:.2f})".format(
+                self.target_odd, self.min_odd, self.max_odd
+            )
         )
-        lines.append(linhas_odds)
-        linha_ev = "• EV mínimo p/ alerta: {:.2f}%".format(self.ev_min_pct)
-        lines.append(linha_ev)
-        linha_leagues = "• Competições: {} ids configurados (foco em ligas/copas relevantes)".format(
-            len(self.league_ids)
+        lines.append("• EV mínimo p/ alerta: {:.2f}%".format(self.ev_min_pct))
+        lines.append(
+            "• Competições: {} ids configurados (foco em ligas/copas relevantes)".format(
+                len(self.league_ids)
+            )
         )
-        lines.append(linha_leagues)
         if self.autostart:
-            linha_auto = "• Autoscan: ON a cada {}s".format(self.check_interval)
+            lines.append("• Autoscan: ON a cada {}s".format(self.check_interval))
         else:
-            linha_auto = "• Autoscan: OFF (use /scan manual)"
-        lines.append(linha_auto)
-        linha_book = "• Casa referência: {} ({})".format(
-            self.bookmaker_name, self.bookmaker_url
+            lines.append("• Autoscan: OFF (use /scan manual)")
+        lines.append(
+            "• Casa referência: {} ({})".format(
+                self.bookmaker_name, self.bookmaker_url
+            )
         )
-        lines.append(linha_book)
         return "\n".join(lines)
 
 
@@ -208,10 +216,9 @@ def load_settings() -> Settings:
     api_key = os.getenv("API_FOOTBALL_KEY", "").strip()
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    chat_id_default: Optional[int]
     if chat_id_raw:
         try:
-            chat_id_default = int(chat_id_raw)
+            chat_id_default: Optional[int] = int(chat_id_raw)
         except Exception:
             logger.warning("TELEGRAM_CHAT_ID inválido: %r (ignorando)", chat_id_raw)
             chat_id_default = None
@@ -242,7 +249,7 @@ def load_settings() -> Settings:
     bookmaker_name = os.getenv("BOOKMAKER_NAME", "Superbet").strip() or "Superbet"
     bookmaker_url = os.getenv("BOOKMAKER_URL", "https://www.superbet.com/").strip() or "https://www.superbet.com/"
 
-    settings = Settings(
+    return Settings(
         api_key=api_key,
         bot_token=bot_token,
         chat_id_default=chat_id_default,
@@ -258,7 +265,6 @@ def load_settings() -> Settings:
         bookmaker_name=bookmaker_name,
         bookmaker_url=bookmaker_url,
     )
-    return settings
 
 
 # =========================
@@ -582,8 +588,8 @@ def format_candidate_message(c: Candidate, settings: Settings) -> str:
     jogo = "{} vs {}".format(c.home_team, c.away_team)
     placar = "{}–{}".format(c.goals_home, c.goals_away)
     prob_pct = c.prob_goal * 100.0
-    ev_str = "{:.2f}%".format(c.ev_pct)
     prob_str = "{:.1f}%".format(prob_pct)
+    ev_str = "{:.2f}%".format(c.ev_pct)
     fair_odd_str = "{:.2f}".format(c.fair_odd)
     linha = "Over (soma + 0,5) @ {:.2f}".format(settings.target_odd)
 
@@ -617,8 +623,7 @@ def format_scan_summary(
     alerts_sent: int,
 ) -> str:
     linhas: List[str] = []
-    header = "[EvRadar PRO] Scan concluído (origem={}).".format(origin)
-    linhas.append(header)
+    linhas.append("[EvRadar PRO] Scan concluído (origem={}).".format(origin))
     resumo = "Eventos ao vivo: {} | Jogos analisados na janela: {} | Alertas enviados: {}".format(
         total_live, games_window, alerts_sent
     )
@@ -636,21 +641,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id is not None:
         STATE.chat_id_bound = chat_id
     text = settings.describe()
-    await update.effective_message.reply_text(
-        "\n".join(
-            [
-                "👋 EvRadar PRO online (Notebook/Nuvem).",
-                "",
-                text,
-                "",
-                "Comandos:",
-                "  /scan   → varrer jogos ao vivo agora",
-                "  /status → ver resumo da última varredura",
-                "  /debug  → ver detalhes técnicos",
-                "  /links  → links úteis / bookmaker",
-            ]
-        )
-    )
+    linhas: List[str] = []
+    linhas.append("👋 EvRadar PRO online (Notebook/Nuvem).")
+    linhas.append("")
+    linhas.append(text)
+    linhas.append("")
+    linhas.append("Comandos:")
+    linhas.append("  /scan   → varrer jogos ao vivo agora")
+    linhas.append("  /status → ver resumo da última varredura")
+    linhas.append("  /debug  → ver detalhes técnicos")
+    linhas.append("  /links  → links úteis / bookmaker")
+    await update.effective_message.reply_text("\n".join(linhas))
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -744,7 +745,11 @@ async def autoscan_loop(app: Application) -> None:
     settings: Settings = app.bot_data["settings"]  # type: ignore[index]
     api: ApiFootballClient = app.bot_data["api"]  # type: ignore[index]
     chat_id = settings.chat_id_default
-    logger.info("Autoscan iniciado (intervalo=%ss) - chat_id_default=%s", settings.check_interval, chat_id)
+    logger.info(
+        "Autoscan iniciado (intervalo=%ss) - chat_id_default=%s",
+        settings.check_interval,
+        chat_id,
+    )
 
     while True:
         try:
@@ -752,7 +757,6 @@ async def autoscan_loop(app: Application) -> None:
             games_window = len(candidates)
             alerts_sent = 0
 
-            # só manda mensagem se houver candidatos
             if candidates and chat_id is not None:
                 for cand in candidates:
                     msg = format_candidate_message(cand, settings)
@@ -765,13 +769,11 @@ async def autoscan_loop(app: Application) -> None:
                     alerts_sent += 1
                     await asyncio.sleep(0.8)
 
-            # atualiza status interno sempre (para /status)
             summary = format_scan_summary("auto", total_live, games_window, alerts_sent)
             STATE.last_scan_summary = summary
             STATE.last_scan_time = asyncio.get_event_loop().time()
             STATE.last_alerts = alerts_sent
 
-            # só manda o resumo se teve alerta (evita spam)
             if chat_id is not None and alerts_sent > 0:
                 await app.bot.send_message(chat_id=chat_id, text=summary)
 
@@ -781,10 +783,46 @@ async def autoscan_loop(app: Application) -> None:
         await asyncio.sleep(settings.check_interval)
 
 
+# =========================
+#  Servidor HTTP mínimo (Render Web Service)
+# =========================
+
+async def start_dummy_http_server() -> None:
+    """
+    Servidor HTTP mínimo só para o Render enxergar uma porta aberta.
+    Não é usado pelo EvRadar; responde "OK" em qualquer request.
+    """
+    port = int(os.getenv("PORT", "10000"))
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+        writer.write(response)
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(handle, "0.0.0.0", port)
+    logger.info("Dummy HTTP server ouvindo em 0.0.0.0:%s", port)
+    async with server:
+        await server.serve_forever()
+
+
+# =========================
+#  Ciclo de vida (startup/shutdown)
+# =========================
+
 async def on_startup(app: Application) -> None:
     settings: Settings = app.bot_data["settings"]  # type: ignore[index]
+    # inicia autoscan se configurado
     if settings.autostart and STATE.autoscan_task is None:
         STATE.autoscan_task = asyncio.create_task(autoscan_loop(app))
+    # inicia servidor HTTP fake para o Render ver a porta
+    asyncio.create_task(start_dummy_http_server())
 
 
 async def on_shutdown(app: Application) -> None:
@@ -821,7 +859,10 @@ def main() -> None:
     application.post_shutdown = on_shutdown  # type: ignore[assignment]
 
     logger.info("Iniciando bot do EvRadar PRO (Notebook/Nuvem)...")
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
