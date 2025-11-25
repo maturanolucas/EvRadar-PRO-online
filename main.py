@@ -1,34 +1,38 @@
 #!/usr/bin/env python3
 """
-EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, Render-friendly)
+EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, Render-friendly, odds reais)
 
 - Funciona local (notebook) e em nuvem (Render Web Service free).
 - Usa polling do Telegram (sem webhook).
 - Abre um servidor HTTP mínimo só para o Render enxergar uma porta aberta.
-- Autoscan sem spam: só manda mensagem automática se houver alerta.
+- Autoscan sem spam: só manda mensagem automática SE houver alerta.
+- Calcula EV usando, quando possível, a ODD REAL AO VIVO da casa (API-Football /odds/live),
+  comparando com a odd justa do modelo.
 
 Requisitos (instalar uma vez no seu Python):
     pip install python-telegram-bot==21.6 httpx python-dotenv
 
 Principais variáveis de ambiente:
-    API_FOOTBALL_KEY   -> sua chave da API-Football (obrigatória)
-    TELEGRAM_BOT_TOKEN -> token do BotFather (obrigatório)
-    TELEGRAM_CHAT_ID   -> (opcional) chat padrão para alertas
+    API_FOOTBALL_KEY      -> sua chave da API-Football (obrigatória)
+    TELEGRAM_BOT_TOKEN    -> token do BotFather (obrigatório)
+    TELEGRAM_CHAT_ID      -> (opcional) chat padrão para alertas
 
-    TARGET_ODD         -> odd de referência p/ cálculo de EV  (padrão: 1.70)
-    EV_MIN_PCT         -> EV mínimo em % para mandar alerta    (padrão: 3.0)
-    MIN_ODD            -> odd mínima aceitável                 (apenas display)
-    MAX_ODD            -> odd máxima aceitável                 (apenas display)
-    WINDOW_START       -> início da janela em minutos          (padrão: 47)
-    WINDOW_END         -> fim da janela em minutos             (padrão: 82)
-    AUTOSTART          -> "1" para varredura automática        (padrão: 0 - OFF)
-    CHECK_INTERVAL     -> intervalo autoscan em segundos       (padrão: 45)
+    TARGET_ODD            -> odd de referência p/ EV quando não houver odd da casa (padrão: 1.70)
+    EV_MIN_PCT            -> EV mínimo em % para mandar alerta              (padrão: 3.0)
+    MIN_ODD               -> odd mínima aceitável (apenas display)          (padrão: 1.47)
+    MAX_ODD               -> odd máxima aceitável (apenas display)          (padrão: 3.50)
+    WINDOW_START          -> início da janela em minutos                    (padrão: 47)
+    WINDOW_END            -> fim da janela em minutos                       (padrão: 82)
+    AUTOSTART             -> "1" para varredura automática                  (padrão: 0 - OFF)
+    CHECK_INTERVAL        -> intervalo autoscan em segundos                 (padrão: 45)
 
-    LEAGUE_IDS         -> ids separados por vírgula; se vazio,
-                          uso um pacote de ligas/copas relevantes.
+    LEAGUE_IDS            -> ids separados por vírgula; se vazio,
+                             usa pacote default de ligas/copas relevantes.
 
-    BOOKMAKER_NAME     -> nome da casa (padrão: Superbet)
-    BOOKMAKER_URL      -> URL da casa (padrão: https://www.superbet.com/)
+    USE_API_FOOTBALL_ODDS -> "1" para usar odds ao vivo via /odds/live      (padrão: 1)
+    BOOKMAKER_ID          -> id numérico do bookmaker na API-Football       (opcional)
+    BOOKMAKER_NAME        -> nome da casa (padrão: Superbet)
+    BOOKMAKER_URL         -> URL da casa (padrão: https://www.superbet.com/)
 """
 
 import asyncio
@@ -118,33 +122,50 @@ class Settings:
     league_ids: List[int]
     bookmaker_name: str
     bookmaker_url: str
+    use_live_odds: bool
+    bookmaker_id: Optional[int]
 
     def describe(self) -> str:
-        lines: List[str] = []
-        lines.append("⚙️ Configuração atual do EvRadar PRO (Notebook/Nuvem):")
-        lines.append("")
-        lines.append("• Janela: {}–{}'".format(self.window_start, self.window_end))
-        lines.append(
-            "• Odds alvo: {:.2f} (min: {:.2f} | max: {:.2f})".format(
+        linhas: List[str] = []
+        linhas.append("⚙️ Configuração atual do EvRadar PRO (Notebook/Nuvem):")
+        linhas.append("")
+        linhas.append("• Janela: {}–{}'".format(self.window_start, self.window_end))
+        linhas.append(
+            "• Odds alvo (fallback): {:.2f} (min: {:.2f} | max: {:.2f})".format(
                 self.target_odd, self.min_odd, self.max_odd
             )
         )
-        lines.append("• EV mínimo p/ alerta: {:.2f}%".format(self.ev_min_pct))
-        lines.append(
+        linhas.append("• EV mínimo p/ alerta: {:.2f}%".format(self.ev_min_pct))
+        if self.use_live_odds:
+            if self.bookmaker_id is not None:
+                linhas.append(
+                    "• Odds em uso: AO VIVO via API-Football (bookmaker_id={})".format(
+                        self.bookmaker_id
+                    )
+                )
+            else:
+                linhas.append(
+                    "• Odds em uso: AO VIVO via API-Football (primeiro bookmaker disponível)"
+                )
+        else:
+            linhas.append(
+                "• Odds em uso: fixas pela odd alvo {:.2f}".format(self.target_odd)
+            )
+        linhas.append(
             "• Competições: {} ids configurados (foco em ligas/copas relevantes)".format(
                 len(self.league_ids)
             )
         )
         if self.autostart:
-            lines.append("• Autoscan: ON a cada {}s".format(self.check_interval))
+            linhas.append("• Autoscan: ON a cada {}s".format(self.check_interval))
         else:
-            lines.append("• Autoscan: OFF (use /scan manual)")
-        lines.append(
+            linhas.append("• Autoscan: OFF (use /scan manual)")
+        linhas.append(
             "• Casa referência: {} ({})".format(
                 self.bookmaker_name, self.bookmaker_url
             )
         )
-        return "\n".join(lines)
+        return "\n".join(linhas)
 
 
 @dataclass
@@ -249,6 +270,18 @@ def load_settings() -> Settings:
     bookmaker_name = os.getenv("BOOKMAKER_NAME", "Superbet").strip() or "Superbet"
     bookmaker_url = os.getenv("BOOKMAKER_URL", "https://www.superbet.com/").strip() or "https://www.superbet.com/"
 
+    use_live_odds_flag = os.getenv("USE_API_FOOTBALL_ODDS", "1").strip()
+    use_live_odds = use_live_odds_flag == "1"
+    bookmaker_id_raw = os.getenv("BOOKMAKER_ID", "").strip()
+    if bookmaker_id_raw:
+        try:
+            bookmaker_id: Optional[int] = int(bookmaker_id_raw)
+        except Exception:
+            logger.warning("BOOKMAKER_ID inválido: %r (ignorando)", bookmaker_id_raw)
+            bookmaker_id = None
+    else:
+        bookmaker_id = None
+
     return Settings(
         api_key=api_key,
         bot_token=bot_token,
@@ -264,6 +297,8 @@ def load_settings() -> Settings:
         league_ids=league_ids,
         bookmaker_name=bookmaker_name,
         bookmaker_url=bookmaker_url,
+        use_live_odds=use_live_odds,
+        bookmaker_id=bookmaker_id,
     )
 
 
@@ -272,6 +307,7 @@ def load_settings() -> Settings:
 # =========================
 
 API_BASE = "https://v3.football.api-sports.io"
+OVER_UNDER_BET_ID = 36  # mercado Over/Under para odds/live (API-Football)
 
 
 class ApiFootballClient:
@@ -339,6 +375,95 @@ class ApiFootballClient:
             else:
                 out["away"] = stats_map
         return out
+
+    async def fetch_live_over_under_odd(
+        self,
+        fixture_id: int,
+        total_goals: int,
+        bookmaker_id: Optional[int],
+    ) -> Optional[float]:
+        """
+        Busca a ODD ao vivo para o mercado Over (soma + 0,5) via /odds/live.
+
+        Estratégia:
+        - Chama /odds/live?fixture={id}&bet=36
+        - Se bookmaker_id for informado, tenta usar esse bookmaker.
+        - Caso contrário, usa o primeiro bookmaker da resposta.
+        - Procura pelo valor "Over X.5" onde X = total_goals.
+        """
+        client = await self._get_client()
+        params: Dict[str, Any] = {
+            "fixture": fixture_id,
+            "bet": OVER_UNDER_BET_ID,
+        }
+        try:
+            resp = await client.get("/odds/live", params=params)
+        except Exception as exc:
+            logger.error("Erro em odds/live para fixture %s: %s", fixture_id, exc)
+            return None
+
+        if resp.status_code != 200:
+            logger.error(
+                "HTTP %s em odds/live(%s): %s",
+                resp.status_code,
+                fixture_id,
+                resp.text[:300],
+            )
+            return None
+
+        data = resp.json()
+        items = data.get("response", []) or []
+        if not items:
+            return None
+
+        item = items[0]
+        bookmakers = item.get("bookmakers") or []
+        chosen_book: Optional[Dict[str, Any]] = None
+
+        if bookmaker_id is not None:
+            for bk in bookmakers:
+                if bk.get("id") == bookmaker_id:
+                    chosen_book = bk
+                    break
+
+        if chosen_book is None and bookmakers:
+            chosen_book = bookmakers[0]
+
+        if chosen_book is None:
+            return None
+
+        bets = chosen_book.get("bets") or []
+        bet_obj: Optional[Dict[str, Any]] = None
+        for b in bets:
+            if b.get("id") == OVER_UNDER_BET_ID:
+                bet_obj = b
+                break
+            name = str(b.get("name") or "").lower()
+            if "over" in name and "under" in name:
+                bet_obj = b
+                break
+
+        if bet_obj is None:
+            return None
+
+        desired_line = float(total_goals) + 0.5
+        desired_str = "{:.1f}".format(desired_line)
+
+        values = bet_obj.get("values") or []
+        for v in values:
+            label = str(v.get("value") or "")
+            label_lower = label.lower()
+            if "over" in label_lower and desired_str in label_lower:
+                odd_raw = v.get("odd")
+                if odd_raw is None:
+                    continue
+                try:
+                    odd_val = float(str(odd_raw).replace(",", "."))
+                    return odd_val
+                except Exception:
+                    continue
+
+        return None
 
 
 # =========================
@@ -460,6 +585,8 @@ class Candidate:
     goals_away: int
     prob_goal: float
     fair_odd: float
+    used_odd: float
+    odd_source: str
     ev_pct: float
     tier: str
     pressure_desc: str
@@ -550,7 +677,25 @@ async def find_candidates(
             settings.window_end,
         )
 
-        ev = prob_goal * settings.target_odd - 1.0
+        total_goals = goals_home + goals_away
+        used_odd = settings.target_odd
+        odd_source = "alvo"
+
+        if settings.use_live_odds:
+            live_odd = await api.fetch_live_over_under_odd(
+                fixture_id_int,
+                total_goals,
+                settings.bookmaker_id,
+            )
+            if live_odd is not None:
+                used_odd = live_odd
+                odd_source = "live"
+
+        # Filtrar odds muito fora da faixa configurada
+        if used_odd < settings.min_odd or used_odd > settings.max_odd:
+            continue
+
+        ev = prob_goal * used_odd - 1.0
         ev_pct = ev * 100.0
 
         if ev_pct < settings.ev_min_pct:
@@ -574,6 +719,8 @@ async def find_candidates(
             goals_away=goals_away,
             prob_goal=prob_goal,
             fair_odd=fair_odd,
+            used_odd=used_odd,
+            odd_source=odd_source,
             ev_pct=ev_pct,
             tier=tier,
             pressure_desc=pressure_desc,
@@ -591,7 +738,8 @@ def format_candidate_message(c: Candidate, settings: Settings) -> str:
     prob_str = "{:.1f}%".format(prob_pct)
     ev_str = "{:.2f}%".format(c.ev_pct)
     fair_odd_str = "{:.2f}".format(c.fair_odd)
-    linha = "Over (soma + 0,5) @ {:.2f}".format(settings.target_odd)
+    used_odd_str = "{:.2f}".format(c.used_odd)
+    linha = "Over (soma + 0,5) @ {}".format(used_odd_str)
 
     if c.tier == "A":
         tier_title = "Tier A — Sinal forte"
@@ -602,12 +750,17 @@ def format_candidate_message(c: Candidate, settings: Settings) -> str:
 
     ev_label = "EV+ ✅" if c.ev_pct >= 0 else "EV- ❌"
 
+    if c.odd_source == "live":
+        odd_info = "odd real da casa"
+    else:
+        odd_info = "odd alvo (fallback)"
+
     linhas: List[str] = []
     linhas.append("🔔 {} ({})".format(tier_title, c.league_name))
     linhas.append("")
     linhas.append("🏟️ {}".format(jogo))
     linhas.append("⏱️ {}' | 🔢 Placar {}".format(c.minute, placar))
-    linhas.append("⚙️ Linha: {}".format(linha))
+    linhas.append("⚙️ Linha: {} [{}]".format(linha, odd_info))
     linhas.append("📊 Probabilidade: {} | Odd justa: {}".format(prob_str, fair_odd_str))
     linhas.append("💰 EV: {} → {}".format(ev_str, ev_label))
     linhas.append("")
@@ -720,6 +873,13 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "ON" if settings.autostart else "OFF",
         settings.check_interval,
     ))
+    if settings.use_live_odds:
+        if settings.bookmaker_id is not None:
+            linhas.append("Odds: AO VIVO via /odds/live (bookmaker_id={})".format(settings.bookmaker_id))
+        else:
+            linhas.append("Odds: AO VIVO via /odds/live (primeiro bookmaker)")
+    else:
+        linhas.append("Odds: fixas pela odd alvo {:.2f}".format(settings.target_odd))
     if STATE.chat_id_bound:
         linhas.append("chat_id_bound atual: {}".format(STATE.chat_id_bound))
     if settings.chat_id_default:
@@ -818,10 +978,8 @@ async def start_dummy_http_server() -> None:
 
 async def on_startup(app: Application) -> None:
     settings: Settings = app.bot_data["settings"]  # type: ignore[index]
-    # inicia autoscan se configurado
     if settings.autostart and STATE.autoscan_task is None:
         STATE.autoscan_task = asyncio.create_task(autoscan_loop(app))
-    # inicia servidor HTTP fake para o Render ver a porta
     asyncio.create_task(start_dummy_http_server())
 
 
