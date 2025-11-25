@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-EvRadar PRO — Versão Notebook (Telegram + API-Football, torneira mais aberta)
+EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, torneira mais aberta)
 
 Requisitos (instalar uma vez no seu Python):
     pip install python-telegram-bot==21.6 httpx python-dotenv
 
-Principais variáveis de ambiente (opcional, senão uso padrão razoável):
+Principais variáveis de ambiente:
     API_FOOTBALL_KEY   -> sua chave da API-Football (obrigatória)
     TELEGRAM_BOT_TOKEN -> token do BotFather (obrigatório)
     TELEGRAM_CHAT_ID   -> (opcional) chat padrão para alertas
@@ -27,7 +27,7 @@ import asyncio
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -289,9 +289,6 @@ class ApiFootballClient:
             self._client = None
 
     async def fetch_live_fixtures(self) -> List[Dict[str, Any]]:
-        """
-        Busca todos os jogos ao vivo.
-        """
         client = await self._get_client()
         try:
             resp = await client.get("/fixtures", params={"live": "all"})
@@ -305,10 +302,6 @@ class ApiFootballClient:
         return data.get("response", []) or []
 
     async def fetch_statistics(self, fixture_id: int) -> Dict[str, Dict[str, Any]]:
-        """
-        Busca estatísticas do jogo (por time).
-        Retorna um dict: { 'home': {...}, 'away': {...} }
-        """
         client = await self._get_client()
         try:
             resp = await client.get("/fixtures/statistics", params={"fixture": fixture_id})
@@ -329,19 +322,12 @@ class ApiFootballClient:
             return {}
         out: Dict[str, Dict[str, Any]] = {"home": {}, "away": {}}
         for item in items:
-            team_info = item.get("team") or {}
-            name = (team_info.get("name") or "").strip().lower()
-            is_home = False
-            # Heurística: primeiro é casa, segundo fora se API seguir padrão
-            # Se não souber, usa ordem.
-            # Aqui só importam os valores agregados.
             stats_list = item.get("statistics") or []
             stats_map: Dict[str, Any] = {}
             for s in stats_list:
                 s_type = s.get("type") or ""
                 s_val = s.get("value")
                 stats_map[s_type] = s_val
-            # Se já temos "home" preenchido, o próximo vira "away".
             if not out["home"]:
                 out["home"] = stats_map
             else:
@@ -383,9 +369,6 @@ def _get_int_stat(stats: Dict[str, Any], key: str) -> int:
 
 
 def compute_pressure_score(stats_home: Dict[str, Any], stats_away: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Calcula um "score de pressão" de 0 a ~100 e devolve também um pequeno resumo textual.
-    """
     shots_on_target = _get_int_stat(stats_home, "Shots on Target") + _get_int_stat(
         stats_away, "Shots on Target"
     )
@@ -402,11 +385,9 @@ def compute_pressure_score(stats_home: Dict[str, Any], stats_away: Dict[str, Any
     poss_away = _parse_percent(stats_away.get("Ball Possession"))
     poss_diff = abs(poss_home - poss_away)
 
-    # Score base combinando volume e ataques perigosos
     volume = shots_total + shots_on_target * 1.5
     ataque_peso = attacks * 0.2 + dang_attacks * 0.6
     pressure_raw = volume * 0.7 + ataque_peso * 0.3
-    # Pequeno boost se posse bem desigual (time amassando)
     pressure_raw += poss_diff * 0.3
 
     pressure = float(min(100.0, max(0.0, pressure_raw / 2.0)))
@@ -432,13 +413,8 @@ def estimate_goal_probability(
     window_start: int,
     window_end: int,
 ) -> Tuple[float, float, str]:
-    """
-    Estima probabilidade de sair +1 gol até o fim do jogo.
-    Retorna (p, fair_odd, desc_pressao).
-    """
     total_goals = goals_home + goals_away
 
-    # Fator tempo: maior no início do 2T, vai caindo.
     minute_clamped = minute
     if minute_clamped < window_start:
         minute_clamped = window_start
@@ -446,20 +422,13 @@ def estimate_goal_probability(
         minute_clamped = window_end
     span = max(1, window_end - window_start)
     t_norm = (minute_clamped - window_start) / float(span)
-    # 0.65 no início da janela → 0.25 no fim
     p_time = 0.65 - 0.40 * t_norm
 
     pressure, pressure_desc = compute_pressure_score(stats_home, stats_away)
-
-    # Converte pressão (0–100) em boost 0–0.20
     p_pressure = (pressure / 100.0) * 0.20
-
-    # Gols já marcados deixam o jogo mais aberto (até certo ponto)
     p_goals = min(0.12, 0.04 * float(total_goals))
 
     p = p_time + p_pressure + p_goals
-
-    # Clamps
     if p < 0.05:
         p = 0.05
     if p > 0.90:
@@ -494,10 +463,6 @@ async def find_candidates(
     api: ApiFootballClient,
     settings: Settings,
 ) -> Tuple[List[Candidate], int]:
-    """
-    Busca jogos ao vivo na API, filtra liga/janela e calcula probabilidade/EV.
-    Retorna (lista de candidatos, qtde total de eventos ao vivo).
-    """
     fixtures = await api.fetch_live_fixtures()
     total_live = len(fixtures)
     candidates: List[Candidate] = []
@@ -565,7 +530,6 @@ async def find_candidates(
         except Exception:
             continue
 
-        # Estatísticas do jogo (1 chamada extra por jogo filtrado)
         stats = await api.fetch_statistics(fixture_id_int)
         stats_home = stats.get("home") or {}
         stats_away = stats.get("away") or {}
@@ -586,7 +550,6 @@ async def find_candidates(
         if ev_pct < settings.ev_min_pct:
             continue
 
-        # Tier por EV (torneira relativamente aberta)
         if ev_pct >= 7.0:
             tier = "A"
         elif ev_pct >= 4.0:
@@ -611,15 +574,11 @@ async def find_candidates(
         )
         candidates.append(candidate)
 
-    # Ordena por maior EV primeiro
     candidates.sort(key=lambda c: c.ev_pct, reverse=True)
     return candidates, total_live
 
 
 def format_candidate_message(c: Candidate, settings: Settings) -> str:
-    """
-    Formata o alerta no layout padrão do Lucas.
-    """
     jogo = "{} vs {}".format(c.home_team, c.away_team)
     placar = "{}–{}".format(c.goals_home, c.goals_away)
     prob_pct = c.prob_goal * 100.0
@@ -680,7 +639,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "\n".join(
             [
-                "👋 EvRadar PRO online (Notebook).",
+                "👋 EvRadar PRO online (Notebook/Nuvem).",
                 "",
                 text,
                 "",
@@ -706,10 +665,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     candidates, total_live = await find_candidates(api, settings)
-    games_window = len(candidates)  # após filtros de EV
+    games_window = len(candidates)
     alerts_sent = 0
 
-    # Envia alertas
     for cand in candidates:
         msg = format_candidate_message(cand, settings)
         await context.bot.send_message(
@@ -734,13 +692,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if STATE.last_scan_time is None:
         ago_text = "nenhuma varredura ainda."
     else:
-        # diferença em minutos
         delta = asyncio.get_event_loop().time() - STATE.last_scan_time
         mins = int(delta // 60)
         secs = int(delta % 60)
         ago_text = "há {}m{}s".format(mins, secs)
     linhas: List[str] = []
-    linhas.append("📈 Status do EvRadar PRO (Notebook)")
+    linhas.append("📈 Status do EvRadar PRO (Notebook/Nuvem)")
     linhas.append("")
     linhas.append(STATE.last_scan_summary)
     linhas.append("")
@@ -753,7 +710,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
-    api: ApiFootballClient = context.application.bot_data["api"]  # type: ignore[index]
     linhas: List[str] = []
     linhas.append("🐞 Debug EvRadar PRO")
     linhas.append("")
@@ -781,7 +737,7 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================
-#  Autoscan (opcional)
+#  Autoscan (sem spam)
 # =========================
 
 async def autoscan_loop(app: Application) -> None:
@@ -789,14 +745,17 @@ async def autoscan_loop(app: Application) -> None:
     api: ApiFootballClient = app.bot_data["api"]  # type: ignore[index]
     chat_id = settings.chat_id_default
     logger.info("Autoscan iniciado (intervalo=%ss) - chat_id_default=%s", settings.check_interval, chat_id)
+
     while True:
         try:
             candidates, total_live = await find_candidates(api, settings)
             games_window = len(candidates)
             alerts_sent = 0
-            for cand in candidates:
-                msg = format_candidate_message(cand, settings)
-                if chat_id is not None:
+
+            # só manda mensagem se houver candidatos
+            if candidates and chat_id is not None:
+                for cand in candidates:
+                    msg = format_candidate_message(cand, settings)
                     await app.bot.send_message(
                         chat_id=chat_id,
                         text=msg,
@@ -805,14 +764,20 @@ async def autoscan_loop(app: Application) -> None:
                     )
                     alerts_sent += 1
                     await asyncio.sleep(0.8)
+
+            # atualiza status interno sempre (para /status)
             summary = format_scan_summary("auto", total_live, games_window, alerts_sent)
             STATE.last_scan_summary = summary
             STATE.last_scan_time = asyncio.get_event_loop().time()
             STATE.last_alerts = alerts_sent
-            if chat_id is not None:
+
+            # só manda o resumo se teve alerta (evita spam)
+            if chat_id is not None and alerts_sent > 0:
                 await app.bot.send_message(chat_id=chat_id, text=summary)
+
         except Exception as exc:
             logger.error("Erro no autoscan: %s", exc)
+
         await asyncio.sleep(settings.check_interval)
 
 
@@ -855,7 +820,7 @@ def main() -> None:
     application.post_init = on_startup  # type: ignore[assignment]
     application.post_shutdown = on_shutdown  # type: ignore[assignment]
 
-    logger.info("Iniciando bot do EvRadar PRO (Notebook)...")
+    logger.info("Iniciando bot do EvRadar PRO (Notebook/Nuvem)...")
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
