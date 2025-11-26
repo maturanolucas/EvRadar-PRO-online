@@ -6,7 +6,6 @@ from typing import List, Dict, Any, Optional, Set
 
 import httpx
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -24,11 +23,8 @@ logging.basicConfig(
 
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 
-# Estado simples em memória
 LAST_SCAN_SUMMARY: str = "Nenhum scan executado ainda."
 LAST_ERROR: Optional[str] = None
-
-_application_singleton: Optional[Application] = None
 
 
 def env_str(name: str, default: Optional[str] = None) -> str:
@@ -76,12 +72,12 @@ def parse_league_ids(raw: str) -> Set[int]:
 
 
 TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")  # pode ser string mesmo
+TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
 
 API_FOOTBALL_KEY = env_str("API_FOOTBALL_KEY")
 
 AUTOSTART = env_int("AUTOSTART", 1)
-CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60)  # segundos
+CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60)
 
 WINDOW_START = env_int("WINDOW_START", 47)
 WINDOW_END = env_int("WINDOW_END", 75)
@@ -89,7 +85,7 @@ WINDOW_END = env_int("WINDOW_END", 75)
 MIN_ODD = env_float("MIN_ODD", 1.47)
 MAX_ODD = env_float("MAX_ODD", 2.30)
 
-EV_MIN_PCT = env_float("EV_MIN_PCT", 0.0)  # por enquanto, só informativo
+EV_MIN_PCT = env_float("EV_MIN_PCT", 0.0)
 
 BOOKMAKER_ID = env_int("BOOKMAKER_ID", 34)
 BOOKMAKER_NAME = os.getenv("BOOKMAKER_NAME", "Superbet")
@@ -142,10 +138,6 @@ async def fetch_odds_for_fixture(
 def extract_over_line_odd(
     odds_payload: Dict[str, Any], total_goals: int
 ) -> Optional[float]:
-    """
-    Procura no payload de odds a linha Over (gols + 0.5) do placar atual.
-    Ex.: placar 1–0 -> linha Over 1.5.
-    """
     target_line = f"Over {total_goals + 0.5}"
     for bookmaker in odds_payload.get("bookmakers", []):
         for bet in bookmaker.get("bets", []):
@@ -165,9 +157,6 @@ def extract_over_line_odd(
 
 
 def format_signal_message(ev: Dict[str, Any]) -> str:
-    """
-    Formata a mensagem do alerta com layout simples e emojis.
-    """
     league = ev.get("league_name", "?")
     home = ev.get("home", "?")
     away = ev.get("away", "?")
@@ -176,32 +165,26 @@ def format_signal_message(ev: Dict[str, Any]) -> str:
     ga = ev.get("goals_away", 0)
     total_goals = gh + ga
     odd = ev.get("odd")
-    line = f"Over (soma + 0,5) ⇒ Over {total_goals + 0.5}"  # SUM_PLUS_HALF
+    line = f"Over (soma + 0,5) ⇒ Over {total_goals + 0.5}"
 
     header = f"🏟️ {home} vs {away} — {league}"
     line1 = f"⏱️ {minute}' | 🔢 {gh}–{ga}"
-    line2 = f"⚙️ Linha: {line}"
     if odd is not None:
-        line2 = f"{line2} @ {odd:.2f}"
+        line2 = f"⚙️ Linha: {line} @ {odd:.2f}"
+    else:
+        line2 = f"⚙️ Linha: {line} (sem odd disponível)"
 
-    # EV por enquanto manual/visual
-    line3_parts = [
-        "📊 EV: manual (avaliar estatísticas ao vivo)",
-        f"Faixa de odds alvo: {MIN_ODD:.2f}–{MAX_ODD:.2f}",
-    ]
-    line3 = " | ".join(line3_parts)
-
-    line4 = "💰 Ação: revisar posse, chutes e contexto; se estiver forte, considerar entrada."
+    line3 = (
+        f"📊 EV: manual (avaliar estatísticas ao vivo) | "
+        f"Faixa de odds alvo: {MIN_ODD:.2f}–{MAX_ODD:.2f}"
+    )
+    line4 = "💰 Ação: revisar posse, chutes, pressão e contexto. Se estiver forte, considerar entrada."
     line5 = f"🔗 Abrir mercado ({BOOKMAKER_NAME}): {BOOKMAKER_URL}"
 
     return "\n".join([header, line1, line2, line3, line4, line5])
 
 
 async def scan_once(application: Optional[Application] = None) -> str:
-    """
-    Executa uma varredura única na API-Football e retorna um resumo textual.
-    Também dispara mensagens de alerta no Telegram (se application/bot estiver disponível).
-    """
     global LAST_SCAN_SUMMARY, LAST_ERROR
 
     async with httpx.AsyncClient() as client:
@@ -212,6 +195,16 @@ async def scan_once(application: Optional[Application] = None) -> str:
             logger.exception(msg)
             LAST_ERROR = msg
             LAST_SCAN_SUMMARY = msg
+            # tenta avisar no Telegram também
+            if application is not None:
+                try:
+                    await application.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=f"[EvRadar PRO] {msg}",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e2:
+                    logger.warning("Falha ao enviar erro no Telegram: %s", e2)
             return msg
 
         total_live = len(fixtures)
@@ -247,16 +240,16 @@ async def scan_once(application: Optional[Application] = None) -> str:
                 fixture_id = int(fixture.get("id"))
 
                 odd_val: Optional[float] = None
+                odds_payload: Optional[Dict[str, Any]] = None
+
                 if USE_API_FOOTBALL_ODDS:
                     try:
                         odds_payload = await fetch_odds_for_fixture(client, fixture_id)
                     except Exception as e:
-                        # não quebra a varredura por causa de odds
                         logger.warning("Falha ao buscar odds para fixture %s: %s", fixture_id, e)
-                        odds_payload = None
 
-                    if odds_payload:
-                        odd_val = extract_over_line_odd(odds_payload, total_goals)
+                if odds_payload:
+                    odd_val = extract_over_line_odd(odds_payload, total_goals)
 
                 if odd_val is not None:
                     if odd_val < MIN_ODD or odd_val > MAX_ODD:
@@ -278,23 +271,9 @@ async def scan_once(application: Optional[Application] = None) -> str:
             except Exception as inner:
                 logger.warning("Erro ao processar fixture: %s", inner)
 
-        # Ordena por minuto desc (jogos mais quentes primeiro)
         candidates.sort(key=lambda x: x["minute"], reverse=True)
 
-        # Envia alertas no Telegram
-        if application is not None:
-            for ev in candidates:
-                text = format_signal_message(ev)
-                try:
-                    await application.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e:
-                    logger.warning("Falha ao enviar alerta no Telegram: %s", e)
-
+        # Monta resumo SEMPRE
         summary_lines: List[str] = []
         summary_lines.append(
             f"[EvRadar PRO] Scan concluído. Eventos ao vivo: {total_live} | Candidatos: {len(candidates)}."
@@ -305,17 +284,58 @@ async def scan_once(application: Optional[Application] = None) -> str:
             f"Janela: {WINDOW_START}–{WINDOW_END}ʼ | Odds alvo: {MIN_ODD:.2f}–{MAX_ODD:.2f}"
         )
 
+        if candidates:
+            preview = []
+            for ev in candidates[:5]:
+                preview.append(
+                    f"- {ev['league_name']}: {ev['home']} x {ev['away']} "
+                    f"({ev['minute']}' | {ev['goals_home']}–{ev['goals_away']} | odd={ev['odd']})"
+                )
+            summary_lines.append("")
+            summary_lines.append("Amostra de candidatos:")
+            summary_lines.extend(preview)
+        else:
+            summary_lines.append("")
+            summary_lines.append("Nenhum jogo encaixou nos filtros neste scan.")
+
         LAST_SCAN_SUMMARY = "\n".join(summary_lines)
         LAST_ERROR = None
         logger.info(LAST_SCAN_SUMMARY)
+
+        # Sempre manda resumo pro chat_id configurado no autoscan/manual
+        if application is not None:
+            try:
+                await application.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=LAST_SCAN_SUMMARY,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning("Falha ao enviar resumo no Telegram: %s", e)
+
+            # Se tiver candidatos, manda alerta detalhado também
+            for ev in candidates:
+                text = format_signal_message(ev)
+                try:
+                    await application.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=text,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.warning("Falha ao enviar alerta no Telegram: %s", e)
+
         return LAST_SCAN_SUMMARY
 
 
-# ----------------- Telegram Bot Handlers ----------------- #
+# ----------------- Telegram Handlers ----------------- #
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cid = update.effective_chat.id
     text_lines = [
         "👋 EvRadar PRO online.",
+        "",
+        f"Seu chat_id: {cid}",
         "",
         f"Janela padrão: {WINDOW_START}–{WINDOW_END}ʼ",
         f"Odds alvo (Superbet): {MIN_ODD:.2f}–{MAX_ODD:.2f}",
@@ -379,10 +399,6 @@ async def autoscan_loop(application: Application) -> None:
 
 
 async def dummy_http_server() -> None:
-    """
-    Servidor HTTP bem simples só para manter porta viva no Railway, se necessário.
-    Não precisa ser perfeito; é só para healthcheck.
-    """
     import socket
 
     host = "0.0.0.0"
@@ -409,14 +425,9 @@ async def dummy_http_server() -> None:
 
 
 async def post_init(application: Application) -> None:
-    """
-    Executado automaticamente pelo run_polling() depois de inicializar o bot.
-    Aqui iniciamos o autoscan (se AUTOSTART=1) e o servidor HTTP dummy.
-    """
     if AUTOSTART:
         application.create_task(autoscan_loop(application))
 
-    # Se estiver no Railway com PORT definido, sobe servidor HTTP dummy
     if os.getenv("PORT"):
         application.create_task(dummy_http_server())
 
