@@ -1,636 +1,351 @@
-#!/usr/bin/env python3
-"""
-EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, Render-friendly, odds reais + banca virtual básica)
-
-- Funciona local (notebook) e em nuvem (Render Web Service free).
-- Usa polling do Telegram (sem webhook).
-- Abre um servidor HTTP mínimo só para o Render enxergar uma porta aberta.
-- Autoscan sem spam: só manda mensagem automática SE houver alerta.
-- Calcula EV usando, quando possível, a ODD REAL AO VIVO da casa (API-Football /odds/live),
-  comparando com a odd justa do modelo.
-- Inclui banca virtual opcional com stake sugerida e comando /entrei para registrar entradas.
-
-Requisitos:
-    pip install python-telegram-bot==21.6 httpx python-dotenv
-"""
-
+import os
 import asyncio
 import logging
-import os
-import signal
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List
 
 import httpx
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    # Em produção (Render) não é obrigatório ter python-dotenv
-    pass
-
-from telegram import Update
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:  # pragma: no cover
+    load_dotenv = None
 
-# =========================
-#  Logging
-# =========================
-
+# -----------------------------------------------------
+# Logging
+# -----------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("EvRadarPRO")
 
+# -----------------------------------------------------
+# Helpers para ENV
+# -----------------------------------------------------
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = val.strip().lower()
+    return val in {"1", "true", "t", "yes", "y", "on"}
 
-# =========================
-#  Config / Settings
-# =========================
+def env_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    if not val:
+        return default
+    try:
+        return float(val.replace(",", "."))
+    except ValueError:
+        logger.warning("Valor inválido para %s=%r, usando default=%s", name, val, default)
+        return default
 
-DEFAULT_LEAGUES = [
-    39,   # Premier League
-    140,  # La Liga
-    135,  # Serie A
-    78,   # Bundesliga
-    61,   # Ligue 1
-    71,   # Serie B Itália / ligas fortes
-    72,
-    13,   # Brasileirão A
-    14,   # Brasileirão B
-    2, 3, 4, 5,  # UCL, UEL etc (ajustado conforme API)
-    180,
-    203,
-    62,
-    88,
-    89,
-    94,
-    128,
-    136,
-    141,
-    144,
-    79,
-    253,
-]
+def env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        logger.warning("Valor inválido para %s=%r, usando default=%s", name, val, default)
+        return default
 
+# -----------------------------------------------------
+# Carrega .env local (se existir)
+# -----------------------------------------------------
+if load_dotenv is not None:
+    load_dotenv()
+
+# -----------------------------------------------------
+# Config via ENV
+# -----------------------------------------------------
+API_BASE = "https://v3.football.api-sports.io"
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+
+AUTOSTART = env_bool("AUTOSTART", False)
+CHECK_INTERVAL = env_int("CHECK_INTERVAL", 300)
+
+WINDOW_START = env_int("WINDOW_START", 47)
+WINDOW_END = env_int("WINDOW_END", 75)
+
+MIN_ODD = env_float("MIN_ODD", 1.47)
+MAX_ODD = env_float("MAX_ODD", 2.30)
+TARGET_ODD = env_float("TARGET_ODD", 1.70)
+
+EV_MIN_PCT = env_float("EV_MIN_PCT", 1.60)
+
+BOOKMAKER_ID = env_int("BOOKMAKER_ID", 34)
+BOOKMAKER_NAME = os.getenv("BOOKMAKER_NAME", "Superbet")
+BOOKMAKER_URL = os.getenv("BOOKMAKER_URL", "https://www.superbet.com/")
+
+USE_API_FOOTBALL_ODDS = env_bool("USE_API_FOOTBALL_ODDS", True)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = env_int("TELEGRAM_CHAT_ID", 0)
+
+# Banca virtual
+USE_VIRTUAL_BANK = env_bool("USE_VIRTUAL_BANK", False)
+BANKROLL_INITIAL = env_float("BANKROLL_INITIAL", 5000.0)
+MAX_STAKE_PCT = 3.0  # hard cap de stake em %
+
+# "Noticiário" / contexto global – bias simples
+NEWS_BOOST_DEFAULT = env_float("NEWS_BOOST_DEFAULT", 0.0)  # em pontos percentuais
+
+# Ligas
+_raw_leagues = os.getenv("LEAGUE_IDS", "")
+LEAGUE_IDS: List[int] = []
+for part in _raw_leagues.split(","):
+    part = part.strip()
+    if not part:
+        continue
+    try:
+        LEAGUE_IDS.append(int(part))
+    except ValueError:
+        logger.warning("ID de liga inválido em LEAGUE_IDS: %r", part)
+
+if not LEAGUE_IDS:
+    logger.warning("Nenhuma liga configurada em LEAGUE_IDS – o radar pode não encontrar jogos.")
+
+# -----------------------------------------------------
+# Estado global simples (apenas em memória)
+# -----------------------------------------------------
+@dataclass
+class VirtualBankState:
+    enabled: bool = USE_VIRTUAL_BANK
+    initial_balance: float = BANKROLL_INITIAL
+    balance: float = BANKROLL_INITIAL
 
 @dataclass
-class Settings:
-    api_key: str
-    bot_token: str
-    chat_id_default: Optional[int]
-
-    target_odd: float
-    ev_min_pct: float
-    min_odd: float
-    max_odd: float
-    window_start: int
-    window_end: int
-    autostart: bool
-    check_interval: int
-
-    league_ids: List[int]
-    bookmaker_name: str
-    bookmaker_url: str
-    use_live_odds: bool
-    bookmaker_id: Optional[int]
-
-    bank_virtual_enabled: bool
-    bankroll_initial: float
-    kelly_fraction: float
-    stake_cap_pct: float
-    bank_leverage: float
-    context_boost_max_pp: float
-
-    def describe(self) -> str:
-        linhas: List[str] = []
-        linhas.append("⚙️ Configuração atual do EvRadar PRO (Notebook/Nuvem):")
-        linhas.append("")
-        linhas.append("• Janela: {}–{}'".format(self.window_start, self.window_end))
-        linhas.append(
-            "• Odds alvo (fallback): {:.2f} (min: {:.2f} | max: {:.2f})".format(
-                self.target_odd, self.min_odd, self.max_odd
-            )
-        )
-        linhas.append("• EV mínimo p/ alerta: {:.2f}%".format(self.ev_min_pct))
-
-        if self.use_live_odds:
-            if self.bookmaker_id is not None:
-                linhas.append(
-                    "• Odds em uso: AO VIVO via API-Football (bookmaker_id={})".format(
-                        self.bookmaker_id
-                    )
-                )
-            else:
-                linhas.append(
-                    "• Odds em uso: AO VIVO via API-Football (primeiro bookmaker disponível)"
-                )
-        else:
-            linhas.append(
-                "• Odds em uso: fixas pela odd alvo {:.2f}".format(self.target_odd)
-            )
-
-        linhas.append(
-            "• Competições: {} ids configurados (foco em ligas/copas relevantes)".format(
-                len(self.league_ids)
-            )
-        )
-        if self.autostart:
-            linhas.append("• Autoscan: ON a cada {}s".format(self.check_interval))
-        else:
-            linhas.append("• Autoscan: OFF (use /scan manual)")
-
-        if self.bank_virtual_enabled:
-            linhas.append(
-                "• Banca virtual: ON (R${:.2f}, Kelly x{:.2f}, cap {:.1f}%, alavancagem x{:.2f})".format(
-                    self.bankroll_initial,
-                    self.kelly_fraction,
-                    self.stake_cap_pct,
-                    self.bank_leverage,
-                )
-            )
-        else:
-            linhas.append("• Banca virtual: OFF")
-
-        linhas.append(
-            "• Casa referência: {} ({})".format(
-                self.bookmaker_name, self.bookmaker_url
-            )
-        )
-        return "\n".join(linhas)
-
-
-@dataclass
-class Candidate:
+class SignalInfo:
     fixture_id: int
-    league_name: str
-    home_team: str
-    away_team: str
+    home: str
+    away: str
     minute: int
     goals_home: int
     goals_away: int
-    prob_goal: float
-    fair_odd: float
-    used_odd: float
-    odd_source: str
+    odd_used: float
     ev_pct: float
-    tier: str
-    pressure_desc: str
-    context_desc: str
+    prob_pct: float
+    tier_label: str
+    tier_name: str
 
+VIRTUAL_BANK = VirtualBankState()
 
-@dataclass
-class VirtualBet:
-    fixture_id: int
-    desc: str
-    stake_pct: float
-    stake_value: float
-    odd: float
+chat_id_bound: Optional[int] = TELEGRAM_CHAT_ID
+LAST_SCAN_SUMMARY: str = "Nenhum scan executado ainda."
+LAST_SCAN_ORIGIN: str = "N/A"
 
+# odds por jogo
+LAST_ODD_BY_FIXTURE: Dict[int, float] = {}
+# sinais abertos (para mapear callback de /entrei)
+OPEN_SIGNALS: Dict[int, SignalInfo] = {}
+# aguardando odd digitada pelo usuário -> chat_id -> fixture_id
+PENDING_ODD_INPUT: Dict[int, int] = {}
+# histórico básico de entradas registradas
+ENTRIES: List[Dict[str, Any]] = []
 
-@dataclass
-class BotState:
-    autoscan_task: Optional[asyncio.Task] = None
-    last_scan_summary: str = "Nenhuma varredura ainda."
-    last_candidates: Dict[int, Candidate] = field(default_factory=dict)
-    bank_virtual_balance: float = 0.0
-    bank_virtual_enabled: bool = False
-    virtual_bets: List[VirtualBet] = field(default_factory=list)
-    chat_id_bound: Optional[int] = None
-    last_live_odds: Dict[int, float] = field(default_factory=dict)
+# client HTTP será criado no post_init
+HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
-
-STATE = BotState()
-
-
-def load_settings() -> Settings:
-    api_key = os.getenv("API_FOOTBALL_KEY", "").strip()
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not api_key or not bot_token:
-        logger.error("API_FOOTBALL_KEY e TELEGRAM_BOT_TOKEN são obrigatórios.")
-        raise SystemExit(1)
-
-    chat_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    chat_id_default: Optional[int] = None
-    if chat_raw:
-        try:
-            chat_id_default = int(chat_raw)
-        except Exception:
-            logger.warning("TELEGRAM_CHAT_ID inválido: %r", chat_raw)
-
-    def _float_env(key: str, default: float) -> float:
-        raw = os.getenv(key, "").strip()
-        if not raw:
-            return default
-        try:
-            return float(raw.replace(",", "."))
-        except Exception:
-            logger.warning("Valor inválido para %s=%r, usando default %.2f", key, raw, default)
-            return default
-
-    def _int_env(key: str, default: int) -> int:
-        raw = os.getenv(key, "").strip()
-        if not raw:
-            return default
-        try:
-            return int(raw)
-        except Exception:
-            logger.warning("Valor inválido para %s=%r, usando default %d", key, raw, default)
-            return default
-
-    target_odd = _float_env("TARGET_ODD", 1.70)
-    ev_min_pct = _float_env("EV_MIN_PCT", 3.0)
-    min_odd = _float_env("MIN_ODD", 1.47)
-    max_odd = _float_env("MAX_ODD", 3.50)
-    window_start = _int_env("WINDOW_START", 47)
-    window_end = _int_env("WINDOW_END", 82)
-
-    autostart_flag = os.getenv("AUTOSTART", "0").strip()
-    autostart = autostart_flag == "1"
-    check_interval = _int_env("CHECK_INTERVAL", 60)
-
-    leagues_raw = os.getenv("LEAGUE_IDS", "").strip()
-    if leagues_raw:
-        league_ids: List[int] = []
-        for part in leagues_raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                league_ids.append(int(part))
-            except Exception:
-                continue
-        if not league_ids:
-            league_ids = DEFAULT_LEAGUES
+# -----------------------------------------------------
+# Probabilidade / EV / Stake
+# -----------------------------------------------------
+def estimate_goal_probability(minute: int, goals_sum: int) -> float:
+    """
+    Estimativa simples de probabilidade de 1 gol a mais até o fim,
+    usando só tempo de jogo + placar + um pequeno bias de "contexto/notícias".
+    """
+    # base por tempo (janela 47–75+)
+    if minute < 55:
+        base = 0.65
+    elif minute < 60:
+        base = 0.62
+    elif minute < 65:
+        base = 0.60
+    elif minute < 70:
+        base = 0.58
+    elif minute < 75:
+        base = 0.55
+    elif minute < 80:
+        base = 0.52
     else:
-        league_ids = DEFAULT_LEAGUES
+        base = 0.48
 
-    bookmaker_name = os.getenv("BOOKMAKER_NAME", "Superbet").strip() or "Superbet"
-    bookmaker_url = os.getenv("BOOKMAKER_URL", "https://www.superbet.com/").strip() or "https://www.superbet.com/"
-
-    use_live_odds_flag = os.getenv("USE_API_FOOTBALL_ODDS", "1").strip()
-    use_live_odds = use_live_odds_flag == "1"
-    bookmaker_id_raw = os.getenv("BOOKMAKER_ID", "").strip()
-    if bookmaker_id_raw:
-        try:
-            bookmaker_id: Optional[int] = int(bookmaker_id_raw)
-        except Exception:
-            logger.warning("BOOKMAKER_ID inválido: %r (ignorando)", bookmaker_id_raw)
-            bookmaker_id = None
+    # ajuste por número de gols
+    if goals_sum == 0:
+        base -= 0.05
+    elif goals_sum == 1:
+        base += 0.02
+    elif goals_sum == 2:
+        base += 0.01
     else:
-        bookmaker_id = None
+        base -= 0.02
 
-    # Banca virtual
-    bank_enabled_flag = os.getenv("BANK_VIRTUAL_ENABLED", "0").strip()
-    bank_virtual_enabled = bank_enabled_flag == "1"
-    bankroll_initial = _float_env("BANKROLL_INITIAL", 5000.0)
-    kelly_fraction = _float_env("KELLY_FRACTION", 0.5)
-    stake_cap_pct = _float_env("STAKE_CAP_PCT", 3.0)
-    bank_leverage = _float_env("BANK_LEVERAGE", 1.0)
-    context_boost_max_pp = _float_env("CONTEXT_BOOST_MAX_PP", 3.0)
+    # "noticiário" global (em pontos percentuais)
+    base += NEWS_BOOST_DEFAULT / 100.0
 
-    settings = Settings(
-        api_key=api_key,
-        bot_token=bot_token,
-        chat_id_default=chat_id_default,
-        target_odd=target_odd,
-        ev_min_pct=ev_min_pct,
-        min_odd=min_odd,
-        max_odd=max_odd,
-        window_start=window_start,
-        window_end=window_end,
-        autostart=autostart,
-        check_interval=check_interval,
-        league_ids=league_ids,
-        bookmaker_name=bookmaker_name,
-        bookmaker_url=bookmaker_url,
-        use_live_odds=use_live_odds,
-        bookmaker_id=bookmaker_id,
-        bank_virtual_enabled=bank_virtual_enabled,
-        bankroll_initial=bankroll_initial,
-        kelly_fraction=kelly_fraction,
-        stake_cap_pct=stake_cap_pct,
-        bank_leverage=bank_leverage,
-        context_boost_max_pp=context_boost_max_pp,
-    )
+    p = max(0.01, min(0.99, base))
+    return p
 
-    STATE.bank_virtual_enabled = bank_virtual_enabled
-    STATE.bank_virtual_balance = bankroll_initial
+def compute_ev_pct(prob: float, odd: float) -> float:
+    return (prob * odd - 1.0) * 100.0
 
-    return settings
+def classify_tier(ev_pct: float) -> (str, str):
+    if ev_pct >= 7.0:
+        return "Tier A", "Sinal forte"
+    elif ev_pct >= 5.0:
+        return "Tier B", "Sinal bom"
+    elif ev_pct >= 3.0:
+        return "Tier C", "Sinal ok"
+    elif ev_pct >= 1.5:
+        return "Tier D", "Sinal marginal"
+    else:
+        return "Tier X", "Sinal fraco"
 
+def suggest_stake_pct(ev_pct: float, odd: float) -> float:
+    # tier pela EV
+    if ev_pct >= 7.0:
+        base = 3.0
+    elif ev_pct >= 5.0:
+        base = 2.5
+    elif ev_pct >= 3.0:
+        base = 2.0
+    elif ev_pct >= 1.5:
+        base = 1.25
+    else:
+        base = 0.75
 
-# =========================
-#  API-Football Client
-# =========================
+    # throttle por odd
+    if odd <= 1.80:
+        mult_odds = 1.0
+    elif odd <= 2.60:
+        mult_odds = 0.9
+    else:
+        mult_odds = 0.7
 
-API_BASE = "https://v3.football.api-sports.io"
-OVER_UNDER_BET_ID = 36  # mercado Over/Under para odds/live (API-Football)
+    stake = base * mult_odds
+    if stake > MAX_STAKE_PCT:
+        stake = MAX_STAKE_PCT
+    return max(0.25, stake)
 
+# -----------------------------------------------------
+# API-Football helpers
+# -----------------------------------------------------
+def get_headers() -> Dict[str, str]:
+    return {
+        "x-apisports-key": API_FOOTBALL_KEY,
+    }
 
-class ApiFootballClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self._client: Optional[httpx.AsyncClient] = None
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=API_BASE,
-                headers={"x-apisports-key": self.api_key},
-                timeout=10.0,
-            )
-        return self._client
-
-    async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
-
-    async def fetch_live_fixtures(self) -> List[Dict[str, Any]]:
-        client = await self._get_client()
-        resp = await client.get("/fixtures", params={"live": "all"})
-        if resp.status_code != 200:
-            logger.error("HTTP %s em fixtures/live: %s", resp.status_code, resp.text[:300])
-            return []
+async def fetch_live_fixtures() -> List[Dict[str, Any]]:
+    if not API_FOOTBALL_KEY:
+        logger.warning("API_FOOTBALL_KEY não configurada.")
+        return []
+    if HTTP_CLIENT is None:
+        raise RuntimeError("HTTP_CLIENT não inicializado ainda.")
+    params = {"live": "all"}
+    try:
+        resp = await HTTP_CLIENT.get(f"{API_BASE}/fixtures", params=params, headers=get_headers(), timeout=15)
+        resp.raise_for_status()
         data = resp.json()
         return data.get("response", []) or []
+    except Exception as exc:
+        logger.exception("Erro ao buscar fixtures ao vivo: %s", exc)
+        return []
 
-    async def fetch_statistics(self, fixture_id: int) -> Dict[str, Dict[str, Any]]:
-        client = await self._get_client()
-        resp = await client.get("/fixtures/statistics", params={"fixture": fixture_id})
-        if resp.status_code != 200:
-            logger.error("HTTP %s em fixtures/statistics(%s): %s", resp.status_code, fixture_id, resp.text[:300])
-            return {}
-
-        data = resp.json()
-        stats = data.get("response", []) or []
-        out: Dict[str, Dict[str, Any]] = {}
-        for item in stats:
-            team = item.get("team") or {}
-            side_name = (team.get("name") or "").lower()
-            side_key = "home" if "home" in side_name else "away"
-            vals = item.get("statistics") or []
-            stats_map: Dict[str, Any] = {}
-            for s in vals:
-                stat_name = str(s.get("type") or "").lower()
-                val = s.get("value")
-                stats_map[stat_name] = val
-            out[side_key] = stats_map
-        return out
-
-    async def fetch_live_over_under_odd(
-        self,
-        fixture_id: int,
-        total_goals: int,
-        bookmaker_id: Optional[int],
-    ) -> Optional[float]:
-        client = await self._get_client()
-        params: Dict[str, Any] = {
-            "fixture": fixture_id,
-            "bet": OVER_UNDER_BET_ID,
-        }
-        try:
-            resp = await client.get("/odds/live", params=params)
-        except Exception as exc:
-            logger.error("Erro em odds/live para fixture %s: %s", fixture_id, exc)
-            return None
-
-        if resp.status_code != 200:
-            logger.error(
-                "HTTP %s em odds/live(%s): %s",
-                resp.status_code,
-                fixture_id,
-                resp.text[:300],
-            )
-            return None
-
-        data = resp.json()
-        items = data.get("response", []) or []
-        if not items:
-            return None
-
-        item = items[0]
-        bookmakers = item.get("bookmakers") or []
-        chosen_book: Optional[Dict[str, Any]] = None
-
-        if bookmaker_id is not None:
-            for bk in bookmakers:
-                if bk.get("id") == bookmaker_id:
-                    chosen_book = bk
-                    break
-
-        if chosen_book is None and bookmakers:
-            chosen_book = bookmakers[0]
-
-        if chosen_book is None:
-            return None
-
-        bets = chosen_book.get("bets") or []
-        bet_obj: Optional[Dict[str, Any]] = None
-        for b in bets:
-            if b.get("id") == OVER_UNDER_BET_ID:
-                bet_obj = b
-                break
-            name = str(b.get("name") or "").lower()
-            if "over" in name and "under" in name:
-                bet_obj = b
-                break
-
-        if bet_obj is None:
-            return None
-
-        desired_line = float(total_goals) + 0.5
-        desired_str = "{:.1f}".format(desired_line)
-
-        values = bet_obj.get("values") or []
-        for v in values:
-            label = str(v.get("value") or "")
-            label_lower = label.lower()
-            if "over" in label_lower and desired_str in label_lower:
-                odd_raw = v.get("odd")
-                if odd_raw is None:
+def extract_over_under_odd(data: Dict[str, Any], target_line: float) -> Optional[float]:
+    """
+    Procura mercado de Over/Under gols com linha exata = target_line (ex.: 2.5)
+    e retorna a odd do Over.
+    """
+    response = data.get("response") or []
+    for item in response:
+        for bookmaker in item.get("bookmakers", []):
+            try:
+                bid = int(bookmaker.get("id"))
+            except Exception:
+                bid = None
+            if bid is not None and BOOKMAKER_ID and bid != BOOKMAKER_ID:
+                continue
+            for bet in bookmaker.get("bets", []):
+                name = str(bet.get("name", "")).lower()
+                if "over" not in name and "under" not in name:
                     continue
-                try:
-                    odd_val = float(str(odd_raw).replace(",", "."))
-                    return odd_val
-                except Exception:
-                    continue
+                for val in bet.get("values", []):
+                    value_str = str(val.get("value", ""))
+                    parts = value_str.split()
+                    if len(parts) < 2:
+                        continue
+                    label = parts[0].lower()
+                    try:
+                        line = float(parts[1])
+                    except Exception:
+                        continue
+                    if label.startswith("over") and abs(line - target_line) < 1e-6:
+                        try:
+                            return float(str(val.get("odd")))
+                        except Exception:
+                            continue
+    return None
 
+async def fetch_live_over_odd(fixture_id: int, goals_home: int, goals_away: int) -> Optional[float]:
+    if not USE_API_FOOTBALL_ODDS:
+        return None
+    if not API_FOOTBALL_KEY:
+        return None
+    if HTTP_CLIENT is None:
+        raise RuntimeError("HTTP_CLIENT não inicializado ainda.")
+    params = {"fixture": fixture_id, "bookmaker": BOOKMAKER_ID}
+    try:
+        resp = await HTTP_CLIENT.get(f"{API_BASE}/odds/live", params=params, headers=get_headers(), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.warning("Erro ao buscar odds ao vivo para fixture=%s: %s", fixture_id, exc)
         return None
 
+    target_line = goals_home + goals_away + 0.5
+    odd = extract_over_under_odd(data, target_line)
+    if odd is None:
+        logger.info("Não encontrei linha Over %.1f para fixture=%s, usando fallback", target_line, fixture_id)
+    return odd
 
-# =========================
-#  Modelo / Heurísticas
-# =========================
+# -----------------------------------------------------
+# Scan de jogos & geração de sinais
+# -----------------------------------------------------
+def bind_chat_id(chat_id: int) -> None:
+    global chat_id_bound
+    if chat_id_bound != chat_id:
+        logger.info("Atualizando chat_id_bound: %s -> %s", chat_id_bound, chat_id)
+        chat_id_bound = chat_id
 
-def _get_int_stat(stats: Dict[str, Any], key: str) -> int:
-    val = stats.get(key)
-    if val is None:
-        return 0
-    try:
-        return int(str(val).replace("%", "").strip())
-    except Exception:
-        return 0
+def get_bound_chat_id() -> int:
+    if chat_id_bound:
+        return chat_id_bound
+    return TELEGRAM_CHAT_ID
 
+async def run_scan(application: Application, origin: str) -> None:
+    global LAST_SCAN_SUMMARY, LAST_SCAN_ORIGIN, OPEN_SIGNALS
 
-def compute_pressure_and_prob(
-    minute: int,
-    goals_home: int,
-    goals_away: int,
-    stats_home: Dict[str, Any],
-    stats_away: Dict[str, Any],
-    context_boost_max_pp: float,
-    league_name: str,
-) -> Tuple[float, str, float, str]:
-    """
-    Retorna:
-      prob_goal (0-1),
-      pressure_desc,
-      context_boost_pp,
-      context_desc
-    """
-    # Stats básicas
-    sh_home = _get_int_stat(stats_home, "shots on goal")
-    sh_away = _get_int_stat(stats_away, "shots on goal")
-    st_home = _get_int_stat(stats_home, "shots on target")
-    st_away = _get_int_stat(stats_away, "shots on target")
-    da_home = _get_int_stat(stats_home, "dangerous attacks")
-    da_away = _get_int_stat(stats_away, "dangerous attacks")
-    poss_home = _get_int_stat(stats_home, "ball possession")
-    poss_away = _get_int_stat(stats_away, "ball possession")
+    fixtures = await fetch_live_fixtures()
+    total_live = len(fixtures)
+    candidates: List[SignalInfo] = []
 
-    total_shots = sh_home + sh_away + st_home + st_away
-    total_da = da_home + da_away
-
-    pressure_score = 0.0
-    pressure_bits: List[str] = []
-
-    if total_shots >= 8:
-        pressure_score += 0.15
-        pressure_bits.append("muitos chutes")
-    elif total_shots >= 5:
-        pressure_score += 0.08
-        pressure_bits.append("bom volume de chutes")
-
-    if st_home + st_away >= 5:
-        pressure_score += 0.15
-        pressure_bits.append("muitos chutes no alvo")
-    elif st_home + st_away >= 3:
-        pressure_score += 0.08
-        pressure_bits.append("chutes no alvo razoáveis")
-
-    if total_da >= 60:
-        pressure_score += 0.10
-        pressure_bits.append("muitos ataques perigosos")
-    elif total_da >= 40:
-        pressure_score += 0.06
-        pressure_bits.append("ataques perigosos ok")
-
-    # Ritmo por minuto (quanto mais tarde, menos tempo pra sair o gol)
-    base_p = 0.60  # prob base bruta de 1 gol a partir de ~50'
-    if minute >= 75:
-        base_p -= 0.08
-    elif minute >= 70:
-        base_p -= 0.04
-    elif minute <= 55:
-        base_p += 0.03
-
-    # Ajuste por placar (0x0, 1x0, etc.)
-    total_goals = goals_home + goals_away
-    if total_goals == 0:
-        base_p += 0.04  # tendência pra abrir o placar
-    elif total_goals == 1:
-        base_p += 0.02
-
-    # Contexto tático simples: desequilíbrio de posse
-    poss_diff = abs(poss_home - poss_away)
-    if poss_diff >= 20:
-        pressure_score += 0.05
-        pressure_bits.append("posse bem desequilibrada")
-
-    # probability raw
-    prob_goal = max(0.40, min(0.85, base_p + pressure_score))
-
-    # Context boost por importância da competição (simples, baseado no nome)
-    league_lower = league_name.lower()
-    context_boost_pp = 0.0
-    context_bits: List[str] = []
-    if "champions" in league_lower or "libertadores" in league_lower:
-        context_boost_pp += context_boost_max_pp
-        context_bits.append("jogo grande (Champions/Liberta)")
-    elif any(k in league_lower for k in ["serie a", "premier", "la liga", "bundesliga", "ligue 1"]):
-        context_boost_pp += min(context_boost_max_pp, 2.0)
-        context_bits.append("liga principal")
-    elif any(k in league_lower for k in ["brasileirao", "brasileirão", "superliga", "primeira", "liga profissional"]):
-        context_boost_pp += min(context_boost_max_pp, 2.0)
-        context_bits.append("liga nacional forte")
-
-    # Converte boost em probabilidade (pontos percentuais)
-    prob_goal += context_boost_pp / 100.0
-    prob_goal = max(0.40, min(0.90, prob_goal))
-
-    pressure_desc = ", ".join(pressure_bits) if pressure_bits else "ritmo moderado"
-    context_desc = ", ".join(context_bits) if context_bits else "contexto neutro"
-
-    return prob_goal, pressure_desc, context_boost_pp, context_desc
-
-
-def classify_tier(ev_pct: float) -> str:
-    if ev_pct >= 7.0:
-        return "A"
-    elif ev_pct >= 4.0:
-        return "B"
-    else:
-        return "C"
-
-
-def compute_stake_pct(
-    settings: Settings,
-    prob_goal: float,
-    used_odd: float,
-) -> float:
-    # Kelly fracionado simples
-    if not settings.bank_virtual_enabled:
-        return 0.0
-    b = used_odd - 1.0
-    p = prob_goal
-    q = 1.0 - p
-    edge = (b * p - q) / b if b > 0 else 0.0
-    if edge <= 0:
-        return 0.0
-    stake_kelly = edge
-    stake_frac = stake_kelly * settings.kelly_fraction
-    # cap
-    stake_frac = min(stake_frac, settings.stake_cap_pct / 100.0)
-    # nunca negativo
-    return max(0.0, stake_frac)
-
-
-# =========================
-#  Scanner de jogos
-# =========================
-
-async def find_candidates(settings: Settings, api: ApiFootballClient) -> List[Candidate]:
-    fixtures = await api.fetch_live_fixtures()
-    candidates: List[Candidate] = []
-
-    for fx in fixtures:
-        fixture = fx.get("fixture") or {}
-        league = fx.get("league") or {}
-        teams = fx.get("teams") or {}
-        goals = fx.get("goals") or {}
-
+    for item in fixtures:
+        league = item.get("league") or {}
         league_id = league.get("id")
-        if league_id not in settings.league_ids:
+        if LEAGUE_IDS and league_id not in LEAGUE_IDS:
             continue
 
-        # status / minuto
+        fixture = item.get("fixture") or {}
         status = fixture.get("status") or {}
         elapsed = status.get("elapsed")
         if elapsed is None:
@@ -640,8 +355,21 @@ async def find_candidates(settings: Settings, api: ApiFootballClient) -> List[Ca
         except Exception:
             continue
 
-        if minute < settings.window_start or minute > settings.window_end:
+        status_short = str(status.get("short", "")).upper()
+        if status_short not in {"1H", "2H"}:
             continue
+
+        if minute < WINDOW_START or minute > WINDOW_END:
+            continue
+
+        teams = item.get("teams") or {}
+        home_team = (teams.get("home") or {}).get("name", "Home")
+        away_team = (teams.get("away") or {}).get("name", "Away")
+
+        goals = item.get("goals") or {}
+        goals_home = goals.get("home") or 0
+        goals_away = goals.get("away") or 0
+        goals_sum = (goals_home or 0) + (goals_away or 0)
 
         fixture_id = fixture.get("id")
         if fixture_id is None:
@@ -651,431 +379,435 @@ async def find_candidates(settings: Settings, api: ApiFootballClient) -> List[Ca
         except Exception:
             continue
 
-        home = teams.get("home") or {}
-        away = teams.get("away") or {}
-        home_name = home.get("name") or "Casa"
-        away_name = away.get("name") or "Fora"
-        league_name = league.get("name") or "Liga"
-
-        goals_home = goals.get("home") or 0
-        goals_away = goals.get("away") or 0
-
-        stats = await api.fetch_statistics(fixture_id_int)
-        stats_home = stats.get("home", {})
-        stats_away = stats.get("away", {})
-
-        prob_goal, pressure_desc, context_boost_pp, context_desc = compute_pressure_and_prob(
-            minute,
-            goals_home,
-            goals_away,
-            stats_home,
-            stats_away,
-            settings.context_boost_max_pp,
-            league_name,
-        )
-
-        fair_odd = 1.0 / prob_goal if prob_goal > 0 else settings.target_odd
-
-        total_goals = goals_home + goals_away
-        used_odd = settings.target_odd
-        odd_source = "alvo"
-
-        if settings.use_live_odds:
-            live_odd = await api.fetch_live_over_under_odd(
-                fixture_id_int,
-                total_goals,
-                settings.bookmaker_id,
-            )
-            if live_odd is not None:
-                used_odd = live_odd
-                odd_source = "live"
-                STATE.last_live_odds[fixture_id_int] = live_odd
-            else:
-                # se não veio odd nova (ex: mercado suspenso), tenta usar a última odd viva conhecida
-                if fixture_id_int in STATE.last_live_odds:
-                    used_odd = STATE.last_live_odds[fixture_id_int]
-                    odd_source = "live-cache"
-
-        if used_odd < settings.min_odd or used_odd > settings.max_odd:
-            continue
-
-        ev = prob_goal * used_odd - 1.0
-        ev_pct = ev * 100.0
-
-        if ev_pct < settings.ev_min_pct:
-            continue
-
-        tier = classify_tier(ev_pct)
-
-        cand = Candidate(
-            fixture_id=fixture_id_int,
-            league_name=league_name,
-            home_team=home_name,
-            away_team=away_name,
-            minute=minute,
-            goals_home=goals_home,
-            goals_away=goals_away,
-            prob_goal=prob_goal,
-            fair_odd=fair_odd,
-            used_odd=used_odd,
-            odd_source=odd_source,
-            ev_pct=ev_pct,
-            tier=tier,
-            pressure_desc=pressure_desc,
-            context_desc=context_desc,
-        )
-        candidates.append(cand)
-
-    candidates.sort(key=lambda c: c.ev_pct, reverse=True)
-    return candidates
-
-
-def format_candidate_message(c: Candidate, settings: Settings) -> str:
-    placar = "{}–{}".format(c.goals_home, c.goals_away)
-    prob_str = "{:.1f}%".format(c.prob_goal * 100.0)
-    ev_str = "{:.2f}%".format(c.ev_pct)
-    fair_odd_str = "{:.2f}".format(c.fair_odd)
-    used_odd_str = "{:.2f}".format(c.used_odd)
-    linha = "Over (soma + 0,5) @ {}".format(used_odd_str)
-
-    if c.tier == "A":
-        tier_title = "Tier A — Sinal forte"
-    elif c.tier == "B":
-        tier_title = "Tier B — Sinal interessante"
-    else:
-        tier_title = "Tier C — Sinal mais leve"
-
-    ev_label = "EV+ ✅" if c.ev_pct >= 0 else "EV- ❌"
-
-    if c.odd_source == "live":
-        odd_info = "odd real da casa"
-    elif c.odd_source == "live-cache":
-        odd_info = "última odd real conhecida"
-    else:
-        odd_info = "odd alvo (fallback)"
-
-    # stake sugerida
-    stake_pct = compute_stake_pct(settings, c.prob_goal, c.used_odd)
-    stake_line = ""
-    if settings.bank_virtual_enabled and stake_pct > 0 and STATE.bank_virtual_balance > 0:
-        stake_value = STATE.bank_virtual_balance * stake_pct * settings.bank_leverage
-        stake_line = "📌 Stake sugerida (banca virtual): {:.2f}% ≈ R${:.2f}".format(
-            stake_pct * 100.0, stake_value
-        )
-    else:
-        stake_line = "📌 Stake sugerida: ajuste conforme sua gestão."
-
-    linhas: List[str] = []
-    linhas.append("🔔 {} ({})".format(tier_title, c.league_name))
-    linhas.append("")
-    linhas.append("🏟️ {} vs {}".format(c.home_team, c.away_team))
-    linhas.append("⏱️ {}' | 🔢 Placar {}".format(c.minute, placar))
-    linhas.append("⚙️ Linha: {} [{}]".format(linha, odd_info))
-    linhas.append("📊 Probabilidade: {} | Odd justa: {}".format(prob_str, fair_odd_str))
-    linhas.append("💰 EV: {} → {}".format(ev_str, ev_label))
-    linhas.append("")
-    linhas.append("🧩 Contexto: {} | Pressão: {}".format(c.context_desc, c.pressure_desc))
-    linhas.append(stake_line)
-    linhas.append("")
-    linhas.append(
-        "Se entrar, responda com: /entrei {} <odd_que_você_pegar>\n"
-        "Exemplo: /entrei {} {:.2f}".format(c.fixture_id, c.fixture_id, c.used_odd)
-    )
-    return "\n".join(linhas)
-
-
-# =========================
-#  Telegram Handlers
-# =========================
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id:
-        STATE.chat_id_bound = chat_id
-    text = "👋 EvRadar PRO online (Notebook/Nuvem).\n\n" + settings.describe()
-    await update.effective_message.reply_text(text)
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = "📈 Status do EvRadar PRO (Notebook/Nuvem)\n\n" + STATE.last_scan_summary
-    await update.effective_message.reply_text(msg)
-
-
-async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
-    linhas: List[str] = []
-    linhas.append("🐞 Debug EvRadar PRO")
-    linhas.append("")
-    linhas.append("API base: {}".format(API_BASE))
-    linhas.append("Ligas ativas ({}): {}".format(len(settings.league_ids), settings.league_ids))
-    linhas.append(
-        "Autoscan: {} (CHECK_INTERVAL={}s)".format(
-            "ON" if settings.autostart else "OFF", settings.check_interval
-        )
-    )
-    if settings.use_live_odds:
-        if settings.bookmaker_id is not None:
-            linhas.append("Odds: AO VIVO via /odds/live (bookmaker_id={})".format(settings.bookmaker_id))
+        # pegar odd ao vivo, ou última conhecida, ou fallback
+        odd_source = "fallback"
+        odd = await fetch_live_over_odd(fixture_id_int, goals_home, goals_away)
+        if odd is not None:
+            odd_source = "ao vivo"
+            LAST_ODD_BY_FIXTURE[fixture_id_int] = odd
         else:
-            linhas.append("Odds: AO VIVO via /odds/live (primeiro bookmaker)")
-    else:
-        linhas.append("Odds: fixas pela odd alvo {:.2f}".format(settings.target_odd))
-    if STATE.chat_id_bound:
-        linhas.append("chat_id_bound atual: {}".format(STATE.chat_id_bound))
-    if settings.chat_id_default:
-        linhas.append("TELEGRAM_CHAT_ID default: {}".format(settings.chat_id_default))
-    linhas.append(
-        "Banca virtual: {} | saldo R${:.2f}".format(
-            "ON" if settings.bank_virtual_enabled else "OFF",
-            STATE.bank_virtual_balance,
+            if fixture_id_int in LAST_ODD_BY_FIXTURE:
+                odd = LAST_ODD_BY_FIXTURE[fixture_id_int]
+                odd_source = "última"
+            else:
+                odd = TARGET_ODD
+                odd_source = "fallback"
+
+        if odd < MIN_ODD or odd > MAX_ODD:
+            continue
+
+        prob = estimate_goal_probability(minute, goals_sum)
+        ev_pct = compute_ev_pct(prob, odd)
+        if ev_pct < EV_MIN_PCT:
+            continue
+
+        tier_label, tier_name = classify_tier(ev_pct)
+
+        sig = SignalInfo(
+            fixture_id=fixture_id_int,
+            home=home_team,
+            away=away_team,
+            minute=minute,
+            goals_home=goals_home or 0,
+            goals_away=goals_away or 0,
+            odd_used=odd,
+            ev_pct=ev_pct,
+            prob_pct=prob * 100.0,
+            tier_label=tier_label,
+            tier_name=tier_name,
         )
-    )
-    await update.effective_message.reply_text("\n".join(linhas))
+        candidates.append(sig)
 
+        await send_signal_message(application, sig, odd_source)
 
-async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
-    linhas = [
-        "🔗 Links úteis",
-        "",
-        "Casa referência: {} ({})".format(settings.bookmaker_name, settings.bookmaker_url),
-        "",
-        "API-Football: https://www.api-football.com/",
-    ]
-    await update.effective_message.reply_text("\n".join(linhas))
+    OPEN_SIGNALS = {s.fixture_id: s for s in candidates}
 
-
-async def do_scan_once(app: Application, origin: str) -> None:
-    settings: Settings = app.bot_data["settings"]  # type: ignore[index]
-    api: ApiFootballClient = app.bot_data["api_client"]  # type: ignore[index]
-
-    candidates = await find_candidates(settings, api)
-    STATE.last_candidates = {c.fixture_id: c for c in candidates}
-
-    if not candidates:
-        summary = "[EvRadar PRO] Scan concluído (origem={}). Nenhum sinal na janela.".format(origin)
-        STATE.last_scan_summary = summary
-        # Só mandar mensagem em autoscan se houver sinal, pra evitar spam
-        if origin == "manual":
-            chat_id = STATE.chat_id_bound or settings.chat_id_default
-            if chat_id:
-                await app.bot.send_message(chat_id=chat_id, text=summary)
-        return
-
-    summary_lines: List[str] = []
-    summary_lines.append(
-        "[EvRadar PRO] Scan concluído (origem={}). Eventos com valor: {}".format(
-            origin, len(candidates)
-        )
-    )
-    for c in candidates[:5]:
-        summary_lines.append(
-            "- {} vs {} ({}', EV {:.2f}%, odd {:.2f})".format(
-                c.home_team, c.away_team, c.minute, c.ev_pct, c.used_odd
+    chat_id = get_bound_chat_id()
+    if chat_id:
+        if candidates:
+            resumo = (
+                f"[EvRadar PRO] Scan concluído (origem={origin}). "
+                f"Eventos ao vivo: {total_live} | Jogos analisados na janela: {len(candidates)} | "
+                f"Alertas enviados: {len(candidates)}"
             )
-        )
-    STATE.last_scan_summary = "\n".join(summary_lines)
+        else:
+            resumo = (
+                f"[EvRadar PRO] Scan concluído (origem={origin}). Nenhum sinal na janela."
+            )
+        LAST_SCAN_SUMMARY = resumo
+        LAST_SCAN_ORIGIN = origin
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=resumo)
+        except Exception as exc:
+            logger.warning("Falha ao enviar resumo do scan: %s", exc)
+    else:
+        LAST_SCAN_SUMMARY = "Scan executado sem chat vinculado."
+        LAST_SCAN_ORIGIN = origin
 
-    chat_id = STATE.chat_id_bound or settings.chat_id_default
+async def send_signal_message(application: Application, sig: SignalInfo, odd_source: str) -> None:
+    chat_id = get_bound_chat_id()
     if not chat_id:
         return
 
-    # Manda mensagem resumo + detalhes de cada candidato
-    await app.bot.send_message(chat_id=chat_id, text=STATE.last_scan_summary)
-    for c in candidates:
-        msg = format_candidate_message(c, settings)
-        await app.bot.send_message(chat_id=chat_id, text=msg)
+    linha_total = sig.goals_home + sig.goals_away + 0.5
+    prob_str = f"{sig.prob_pct:.1f}%"
+    odd_fair = sig.odd_used / (sig.prob_pct / 100.0) if sig.prob_pct > 0 else 0.0
+    ev_str = f"{sig.ev_pct:+.2f}%"
 
+    if odd_source == "ao vivo":
+        odd_src_label = "AO VIVO"
+    elif odd_source == "última":
+        odd_src_label = "última odd conhecida"
+    else:
+        odd_src_label = "fallback (TARGET_ODD)"
 
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id:
-        STATE.chat_id_bound = chat_id
-    await update.effective_message.reply_text(
-        "🔍 Iniciando varredura manual de jogos ao vivo (EvRadar PRO)..."
+    if VIRTUAL_BANK.enabled:
+        stake_pct = suggest_stake_pct(sig.ev_pct, sig.odd_used)
+        stake_value = VIRTUAL_BANK.balance * stake_pct / 100.0
+        bank_lines = [
+            f"- Saldo simulado: R${VIRTUAL_BANK.balance:,.2f}",
+            f"- Stake sugerida: {stake_pct:.2f}% da banca (≈ R${stake_value:,.2f})",
+        ]
+    else:
+        bank_lines = [
+            "- Banca virtual OFF (usando apenas EV para decisão)."
+        ]
+
+    lines: List[str] = []
+    lines.append(f"🔔 {sig.tier_label} — {sig.tier_name} (EV {ev_str})")
+    lines.append("")
+    lines.append(f"🏟️ {sig.home} vs {sig.away}")
+    lines.append(f"⏱️ {sig.minute}' | 🔢 {sig.goals_home}–{sig.goals_away}")
+    lines.append(f"⚙️ Linha: Over (soma + 0,5) @ {sig.odd_used:.2f} [{odd_src_label}] (linha total: {linha_total:.1f})")
+    lines.append("")
+    lines.append("📊 Probabilidade & valor:")
+    lines.append(f"- P_final (gol a mais): {prob_str}")
+    lines.append(f"- Odd justa (modelo): {odd_fair:.2f}")
+    lines.append(f"- EV na odd atual: {ev_str}")
+    lines.append("")
+    lines.append("💰 Gestão (banca virtual):")
+    lines.extend(bank_lines)
+    lines.append("")
+    lines.append("🧩 Interpretação:")
+    lines.append(
+        "Jogo dentro da janela com probabilidade interessante de 1 gol a mais "
+        "e odd acima do justo pelo modelo. Ajuste o risco conforme seu perfil."
     )
-    await do_scan_once(context.application, origin="manual")
-    # No final, o resumo já foi atualizado e (se houver sinais) enviado.
+    lines.append("")
+    lines.append(
+        "Se entrar, toca em ✅ ENTREI abaixo para o radar registrar e sugerir stake pela banca virtual."
+    )
 
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Entrei", callback_data=f"enter:{sig.fixture_id}"),
+            InlineKeyboardButton("❌ Pulei", callback_data=f"skip:{sig.fixture_id}"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Abrir mercado (Superbet)", url=BOOKMAKER_URL),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-async def cmd_entrei(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /entrei <fixture_id> <odd>
-    Exemplo: /entrei 1451092 1.85
-    Registra entrada na banca virtual.
-    """
-    settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
-    if not settings.bank_virtual_enabled:
-        await update.effective_message.reply_text(
-            "A banca virtual está desligada. Ative com BANK_VIRTUAL_ENABLED=1 nas variáveis de ambiente."
-        )
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.effective_message.reply_text(
-            "Uso: /entrei <fixture_id> <odd>\nExemplo: /entrei 1451092 1.85"
-        )
-        return
-
+    text = "\n".join(lines)
     try:
-        fixture_id = int(args[0])
-        odd = float(args[1].replace(",", "."))
-    except Exception:
-        await update.effective_message.reply_text(
-            "Não entendi os argumentos. Exemplo correto: /entrei 1451092 1.85"
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
         )
+    except Exception as exc:
+        logger.warning("Falha ao enviar sinal: %s", exc)
+
+# -----------------------------------------------------
+# Autoscan & HTTP dummy
+# -----------------------------------------------------
+async def autoscan_loop(application: Application) -> None:
+    if not AUTOSTART:
+        logger.info("AUTOSTART=0 – autoscan desabilitado (use /scan manual).")
         return
-
-    cand = STATE.last_candidates.get(fixture_id)
-    if not cand:
-        await update.effective_message.reply_text(
-            "Não achei esse jogo no último scan. Tente usar /scan antes ou confira o ID."
-        )
-        return
-
-    stake_pct = compute_stake_pct(settings, cand.prob_goal, odd)
-    if stake_pct <= 0 or STATE.bank_virtual_balance <= 0:
-        await update.effective_message.reply_text(
-            "Esse jogo não gera stake positiva na banca virtual (edge ≤ 0). Entrada não registrada."
-        )
-        return
-
-    stake_value = STATE.bank_virtual_balance * stake_pct * settings.bank_leverage
-    vb = VirtualBet(
-        fixture_id=fixture_id,
-        desc="{} vs {} ({}')".format(cand.home_team, cand.away_team, cand.minute),
-        stake_pct=stake_pct * 100.0,
-        stake_value=stake_value,
-        odd=odd,
-    )
-    STATE.virtual_bets.append(vb)
-
-    await update.effective_message.reply_text(
-        "Entrada registrada na banca virtual:\n"
-        "🏟️ {desc}\n"
-        "⚙️ Over (soma+0,5) @ {odd:.2f}\n"
-        "📌 Stake: {pct:.2f}% ≈ R${val:.2f}\n\n"
-        "Obs: por enquanto o resultado (green/red) ainda é manual, mas já guardamos stake e odd.\n"
-        "Depois podemos evoluir para liquidar automaticamente pelo placar final.".format(
-            desc=vb.desc,
-            odd=vb.odd,
-            pct=vb.stake_pct,
-            val=vb.stake_value,
-        )
-    )
-
-
-# =========================
-#  Autoscan + HTTP dummy
-# =========================
-
-async def autoscan_loop(app: Application) -> None:
-    settings: Settings = app.bot_data["settings"]  # type: ignore[index]
-    logger.info("Autoscan iniciado (intervalo=%ss)", settings.check_interval)
+    logger.info("Autoscan iniciado (intervalo=%ss)", CHECK_INTERVAL)
     while True:
         try:
-            await do_scan_once(app, origin="auto")
+            await run_scan(application, origin="auto")
         except Exception as exc:
-            logger.error("Erro no autoscan: %s", exc)
-        await asyncio.sleep(settings.check_interval)
-
-
-async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    try:
-        data = await reader.read(1024)
-        _ = data
-        resp = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain; charset=utf-8\r\n"
-            "Content-Length: 16\r\n"
-            "\r\n"
-            "EvRadar online\n"
-        )
-        writer.write(resp.encode("utf-8"))
-        await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-
+            logger.exception("Erro no autoscan: %s", exc)
+        await asyncio.sleep(CHECK_INTERVAL)
 
 async def start_dummy_http_server() -> None:
-    port_raw = os.getenv("PORT", "10000")
-    try:
-        port = int(port_raw)
-    except Exception:
-        port = 10000
-    server = await asyncio.start_server(handle_http, host="0.0.0.0", port=port)
-    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
-    logger.info("Servidor HTTP dummy ouvindo em %s", addrs)
+    """
+    Servidor HTTP simples só para manter a porta 8080 aberta (health-check).
+    """
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read(1024)
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "EvRadar PRO online"
+            )
+            writer.write(response.encode("utf-8"))
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle, host="0.0.0.0", port=8080)
+    addr = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+    logger.info("Servidor HTTP dummy ouvindo em %s", addr)
     async with server:
         await server.serve_forever()
 
+# -----------------------------------------------------
+# Comandos
+# -----------------------------------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat:
+        bind_chat_id(update.effective_chat.id)
 
-async def on_startup(app: Application) -> None:
-    settings: Settings = app.bot_data["settings"]  # type: ignore[index]
-    if settings.autostart and STATE.autoscan_task is None:
-        STATE.autoscan_task = asyncio.create_task(autoscan_loop(app))
-    # servidor HTTP dummy para o Render enxergar porta
-    asyncio.create_task(start_dummy_http_server())
+    autoscan_label = "ON a cada " + str(CHECK_INTERVAL) + "s" if AUTOSTART else "OFF (manual apenas)"
+    odds_label = "AO VIVO via API-Football (bookmaker_id={})".format(BOOKMAKER_ID) if USE_API_FOOTBALL_ODDS else "Fallback TARGET_ODD"
 
+    banca_label = "ON" if VIRTUAL_BANK.enabled else "OFF"
 
-async def on_shutdown(app: Application) -> None:
-    logger.info("Encerrando EvRadar PRO...")
-    if STATE.autoscan_task is not None:
-        STATE.autoscan_task.cancel()
+    lines = [
+        "👋 EvRadar PRO online (Notebook/Nuvem).",
+        "",
+        "⚙️ Configuração atual do EvRadar PRO (Notebook/Nuvem):",
+        "",
+        f"• Janela: {WINDOW_START}–{WINDOW_END}'",
+        f"• Odds alvo (fallback): {TARGET_ODD:.2f} (min: {MIN_ODD:.2f} | max: {MAX_ODD:.2f})",
+        f"• EV mínimo p/ alerta: {EV_MIN_PCT:.2f}%",
+        f"• Odds em uso: {odds_label}",
+        f"• Competições: {len(LEAGUE_IDS)} ids configurados (foco em ligas/copas relevantes)",
+        f"• Autoscan: {autoscan_label}",
+        f"• Banca virtual: {banca_label}",
+        f"• Casa referência: {BOOKMAKER_NAME} ({BOOKMAKER_URL})",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat:
+        bind_chat_id(update.effective_chat.id)
+    await update.message.reply_text("🔍 Iniciando varredura manual de jogos ao vivo (EvRadar PRO)...")
+    await run_scan(context.application, origin="manual")
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    banca_label = "ON" if VIRTUAL_BANK.enabled else "OFF"
+    lines = [
+        "📈 Status do EvRadar PRO (Notebook/Nuvem)",
+        "",
+        LAST_SCAN_SUMMARY,
+        "",
+        f"Banca virtual: {banca_label} | saldo R${VIRTUAL_BANK.balance:,.2f}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    autoscan_label = "ON (CHECK_INTERVAL={}s)".format(CHECK_INTERVAL) if AUTOSTART else "OFF"
+    odds_label = "AO VIVO via /odds/live (bookmaker_id={})".format(BOOKMAKER_ID) if USE_API_FOOTBALL_ODDS else "Fallback TARGET_ODD"
+    banca_label = "ON" if VIRTUAL_BANK.enabled else "OFF"
+    bound = chat_id_bound or TELEGRAM_CHAT_ID
+    lines = [
+        "🐞 Debug EvRadar PRO",
+        "",
+        f"API base: {API_BASE}",
+        f"Ligas ativas ({len(LEAGUE_IDS)}): {LEAGUE_IDS}",
+        f"Autoscan: {autoscan_label}",
+        f"Odds: {odds_label}",
+        f"chat_id_bound atual: {bound}",
+        f"TELEGRAM_CHAT_ID default: {TELEGRAM_CHAT_ID}",
+        f"Banca virtual: {banca_label} | saldo R${VIRTUAL_BANK.balance:,.2f}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = [
+        "🔗 Links úteis:",
+        f"- Casa referência: {BOOKMAKER_NAME} → {BOOKMAKER_URL}",
+        "",
+        "Comandos:",
+        "/start  → ver configuração atual",
+        "/scan   → rodar varredura agora",
+        "/status → ver resumo da última varredura",
+        "/debug  → info técnica",
+        "/links  → esta mensagem",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+# -----------------------------------------------------
+# Callbacks (inline buttons) & captura de odd
+# -----------------------------------------------------
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    chat = query.message.chat if query.message else None
+    chat_id = chat.id if chat else None
+    if data.startswith("enter:"):
+        parts = data.split(":", 1)
         try:
-            await STATE.autoscan_task
-        except asyncio.CancelledError:
+            fixture_id = int(parts[1])
+        except Exception:
+            return
+        if chat_id is not None:
+            PENDING_ODD_INPUT[chat_id] = fixture_id
+        sig = OPEN_SIGNALS.get(fixture_id)
+        title = f"{sig.home} vs {sig.away}" if sig else f"fixture {fixture_id}"
+        text_lines = [
+            "✅ Beleza, marquei que você ENTROU nesse jogo:",
+            f"- {title}",
+            "",
+            "Agora manda a ODD exata que você pegou nesse mercado (ex.: 1.78).",
+            "É só mandar o número aqui no chat, sem mais nada.",
+        ]
+        await query.message.reply_text("\n".join(text_lines))
+    elif data.startswith("skip:"):
+        parts = data.split(":", 1)
+        try:
+            fixture_id = int(parts[1])
+        except Exception:
+            fixture_id = None
+        title = ""
+        if fixture_id is not None and fixture_id in OPEN_SIGNALS:
+            sig = OPEN_SIGNALS[fixture_id]
+            title = f"{sig.home} vs {sig.away}"
+        msg = "🧊 Blz, marcado como PULEI."
+        if title:
+            msg += " " + title
+        await query.message.reply_text(msg)
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.message:
+        return
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    if chat_id not in PENDING_ODD_INPUT:
+        # texto solto – ignoramos pra não spammar
+        return
+
+    # estamos esperando uma odd
+    fixture_id = PENDING_ODD_INPUT.pop(chat_id)
+    text_norm = text.replace(",", ".")
+    try:
+        odd_entered = float(text_norm)
+    except ValueError:
+        await update.message.reply_text(
+            "Não entendi essa odd. Manda só o número, por exemplo: 1.78"
+        )
+        # recoloca na fila
+        PENDING_ODD_INPUT[chat_id] = fixture_id
+        return
+
+    sig = OPEN_SIGNALS.get(fixture_id)
+    if not sig:
+        await update.message.reply_text(
+            f"Registrei que você entrou a {odd_entered:.2f}, "
+            "mas não encontrei esse jogo na memória de sinais (pode ter sido de um scan anterior)."
+        )
+        return
+
+    ev_pct = sig.ev_pct
+    stake_info_line = "Banca virtual está OFF, então não calculei stake."
+    stake_pct = 0.0
+    stake_value = 0.0
+    if VIRTUAL_BANK.enabled:
+        stake_pct = suggest_stake_pct(ev_pct, odd_entered)
+        stake_value = VIRTUAL_BANK.balance * stake_pct / 100.0
+        stake_info_line = (
+            f"Stake sugerida (banca virtual): {stake_pct:.2f}% "
+            f"(≈ R${stake_value:,.2f}) sobre R${VIRTUAL_BANK.balance:,.2f}."
+        )
+
+    entry = {
+        "fixture_id": fixture_id,
+        "home": sig.home,
+        "away": sig.away,
+        "minute": sig.minute,
+        "goals_home": sig.goals_home,
+        "goals_away": sig.goals_away,
+        "odd_entered": odd_entered,
+        "ev_pct": ev_pct,
+        "stake_pct": stake_pct,
+        "stake_value": stake_value,
+    }
+    ENTRIES.append(entry)
+
+    lines = [
+        "📝 Entrada registrada no radar:",
+        f"- Jogo: {sig.home} vs {sig.away}",
+        f"- Momento do alerta: {sig.minute}' | Placar {sig.goals_home}–{sig.goals_away}",
+        f"- Odd que você pegou: {odd_entered:.2f}",
+        f"- EV do modelo no alerta: {ev_pct:+.2f}%",
+        "",
+        stake_info_line,
+        "",
+        "Por enquanto a banca virtual é só simulada (não atualiza automática com green/red).",
+        "Depois a gente adiciona /green e /red pra ir batendo com o resultado real.",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+# -----------------------------------------------------
+# Ciclo de vida (post_init / post_shutdown)
+# -----------------------------------------------------
+async def on_post_init(application: Application) -> None:
+    global HTTP_CLIENT
+    HTTP_CLIENT = httpx.AsyncClient()
+    application.bot_data["autoscan_task"] = asyncio.create_task(autoscan_loop(application))
+    application.bot_data["dummy_http_task"] = asyncio.create_task(start_dummy_http_server())
+    logger.info("Application started (post_init executado).")
+
+async def on_post_shutdown(application: Application) -> None:
+    global HTTP_CLIENT
+    logger.info("Encerrando EvRadar PRO...")
+    task1 = application.bot_data.get("autoscan_task")
+    task2 = application.bot_data.get("dummy_http_task")
+    for t in (task1, task2):
+        if isinstance(t, asyncio.Task):
+            t.cancel()
+    if HTTP_CLIENT is not None:
+        try:
+            await HTTP_CLIENT.aclose()
+        except Exception:
             pass
-        STATE.autoscan_task = None
-    api: ApiFootballClient = app.bot_data.get("api_client")  # type: ignore[assignment]
-    if api:
-        await api.close()
+        HTTP_CLIENT = None
 
-
-# =========================
-#  main()
-# =========================
-
+# -----------------------------------------------------
+# main()
+# -----------------------------------------------------
 def main() -> None:
-    settings = load_settings()
-
-    app = (
-        Application.builder()
-        .token(settings.bot_token)
-        .post_init(on_startup)
-        .post_shutdown(on_shutdown)
-        .build()
+    if not TELEGRAM_BOT_TOKEN:
+        raise SystemExit("TELEGRAM_BOT_TOKEN não configurado.")
+    app_builder = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(on_post_init)
+        .post_shutdown(on_post_shutdown)
     )
+    application = app_builder.build()
 
-    api_client = ApiFootballClient(settings.api_key)
+    # handlers
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("scan", cmd_scan))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("debug", cmd_debug))
+    application.add_handler(CommandHandler("links", cmd_links))
+    application.add_handler(CallbackQueryHandler(on_button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.bot_data["settings"] = settings
-    app.bot_data["api_client"] = api_client
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("links", cmd_links))
-    app.add_handler(CommandHandler("entrei", cmd_entrei))
-
-    # Em ambientes como Render, é importante não ter dois processos usando o mesmo bot.
-    # Certifique-se de NÃO rodar o mesmo token em outro lugar ao mesmo tempo.
     logger.info("Iniciando bot do EvRadar PRO (Notebook/Nuvem)...")
-    app.run_polling(
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
     )
-
 
 if __name__ == "__main__":
     main()
