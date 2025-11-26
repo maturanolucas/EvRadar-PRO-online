@@ -82,7 +82,7 @@ def parse_league_ids(raw: str) -> Set[int]:
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")  # pode ser string mesmo
 
 API_FOOTBALL_KEY = env_str("API_FOOTBALL_KEY")
 
@@ -120,6 +120,26 @@ NEWS_BOOST_DEFAULT = env_float("NEWS_BOOST_DEFAULT", 0.0)  # -2 a +2 idealmente
 # Kelly & caps
 KELLY_FRACTION = env_float("KELLY_FRACTION", 0.5)
 STAKE_CAP_PCT = env_float("STAKE_CAP_PCT", 3.0)  # máximo % da banca por entrada
+
+
+# ============================================================
+#  TELEGRAM: HELPER PRA ENVIAR MENSAGEM COM LOG
+# ============================================================
+
+async def safe_send_message(
+    application: Application,
+    chat_id: str,
+    text: str,
+) -> None:
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        )
+        logger.info("Mensagem enviada ao chat_id=%s: %s", chat_id, text[:80])
+    except Exception as e:
+        logger.warning("Falha ao enviar mensagem para chat_id=%s: %s", chat_id, e)
 
 
 # ============================================================
@@ -170,8 +190,7 @@ async def fetch_stats_for_fixture(
     fixture_id: int,
 ) -> Optional[List[Dict[str, Any]]]:
     """
-    Busca estatísticas detalhadas do jogo.
-    Endpoint: /fixtures/statistics?fixture=ID
+    /fixtures/statistics?fixture=ID
     Retorno: lista [ { team: {...}, statistics: [ {type, value}, ...] }, ... ]
     """
     if not USE_STATS:
@@ -186,10 +205,6 @@ async def fetch_stats_for_fixture(
 # ============================================================
 
 def get_stat_value(stats: List[Dict[str, Any]], key: str) -> Optional[float]:
-    """
-    stats: lista de {type: 'Total Shots', value: '10'}
-    Retorna float ou None.
-    """
     for item in stats:
         t = (item.get("type") or "").strip().lower()
         if t == key.lower():
@@ -212,11 +227,6 @@ def get_stat_value(stats: List[Dict[str, Any]], key: str) -> Optional[float]:
 def aggregate_stats(
     stats_payload: Optional[List[Dict[str, Any]]]
 ) -> Dict[str, float]:
-    """
-    Junta estatísticas dos dois times em um pacote único:
-    total_shots, shots_on_target, dangerous_attacks, possession_avg.
-    Se não tiver stats, devolve tudo zero.
-    """
     result = {
         "total_shots": 0.0,
         "shots_on_target": 0.0,
@@ -254,31 +264,23 @@ def aggregate_stats(
 
 
 def compute_pressure_score(stats_agg: Dict[str, float], minute: int) -> float:
-    """
-    Score 0–10 de pressão / ritmo:
-    combinação de chutes, chutes no alvo, ataques perigosos e posse média, ajustado pelo tempo.
-    """
     total_shots = stats_agg["total_shots"]
     shots_on_target = stats_agg["shots_on_target"]
     dangerous_attacks = stats_agg["dangerous_attacks"]
     possession_avg = stats_agg["possession_avg"]
 
-    # Normalizações (limiares típicos)
-    shots_norm = min(total_shots / 20.0, 1.5)        # até ~20 chutes
-    sog_norm = min(shots_on_target / 8.0, 1.5)       # até ~8 chutes no alvo
-    da_norm = min(dangerous_attacks / 60.0, 1.5)     # até ~60 ataques perigosos
-    pos_norm = min(possession_avg / 50.0, 1.5)       # ~50% como base
+    shots_norm = min(total_shots / 20.0, 1.5)
+    sog_norm = min(shots_on_target / 8.0, 1.5)
+    da_norm = min(dangerous_attacks / 60.0, 1.5)
+    pos_norm = min(possession_avg / 50.0, 1.5)
 
-    # Peso maior pra chutes no alvo e ataques perigosos
     base = (
         0.25 * shots_norm +
         0.35 * sog_norm +
         0.30 * da_norm +
         0.10 * pos_norm
-    )  # ~0–1.5
+    )
 
-    # Ajuste pelo tempo: pressão tardia vale mais
-    # No fim do jogo, a mesma pressão sobe o score
     if minute <= 45:
         time_factor = 0.8
     elif minute <= 60:
@@ -302,29 +304,20 @@ def estimate_goal_probability(
     total_goals: int,
     news_boost: float,
 ) -> float:
-    """
-    Estima probabilidade de sair +1 gol no resto do jogo (Over SUM_PLUS_HALF)
-    com base na pressão (0–10), minuto, placar e news/contexto.
-    """
-    # Base: pressão -> probabilidade bruta 0.25–0.85
-    base = 0.25 + 0.06 * pressure_score  # pressão 0 → 25%, 10 → 85%
+    base = 0.25 + 0.06 * pressure_score  # 0–10 → 25–85%
 
-    # Fator tempo: menos tempo -> menor probabilidade efetiva
     if minute <= 45:
         time_mult = 1.0
     else:
-        # de 45 a 90, cai de 1.0 para ~0.4
         dec = (minute - 45) * 0.014
         time_mult = 1.0 - dec
         if time_mult < 0.4:
             time_mult = 0.4
 
-    # Placar: jogos mais abertos (mais gols) tendem a aceitar mais um gol
     score_mult = 1.0 + 0.08 * total_goals
     if score_mult > 1.4:
         score_mult = 1.4
 
-    # News/contexto: -2 a +2 → 0.85 a 1.15 aprox.
     context_mult = 1.0 + 0.07 * news_boost
     if context_mult < 0.85:
         context_mult = 0.85
@@ -342,10 +335,6 @@ def estimate_goal_probability(
 
 
 def compute_ev(p: float, odd: float) -> Tuple[float, float, float]:
-    """
-    Retorna (ev, ev_pct, fair_odd)
-    ev = p * odd - 1
-    """
     if odd <= 1.0:
         return -1.0, -100.0, 999.0
     fair_odd = 1.0 / p
@@ -355,31 +344,23 @@ def compute_ev(p: float, odd: float) -> Tuple[float, float, float]:
 
 
 def compute_kelly_stake_pct(p: float, odd: float, ev_pct: float) -> float:
-    """
-    Kelly fracionado 0.5 com cap 3%, mais:
-    - throttle por odd
-    - tier por EV
-    Retorna % da banca sugerida.
-    """
     if odd <= 1.0:
         return 0.0
 
     b = odd - 1.0
     q = 1.0 - p
-    f_star = (b * p - q) / b  # Kelly pleno
+    f_star = (b * p - q) / b
 
     if f_star <= 0.0:
         return 0.0
 
-    # Fractional kelly
     f_star *= KELLY_FRACTION
 
-    # Cap global
     max_cap = STAKE_CAP_PCT / 100.0
     if f_star > max_cap:
         f_star = max_cap
 
-    # Throttle por odds
+    # throttle por odd
     if odd <= 1.80:
         odds_mult = 1.0
     elif odd <= 2.60:
@@ -387,9 +368,9 @@ def compute_kelly_stake_pct(p: float, odd: float, ev_pct: float) -> float:
     else:
         odds_mult = 0.7
 
-    # Tier por EV
+    # tiers por EV
     if ev_pct < 1.5:
-        ev_mult = 0.0  # nem deveria passar pelo filtro
+        ev_mult = 0.0
     elif ev_pct < 3.0:
         ev_mult = 0.5
     elif ev_pct < 5.0:
@@ -407,6 +388,32 @@ def compute_kelly_stake_pct(p: float, odd: float, ev_pct: float) -> float:
         stake_pct = max_cap
 
     return stake_pct
+
+
+def extract_over_line_odd(
+    odds_payload: Dict[str, Any],
+    total_goals: int,
+) -> Optional[float]:
+    """
+    Procura no payload de odds a linha Over (soma + 0,5) do placar atual.
+    Ex.: placar 1–0 -> linha Over 1.5.
+    """
+    target_line = f"Over {total_goals + 0.5}"
+    for bookmaker in odds_payload.get("bookmakers", []):
+        for bet in bookmaker.get("bets", []):
+            name = bet.get("name", "") or ""
+            if "Goals" in name or "Over/Under" in name:
+                for v in bet.get("values", []):
+                    val = v.get("value", "")
+                    if val == target_line:
+                        odd_str = v.get("odd")
+                        if not odd_str:
+                            continue
+                        try:
+                            return float(odd_str.replace(",", "."))
+                        except ValueError:
+                            continue
+    return None
 
 
 # ============================================================
@@ -483,14 +490,7 @@ async def scan_once(application: Optional[Application] = None) -> str:
             LAST_ERROR = msg
             LAST_SCAN_SUMMARY = msg
             if application is not None:
-                try:
-                    await application.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=f"[EvRadar PRO] {msg}",
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e2:
-                    logger.warning("Falha ao enviar erro no Telegram: %s", e2)
+                await safe_send_message(application, TELEGRAM_CHAT_ID, f"[EvRadar PRO] {msg}")
             return msg
 
         total_live = len(fixtures)
@@ -502,7 +502,6 @@ async def scan_once(application: Optional[Application] = None) -> str:
                 league_id = int(league.get("id"))
                 league_name = league.get("name", "?")
 
-                # Filtro de ligas
                 if ALLOWED_LEAGUES and league_id not in ALLOWED_LEAGUES:
                     continue
 
@@ -512,7 +511,6 @@ async def scan_once(application: Optional[Application] = None) -> str:
                 if minute is None:
                     continue
 
-                # Janela 2º tempo
                 if minute < WINDOW_START or minute > WINDOW_END:
                     continue
 
@@ -527,7 +525,7 @@ async def scan_once(application: Optional[Application] = None) -> str:
 
                 fixture_id = int(fixture.get("id"))
 
-                # 1º: Odds (pra não gastar stats à toa)
+                # 1) odds
                 odd_val: Optional[float] = None
                 odds_payload: Optional[Dict[str, Any]] = None
 
@@ -539,17 +537,14 @@ async def scan_once(application: Optional[Application] = None) -> str:
 
                 if odds_payload:
                     odd_val = extract_over_line_odd(odds_payload, total_goals)
-                else:
-                    odd_val = None
 
-                # Sem odd → não dá pra calcular EV
                 if odd_val is None:
                     continue
 
                 if odd_val < MIN_ODD or odd_val > MAX_ODD:
                     continue
 
-                # 2º: Stats (só agora)
+                # 2) stats
                 stats_payload = None
                 stats_agg = {
                     "total_shots": 0.0,
@@ -565,13 +560,13 @@ async def scan_once(application: Optional[Application] = None) -> str:
                     except Exception as e:
                         logger.warning("Falha ao buscar stats para fixture %s: %s", fixture_id, e)
 
-                # 3º: Pressão v0.2
+                # 3) pressão
                 pressure_score = compute_pressure_score(stats_agg, minute)
 
-                # 4º: News/contexto — por enquanto default global (camada existe, mas neutra)
+                # 4) contexto/news (por enquanto boost global)
                 news_boost = NEWS_BOOST_DEFAULT
 
-                # 5º: Probabilidade de gol e EV
+                # 5) prob. gol e EV
                 p_goal = estimate_goal_probability(
                     pressure_score=pressure_score,
                     minute=minute,
@@ -583,7 +578,7 @@ async def scan_once(application: Optional[Application] = None) -> str:
                 if ev_pct < EV_MIN_PCT:
                     continue
 
-                # 6º: Stake por Kelly fracionado + tiers
+                # 6) stake
                 stake_pct = compute_kelly_stake_pct(p_goal, odd_val, ev_pct)
 
                 candidates.append(
@@ -609,10 +604,8 @@ async def scan_once(application: Optional[Application] = None) -> str:
             except Exception as inner:
                 logger.warning("Erro ao processar fixture: %s", inner)
 
-        # Ordena por EV desc, depois minuto desc
         candidates.sort(key=lambda x: (x["ev_pct"], x["minute"]), reverse=True)
 
-        # === RESUMO ===
         summary_lines: List[str] = []
         summary_lines.append(
             f"[EvRadar PRO] Scan concluído. Eventos ao vivo: {total_live} | Candidatos (EV ≥ {EV_MIN_PCT:.2f}%): {len(candidates)}."
@@ -623,7 +616,7 @@ async def scan_once(application: Optional[Application] = None) -> str:
             f"Janela: {WINDOW_START}–{WINDOW_END}ʼ | Odds alvo: {MIN_ODD:.2f}–{MAX_ODD:.2f}"
         )
         summary_lines.append(
-            f"Config stake: Kelly {KELLY_FRACTION:.2f}x, cap {STAKE_CAP_PCT:.1f}% da banca (R${BANKROLL:,.2f})"
+            f"Stake: Kelly {KELLY_FRACTION:.2f}x, cap {STAKE_CAP_PCT:.1f}% da banca (R${BANKROLL:,.2f})"
             .replace(",", "X").replace(".", ",").replace("X", ".")
         )
 
@@ -645,27 +638,11 @@ async def scan_once(application: Optional[Application] = None) -> str:
         LAST_ERROR = None
         logger.info(LAST_SCAN_SUMMARY)
 
-        # Envia resumo + alertas
         if application is not None:
-            try:
-                await application.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=LAST_SCAN_SUMMARY,
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.warning("Falha ao enviar resumo no Telegram: %s", e)
-
+            await safe_send_message(application, TELEGRAM_CHAT_ID, LAST_SCAN_SUMMARY)
             for ev in candidates:
                 text = format_signal_message(ev)
-                try:
-                    await application.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=text,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e:
-                    logger.warning("Falha ao enviar alerta no Telegram: %s", e)
+                await safe_send_message(application, TELEGRAM_CHAT_ID, text)
 
         return LAST_SCAN_SUMMARY
 
@@ -675,7 +652,10 @@ async def scan_once(application: Optional[Application] = None) -> str:
 # ============================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cid = update.effective_chat.id
+    chat = update.effective_chat
+    cid = chat.id
+    logger.info("/start recebido de chat_id=%s", cid)
+
     lines = [
         "👋 EvRadar PRO v0.2 (parrudo) online.",
         "",
@@ -685,17 +665,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Odds alvo: {MIN_ODD:.2f}–{MAX_ODD:.2f}",
         f"EV mínimo: {EV_MIN_PCT:.2f}%",
         f"Banca (config): R${BANKROLL:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
-        "",
-        "Comandos:",
-        "  /scan   → rodar varredura agora",
-        "  /status → ver último resumo",
-        "  /debug  → info técnica",
-        "  /links  → links úteis / bookmaker",
     ]
+    if str(cid) != str(TELEGRAM_CHAT_ID):
+        lines.append("")
+        lines.append(f"⚠️ ATENÇÃO: TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} (no Railway) é diferente deste chat_id!")
+        lines.append("Se quiser receber autoscan aqui, coloque esse chat_id nas variáveis do Railway.")
+
     await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("/scan recebido")
     await update.message.reply_text("🔍 Iniciando varredura manual de jogos ao vivo (EvRadar v0.2)...")
     application = context.application
     summary = await scan_once(application)
@@ -703,10 +683,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("/status recebido")
     await update.message.reply_text(LAST_SCAN_SUMMARY)
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("/debug recebido")
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "🛠 Debug EvRadar PRO v0.2",
@@ -721,6 +703,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"LEAGUE_IDS: {LEAGUE_IDS_RAW or '(não definido, todas as ligas)'}",
         f"USE_API_FOOTBALL_ODDS: {USE_API_FOOTBALL_ODDS}",
         f"USE_STATS: {USE_STATS}",
+        f"TELEGRAM_CHAT_ID (env): {TELEGRAM_CHAT_ID}",
     ]
     if LAST_ERROR:
         lines.append("")
@@ -729,12 +712,27 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("/links recebido")
     lines = [
         "🔗 Links úteis",
         f"- Bookmaker: {BOOKMAKER_NAME} → {BOOKMAKER_URL}",
         "- API-Football Dashboard: https://dashboard.api-football.com/",
     ]
     await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_testchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Testa envio para TELEGRAM_CHAT_ID configurado no Railway."""
+    logger.info("/testchat recebido")
+    app = context.application
+    await update.message.reply_text(
+        f"Testando envio para TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} configurado no Railway..."
+    )
+    await safe_send_message(
+        app,
+        TELEGRAM_CHAT_ID,
+        f"[EvRadar PRO] Teste de envio para TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} (comando /testchat).",
+    )
 
 
 # ============================================================
@@ -778,11 +776,19 @@ async def dummy_http_server() -> None:
 
 
 async def post_init(application: Application) -> None:
+    logger.info("post_init executado. Autoscan=%s", bool(AUTOSTART))
+    # mensagem de boot no chat configurado
+    await safe_send_message(
+        application,
+        TELEGRAM_CHAT_ID,
+        "[EvRadar PRO] Bot iniciado (post_init). Se você recebeu isso, Telegram está OK. "
+        "Se não recebeu, confira TELEGRAM_CHAT_ID e se a conversa com o bot foi iniciada."
+    )
+
     if AUTOSTART:
         application.create_task(autoscan_loop(application))
     if os.getenv("PORT"):
         application.create_task(dummy_http_server())
-    logger.info("post_init executado. Autoscan=%s", bool(AUTOSTART))
 
 
 # ============================================================
@@ -802,6 +808,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
+    application.add_handler(CommandHandler("testchat", cmd_testchat))
 
     return application
 
@@ -810,32 +817,6 @@ def main() -> None:
     logger.info("Iniciando bot do EvRadar PRO v0.2 (Local/Railway)...")
     application = build_application()
     application.run_polling()
-
-
-def extract_over_line_odd(
-    odds_payload: Dict[str, Any],
-    total_goals: int,
-) -> Optional[float]:
-    """
-    Procura no payload de odds a linha Over (soma + 0,5) do placar atual.
-    Ex.: placar 1–0 -> linha Over 1.5.
-    """
-    target_line = f"Over {total_goals + 0.5}"
-    for bookmaker in odds_payload.get("bookmakers", []):
-        for bet in bookmaker.get("bets", []):
-            name = bet.get("name", "") or ""
-            if "Goals" in name or "Over/Under" in name:
-                for v in bet.get("values", []):
-                    val = v.get("value", "")
-                    if val == target_line:
-                        odd_str = v.get("odd")
-                        if not odd_str:
-                            continue
-                        try:
-                            return float(odd_str.replace(",", "."))
-                        except ValueError:
-                            continue
-    return None
 
 
 if __name__ == "__main__":
