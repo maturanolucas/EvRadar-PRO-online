@@ -13,14 +13,14 @@ Requisitos (instalar uma vez no seu Python):
     pip install python-telegram-bot==21.6 httpx python-dotenv
 
 Principais variáveis de ambiente:
-    API_FOOTBALL_KEY      -> sua chave da API-Football (obrigatória)
+    API_FOOTBALL_KEY      -> chave da API-Football (obrigatória)
     TELEGRAM_BOT_TOKEN    -> token do BotFather (obrigatório)
     TELEGRAM_CHAT_ID      -> (opcional) chat padrão para alertas
 
-    TARGET_ODD            -> odd de referência p/ EV quando não houver odd da casa (padrão: 1.70)
+    TARGET_ODD            -> odd ref p/ EV quando não houver odd da casa (padrão: 1.70)
     EV_MIN_PCT            -> EV mínimo em % para mandar alerta              (padrão: 3.0)
-    MIN_ODD               -> odd mínima aceitável (apenas display)          (padrão: 1.47)
-    MAX_ODD               -> odd máxima aceitável (apenas display)          (padrão: 3.50)
+    MIN_ODD               -> odd mínima aceitável (apenas filtro)           (padrão: 1.47)
+    MAX_ODD               -> odd máxima aceitável (apenas filtro)           (padrão: 3.50)
     WINDOW_START          -> início da janela em minutos                    (padrão: 47)
     WINDOW_END            -> fim da janela em minutos                       (padrão: 82)
     AUTOSTART             -> "1" para varredura automática                  (padrão: 0 - OFF)
@@ -58,10 +58,6 @@ except Exception:  # pragma: no cover
     load_dotenv = None  # type: ignore[assignment]
 
 
-# =========================
-#  Logging básico
-# =========================
-
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
@@ -69,38 +65,30 @@ logging.basicConfig(
 logger = logging.getLogger("EvRadarNotebook")
 
 
-# =========================
-#  Config padrão
-# =========================
-
 LEAGUE_IDS_DEFAULT: List[int] = [
-    # Big 5 Europa
     39,   # Premier League
     140,  # La Liga
     135,  # Serie A
     78,   # Bundesliga
     61,   # Ligue 1
-    # Brasil / América do Sul
     71,   # Brasileirão Série A
     72,   # Brasileirão Série B
     13,   # Argentina Liga Profesional
-    14,   # Argentina segunda/próximas
-    # Copas relevantes
+    14,   # Argentina outra
     2,    # Champions League
     3,    # Europa League
     4,    # Conference League
-    5,    # Eurocopa
+    5,    # Euro
     180,  # Libertadores
     203,  # Sudamericana
-    # Outras ligas boas
     62,   # Ligue 2
     88,   # Eredivisie
-    89,   # Jupiler Pro League
-    94,   # Primeira Liga (POR)
-    128,  # Superliga (TUR)
-    136,  # Super League (GRE)
-    141,  # Outra top secundária
-    144,  # Championship (ING)
+    89,   # Bélgica
+    94,   # Portugal
+    128,  # Turquia
+    136,  # Grécia
+    141,  # outra top secundária
+    144,  # Championship
     79,   # 2. Bundesliga
     253,  # MLS
 ]
@@ -175,14 +163,12 @@ class GlobalState:
     last_alerts: int = 0
     autoscan_task: Optional[asyncio.Task] = None
     chat_id_bound: Optional[int] = None
+    http_server: Optional[asyncio.AbstractServer] = None
+    http_task: Optional[asyncio.Task] = None
 
 
 STATE = GlobalState()
 
-
-# =========================
-#  Helpers de ambiente
-# =========================
 
 def _load_env() -> None:
     if load_dotenv is not None:
@@ -247,11 +233,11 @@ def load_settings() -> Settings:
         chat_id_default = None
 
     if not api_key:
-        logger.error("API_FOOTBALL_KEY não configurada. Defina a variável de ambiente.")
+        logger.error("API_FOOTBALL_KEY não configurada.")
         print("ERRO: API_FOOTBALL_KEY não configurada. Configure no sistema ou .env.")
         sys.exit(1)
     if not bot_token:
-        logger.error("TELEGRAM_BOT_TOKEN não configurado. Defina a variável de ambiente.")
+        logger.error("TELEGRAM_BOT_TOKEN não configurado.")
         print("ERRO: TELEGRAM_BOT_TOKEN não configurado. Configure no sistema ou .env.")
         sys.exit(1)
 
@@ -302,12 +288,8 @@ def load_settings() -> Settings:
     )
 
 
-# =========================
-#  Cliente API-Football
-# =========================
-
 API_BASE = "https://v3.football.api-sports.io"
-OVER_UNDER_BET_ID = 36  # mercado Over/Under para odds/live (API-Football)
+OVER_UNDER_BET_ID = 36
 
 
 class ApiFootballClient:
@@ -382,20 +364,8 @@ class ApiFootballClient:
         total_goals: int,
         bookmaker_id: Optional[int],
     ) -> Optional[float]:
-        """
-        Busca a ODD ao vivo para o mercado Over (soma + 0,5) via /odds/live.
-
-        Estratégia:
-        - Chama /odds/live?fixture={id}&bet=36
-        - Se bookmaker_id for informado, tenta usar esse bookmaker.
-        - Caso contrário, usa o primeiro bookmaker da resposta.
-        - Procura pelo valor "Over X.5" onde X = total_goals.
-        """
         client = await self._get_client()
-        params: Dict[str, Any] = {
-            "fixture": fixture_id,
-            "bet": OVER_UNDER_BET_ID,
-        }
+        params: Dict[str, Any] = {"fixture": fixture_id, "bet": OVER_UNDER_BET_ID}
         try:
             resp = await client.get("/odds/live", params=params)
         except Exception as exc:
@@ -465,10 +435,6 @@ class ApiFootballClient:
 
         return None
 
-
-# =========================
-#  Modelo de probabilidade
-# =========================
 
 def _parse_percent(value: Any) -> float:
     if value is None:
@@ -568,10 +534,6 @@ def estimate_goal_probability(
     fair_odd = 1.0 / p
     return p, fair_odd, pressure_desc
 
-
-# =========================
-#  Lógica de scan
-# =========================
 
 @dataclass
 class Candidate:
@@ -691,7 +653,6 @@ async def find_candidates(
                 used_odd = live_odd
                 odd_source = "live"
 
-        # Filtrar odds muito fora da faixa configurada
         if used_odd < settings.min_odd or used_odd > settings.max_odd:
             continue
 
@@ -784,10 +745,6 @@ def format_scan_summary(
     return "\n".join(linhas)
 
 
-# =========================
-#  Handlers do Telegram
-# =========================
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -824,8 +781,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for cand in candidates:
         msg = format_candidate_message(cand, settings)
-        await context.bot.send_message(
-            chat_id=STATE.chat_id_bound or chat_id or settings.chat_id_default,
+        await update.effective_chat.send_message(  # type: ignore[union-attr]
             text=msg,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -842,23 +798,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]  # type: ignore[index]
-    if STATE.last_scan_time is None:
-        ago_text = "nenhuma varredura ainda."
-    else:
-        delta = asyncio.get_event_loop().time() - STATE.last_scan_time
-        mins = int(delta // 60)
-        secs = int(delta % 60)
-        ago_text = "há {}m{}s".format(mins, secs)
     linhas: List[str] = []
     linhas.append("📈 Status do EvRadar PRO (Notebook/Nuvem)")
     linhas.append("")
     linhas.append(STATE.last_scan_summary)
-    linhas.append("")
-    linhas.append("Última varredura: {}".format(ago_text))
-    linhas.append("")
-    linhas.append("Config atual:")
-    linhas.append(settings.describe())
     await update.effective_message.reply_text("\n".join(linhas))
 
 
@@ -869,10 +812,12 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     linhas.append("")
     linhas.append("API base: {}".format(API_BASE))
     linhas.append("Ligas ativas ({}): {}".format(len(settings.league_ids), settings.league_ids))
-    linhas.append("Autoscan: {} (CHECK_INTERVAL={}s)".format(
-        "ON" if settings.autostart else "OFF",
-        settings.check_interval,
-    ))
+    linhas.append(
+        "Autoscan: {} (CHECK_INTERVAL={}s)".format(
+            "ON" if settings.autostart else "OFF",
+            settings.check_interval,
+        )
+    )
     if settings.use_live_odds:
         if settings.bookmaker_id is not None:
             linhas.append("Odds: AO VIVO via /odds/live (bookmaker_id={})".format(settings.bookmaker_id))
@@ -892,118 +837,139 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     linhas: List[str] = []
     linhas.append("🔗 Links úteis")
     linhas.append("")
-    linhas.append("• Casa referência: {} ({})".format(settings.bookmaker_name, settings.bookmaker_url))
-    linhas.append("• Abrir mercado (Superbet): {}".format(settings.bookmaker_url))
+    linhas.append("Casa referência: {} ({})".format(settings.bookmaker_name, settings.bookmaker_url))
+    linhas.append("API-Football: https://dashboard.api-football.com/")
     await update.effective_message.reply_text("\n".join(linhas))
 
-
-# =========================
-#  Autoscan (sem spam)
-# =========================
 
 async def autoscan_loop(app: Application) -> None:
     settings: Settings = app.bot_data["settings"]  # type: ignore[index]
     api: ApiFootballClient = app.bot_data["api"]  # type: ignore[index]
-    chat_id = settings.chat_id_default
+    chat_id = settings.chat_id_default or STATE.chat_id_bound
     logger.info(
         "Autoscan iniciado (intervalo=%ss) - chat_id_default=%s",
         settings.check_interval,
         chat_id,
     )
 
-    while True:
-        try:
-            candidates, total_live = await find_candidates(api, settings)
-            games_window = len(candidates)
-            alerts_sent = 0
+    try:
+        while True:
+            try:
+                candidates, total_live = await find_candidates(api, settings)
+                games_window = len(candidates)
+                alerts_sent = 0
 
-            if candidates and chat_id is not None:
-                for cand in candidates:
-                    msg = format_candidate_message(cand, settings)
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=msg,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                    alerts_sent += 1
-                    await asyncio.sleep(0.8)
+                if candidates and chat_id is not None:
+                    for cand in candidates:
+                        msg = format_candidate_message(cand, settings)
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=msg,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        alerts_sent += 1
+                        await asyncio.sleep(0.8)
 
-            summary = format_scan_summary("auto", total_live, games_window, alerts_sent)
-            STATE.last_scan_summary = summary
-            STATE.last_scan_time = asyncio.get_event_loop().time()
-            STATE.last_alerts = alerts_sent
+                summary = format_scan_summary("auto", total_live, games_window, alerts_sent)
+                STATE.last_scan_summary = summary
+                STATE.last_scan_time = asyncio.get_event_loop().time()
+                STATE.last_alerts = alerts_sent
 
-            if chat_id is not None and alerts_sent > 0:
-                await app.bot.send_message(chat_id=chat_id, text=summary)
+                if chat_id is not None and alerts_sent > 0:
+                    await app.bot.send_message(chat_id=chat_id, text=summary)
 
-        except Exception as exc:
-            logger.error("Erro no autoscan: %s", exc)
+            except Exception as exc:
+                logger.error("Erro no autoscan: %s", exc)
 
-        await asyncio.sleep(settings.check_interval)
+            await asyncio.sleep(settings.check_interval)
+    except asyncio.CancelledError:
+        logger.info("Autoscan cancelado (shutdown).")
 
 
-# =========================
-#  Servidor HTTP mínimo (Render Web Service)
-# =========================
-
-async def start_dummy_http_server() -> None:
-    """
-    Servidor HTTP mínimo só para o Render enxergar uma porta aberta.
-    Não é usado pelo EvRadar; responde "OK" em qualquer request.
-    """
-    port = int(os.getenv("PORT", "10000"))
-
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-        writer.write(response)
-        try:
-            await writer.drain()
-        except Exception:
-            pass
+async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        data = await reader.read(1024)
+        _ = data
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: 2\r\n"
+            "\r\n"
+            "OK"
+        )
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+    except Exception as exc:
+        logger.debug("Erro no HTTP fake: %s", exc)
+    finally:
         try:
             writer.close()
+            await writer.wait_closed()
         except Exception:
             pass
 
-    server = await asyncio.start_server(handle, "0.0.0.0", port)
-    logger.info("Dummy HTTP server ouvindo em 0.0.0.0:%s", port)
+
+async def start_dummy_http_server() -> None:
+    port_raw = os.getenv("PORT", "10000")
+    try:
+        port = int(port_raw)
+    except Exception:
+        port = 10000
+
+    server = await asyncio.start_server(handle_http, host="0.0.0.0", port=port)
+    STATE.http_server = server
+    addr = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+    logger.info("Servidor HTTP fake iniciado em %s", addr)
     async with server:
         await server.serve_forever()
 
-
-# =========================
-#  Ciclo de vida (startup/shutdown)
-# =========================
 
 async def on_startup(app: Application) -> None:
     settings: Settings = app.bot_data["settings"]  # type: ignore[index]
     if settings.autostart and STATE.autoscan_task is None:
         STATE.autoscan_task = asyncio.create_task(autoscan_loop(app))
-    asyncio.create_task(start_dummy_http_server())
+    if STATE.http_task is None:
+        STATE.http_task = asyncio.create_task(start_dummy_http_server())
 
 
 async def on_shutdown(app: Application) -> None:
     api: ApiFootballClient = app.bot_data.get("api")  # type: ignore[assignment]
     if isinstance(api, ApiFootballClient):
         await api.close()
+
     if STATE.autoscan_task is not None:
         STATE.autoscan_task.cancel()
+        STATE.autoscan_task = None
+
+    if STATE.http_server is not None:
+        STATE.http_server.close()
         try:
-            await STATE.autoscan_task
+            await STATE.http_server.wait_closed()
         except Exception:
             pass
+        STATE.http_server = None
+
+    if STATE.http_task is not None:
+        STATE.http_task.cancel()
+        STATE.http_task = None
 
 
-# =========================
-#  Main
-# =========================
+def _post_init(app: Application) -> None:
+    # Apenas garante que settings/api já estão em bot_data
+    return None
+
 
 def main() -> None:
     settings = load_settings()
     api_client = ApiFootballClient(settings.api_key)
 
-    application = ApplicationBuilder().token(settings.bot_token).build()
+    application = (
+        ApplicationBuilder()
+        .token(settings.bot_token)
+        .post_init(_post_init)
+        .build()
+    )
     application.bot_data["settings"] = settings
     application.bot_data["api"] = api_client
 
@@ -1016,10 +982,9 @@ def main() -> None:
     application.post_init = on_startup  # type: ignore[assignment]
     application.post_shutdown = on_shutdown  # type: ignore[assignment]
 
-    logger.info("Iniciando bot do EvRadar PRO (Notebook/Nuvem)...")
     application.run_polling(
-        drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
     )
 
 
