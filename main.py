@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, Render-friendly, odds reais, contexto, banca virtual e auto-settle)
+EvRadar PRO — Versão Notebook/Nuvem (Telegram + API-Football, Render-friendly, odds reais,
+contexto, banca virtual e auto-settle por jogo específico)
 
-- Funciona local (notebook) e em nuvem (Render Web Service free).
-- Usa polling do Telegram (sem webhook).
-- Abre um servidor HTTP mínimo só para o Render enxergar uma porta aberta.
-- Autoscan sem spam: só manda mensagem automática SE houver alerta.
-- Calcula EV usando, quando possível, a ODD REAL AO VIVO da casa (API-Football /odds/live),
-  comparando com a odd justa do modelo.
-- Inclui camada de contexto/noticiário heurístico automático.
-- Controla uma banca virtual com stake sugerida (Kelly fracionado + alavancagem).
-- AUTO-SETTLE: resolve apostas registradas via /entrei, usando /fixtures?id=fixture_id:
-    - Se sair +1 gol depois da entrada → green automático.
-    - Se o jogo terminar sem +1 gol → red automático.
+Melhorias desta versão:
+- Cada sinal enviado fica associado à MENSAGEM do Telegram.
+- Quando você responde um sinal com `/entrei <odd>`, o bot sabe EXATAMENTE
+  qual jogo foi (mesmo com vários sinais na tela).
+- Banca virtual com alavancagem.
+- Auto-settle:
+    • Green automático: saiu +1 gol depois da entrada.
+    • Red automático: jogo terminou sem +1 gol.
 
-Requisitos (instalar uma vez no seu Python):
+Requisitos:
     pip install python-telegram-bot==21.6 httpx python-dotenv
 """
 
@@ -180,6 +178,8 @@ class State:
     virtual_bankroll_initial: float = 0.0
     bets: List[Bet] = field(default_factory=list)
     next_bet_id: int = 1
+    # mapa mensagem -> candidato (para saber em qual jogo você entrou)
+    msg_to_candidate: Dict[str, Any] = field(default_factory=dict)
 
 
 STATE = State()
@@ -830,9 +830,9 @@ def format_candidate_message(c: Candidate, settings: Settings) -> str:
         )
         linhas.append("")
         linhas.append(
-            "👉 Se entrar, responda com: /entrei {:.2f}".format(c.used_odd)
+            "👉 Se entrar **NESSE jogo**, responda ESTA mensagem com:\n"
+            "   /entrei {:.2f}  (use a odd REAL que você pegou)".format(c.used_odd)
         )
-        linhas.append("   (use a odd REAL que você pegou, ex: /entrei 1.68)")
     return "\n".join(linhas)
 
 
@@ -872,22 +872,19 @@ def _settle_bet(bet: Bet, result: str) -> Optional[Bet]:
     return bet
 
 
-def register_bet(odd: float, settings: Settings) -> Optional[Bet]:
-    if not STATE.last_candidates:
-        return None
-    c = STATE.last_candidates[0]
+def register_bet(cand: Candidate, odd: float, settings: Settings) -> Optional[Bet]:
     if not settings.virtual_bankroll_enabled or STATE.virtual_bankroll <= 0:
         return None
-    stake_pct = c.stake_pct
+    stake_pct = cand.stake_pct
     if stake_pct <= 0:
         return None
     stake_amount = STATE.virtual_bankroll * (stake_pct / 100.0) * settings.leverage
-    total_goals = c.goals_home + c.goals_away
+    total_goals = cand.goals_home + cand.goals_away
     bet = Bet(
         bet_id=STATE.next_bet_id,
-        fixture_id=c.fixture_id,
+        fixture_id=cand.fixture_id,
         description="{} vs {} ({}')".format(
-            c.home_team, c.away_team, c.minute
+            cand.home_team, cand.away_team, cand.minute
         ),
         odd=odd,
         stake_pct=stake_pct,
@@ -1054,7 +1051,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         alerts = 0
         for c in candidates:
             text = format_candidate_message(c, settings)
-            await update.message.reply_text(text)  # type: ignore[union-attr]
+            msg = await update.message.reply_text(text)  # type: ignore[union-attr]
+            key = "{}:{}".format(msg.chat.id, msg.message_id)
+            STATE.msg_to_candidate[key] = c
             alerts += 1
         games_in_window = len(candidates)
         summary = format_scan_summary(total_live, games_in_window, alerts)
@@ -1146,7 +1145,7 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         settings.bookmaker_name, settings.bookmaker_url
     ))
     linhas.append("")
-    linhas.append("Abra o evento na casa, confira se a odd está próxima da indicada.")
+    linhas.append("Abra o evento na casa e confira se a odd está próxima da indicada.")
     await update.message.reply_text("\n".join(linhas))  # type: ignore[union-attr]
 
 
@@ -1164,7 +1163,7 @@ async def cmd_entrei(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not context.args:
         await update.message.reply_text(  # type: ignore[union-attr]
-            "Use: /entrei <odd>. Exemplo: /entrei 1.68"
+            "Use: /entrei <odd>. Exemplo: /entrei 1.68 (respondendo o SINAL específico)."
         )
         return
     try:
@@ -1174,12 +1173,33 @@ async def cmd_entrei(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Odd inválida. Exemplo de uso: /entrei 1.68"
         )
         return
-    bet = register_bet(odd, settings)
-    if bet is None:
+
+    cand: Optional[Candidate] = None
+
+    # 1) Tenta pegar o jogo pela mensagem que você respondeu
+    if update.message and update.message.reply_to_message:
+        rmsg = update.message.reply_to_message
+        key = "{}:{}".format(rmsg.chat.id, rmsg.message_id)
+        cand = STATE.msg_to_candidate.get(key)
+
+    # 2) Se não tiver reply, cai no último sinal forte como fallback
+    if cand is None and STATE.last_candidates:
+        cand = STATE.last_candidates[0]
+
+    if cand is None:
         await update.message.reply_text(  # type: ignore[union-attr]
-            "Não há sinal recente elegível ou stake calculada para registrar aposta."
+            "Não encontrei um sinal ligado a este comando.\n"
+            "Dica: responda o alerta do jogo com /entrei <odd>."
         )
         return
+
+    bet = register_bet(cand, odd, settings)
+    if bet is None:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Não foi possível registrar aposta (stake=0 ou banca virtual zerada)."
+        )
+        return
+
     linhas = []
     linhas.append("✅ Aposta registrada na banca virtual:")
     linhas.append(
@@ -1290,7 +1310,9 @@ async def autoscan_loop(app: Application) -> None:
                 continue
             for c in candidates:
                 text = format_candidate_message(c, settings)
-                await app.bot.send_message(chat_id=chat_id, text=text)
+                msg = await app.bot.send_message(chat_id=chat_id, text=text)
+                key = "{}:{}".format(msg.chat.id, msg.message_id)
+                STATE.msg_to_candidate[key] = c
                 alerts += 1
             games_in_window = len(candidates)
             summary = format_scan_summary(total_live, games_in_window, alerts)
