@@ -353,7 +353,7 @@ async def _fetch_live_odds_for_fixture(
 ) -> Optional[float]:
     """
     Busca odd em tempo real na API-FOOTBALL para a linha Over (soma + 0,5)
-    usando o endpoint de odds. Se não achar nada, retorna None.
+    usando o endpoint de odds LIVE. Se não achar nada, retorna None.
     """
     if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
         return None
@@ -365,8 +365,9 @@ async def _fetch_live_odds_for_fixture(
     }
 
     try:
+        # IMPORTANTE: usar odds LIVE (não pré-jogo)
         resp = await client.get(
-            API_FOOTBALL_BASE_URL.rstrip("/") + "/odds",
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/odds/live",
             headers=headers,
             params=params,
             timeout=10.0,
@@ -374,7 +375,7 @@ async def _fetch_live_odds_for_fixture(
         resp.raise_for_status()
         data = resp.json()
     except Exception:
-        logging.exception("Erro ao buscar odds para fixture=%s", fixture_id)
+        logging.exception("Erro ao buscar odds LIVE para fixture=%s", fixture_id)
         return None
 
     response = data.get("response") or []
@@ -807,6 +808,10 @@ def _estimate_prob_and_odd(
     - leve ajuste pelo placar
     - ajuste de noticiário (news_boost_prob, ex.: +0.02 = +2pp)
     - ajuste pré-jogo (pregame_boost_prob, ex.: +0.02 = +2pp)
+
+    IMPORTANTE: se forced_odd_current vier da API (odd real da casa),
+    NÃO fazemos clamp em [MIN_ODD, MAX_ODD] aqui. O filtro por faixa de
+    odds é feito fora, no scan, para não distorcer a odd real.
     """
 
     total_goals = home_goals + away_goals
@@ -878,15 +883,12 @@ def _estimate_prob_and_odd(
     p_final = max(0.20, min(0.90, base_prob))
 
     odd_fair = 1.0 / p_final
-    odd_current = odd_fair * 1.03
 
+    # Odd atual: se vier da casa, usamos ela; senão, odd justa * pequeno overround
     if forced_odd_current is not None and forced_odd_current > 1.0:
         odd_current = forced_odd_current
-
-    if odd_current < MIN_ODD:
-        odd_current = MIN_ODD
-    if odd_current > MAX_ODD:
-        odd_current = MAX_ODD
+    else:
+        odd_current = odd_fair * 1.03
 
     ev = p_final * odd_current - 1.0
     ev_pct = ev * 100.0
@@ -914,7 +916,6 @@ def _format_alert_text(
     )
     minuto = fixture["minute"]
     placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
-    total_goals = fixture["home_goals"] + fixture["away_goals"]
     linha = "Over (soma + 0,5)"
 
     p_final = metrics["p_final"] * 100.0
@@ -935,7 +936,7 @@ def _format_alert_text(
     else:
         interpretacao_parts.append("pressão apenas ok (cuidado)")
 
-    # Placar
+    total_goals = fixture["home_goals"] + fixture["away_goals"]
     if total_goals >= 3:
         interpretacao_parts.append("jogo aberto em gols")
     elif total_goals == 0:
@@ -1098,6 +1099,12 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     news_boost_prob=news_boost_prob,
                     pregame_boost_prob=pregame_boost_prob,
                 )
+
+                # Filtro por faixa de odds REAL: se a odd atual estiver fora
+                # de [MIN_ODD, MAX_ODD], não enviamos alerta.
+                odd_cur = metrics["odd_current"]
+                if odd_cur < MIN_ODD or odd_cur > MAX_ODD:
+                    continue
 
                 if metrics["ev_pct"] < EV_MIN_PCT:
                     continue
