@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.2-lite
-------------------------------------------
+EvRadar PRO - Telegram + Cérebro v0.2-lite (Odds reais + backup)
+----------------------------------------------------------------
 Base: EvRadar PRO - Base Telegram v0.1 (casca estável)
+
 Esta versão adiciona um "cérebro" simplificado que:
 - Consulta jogos ao vivo na API-FOOTBALL
 - Aplica filtros de liga e janela de tempo
 - Calcula um score de pressão/chances
 - Estima uma probabilidade de 1 gol a mais
-- Aproxima uma odd atual e calcula EV
-- Dispara alertas no Telegram quando EV >= EV_MIN_PCT
+- Busca odd em tempo real (API-FOOTBALL odds) com backup da última odd
+- Aproxima odd se não houver dado real
+- Calcula EV e dispara alertas no Telegram quando EV >= EV_MIN_PCT
 
 IMPORTANTE:
 - Ainda não é o modelo completo "parrudo" v0.2 (news, contexto avançado etc.),
   mas já é um cérebro real, com dados ao vivo.
-- Usa apenas uma aproximação de odd (não integra Superbet ainda).
 """
 
 import asyncio
@@ -23,7 +24,6 @@ import logging
 import os
 from typing import Optional, List, Dict, Any
 
-import math
 import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -89,7 +89,7 @@ API_FOOTBALL_BASE_URL: str = _get_env_str(
 
 LEAGUE_IDS_RAW: str = _get_env_str("LEAGUE_IDS")
 USE_API_FOOTBALL_ODDS: int = _get_env_int("USE_API_FOOTBALL_ODDS", 0)
-
+BOOKMAKER_ID: int = _get_env_int("BOOKMAKER_ID", 34)  # 34 = Superbet (como já usamos)
 
 def _parse_league_ids(raw: str) -> List[int]:
     if not raw:
@@ -118,6 +118,9 @@ last_scan_alerts: int = 0
 last_scan_live_events: int = 0
 last_scan_window_matches: int = 0
 
+# Cache de última odd real por jogo (fixture_id -> odd)
+last_odd_cache: Dict[int, float] = {}
+
 
 # ---------------------------------------------------------------------------
 # Funções auxiliares do cérebro
@@ -141,7 +144,7 @@ def _safe_get_stat(stats_list: List[Dict[str, Any]], stat_type: str) -> int:
 
 
 async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    """Busca jogos ao vivo na API-FOOTBALL."""
+    """Busca jogos ao vivo na API-FOOTBALL, já filtrando por liga e janela."""
     if not API_FOOTBALL_KEY:
         logging.warning("API_FOOTBALL_KEY não definido; não há como buscar jogos ao vivo.")
         return []
@@ -174,7 +177,11 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
             teams = item.get("teams") or {}
             goals = item.get("goals") or {}
 
-            league_id = int(league.get("id"))
+            league_id_raw = league.get("id")
+            if league_id_raw is None:
+                continue
+            league_id = int(league_id_raw)
+
             if LEAGUE_IDS and league_id not in LEAGUE_IDS:
                 continue
 
@@ -282,11 +289,96 @@ async def _fetch_statistics_for_fixture(
     }
 
 
+async def _fetch_live_odds_for_fixture(
+    client: httpx.AsyncClient,
+    fixture_id: int,
+    total_goals: int,
+) -> Optional[float]:
+    """
+    Busca odd em tempo real na API-FOOTBALL para a linha Over (soma + 0,5)
+    usando o endpoint de odds. Se não achar nada, retorna None.
+    """
+    if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
+        return None
+
+    headers = {
+        "x-apisports-key": API_FOOTBALL_KEY,
+    }
+    params = {
+        "fixture": fixture_id,
+        "bookmaker": BOOKMAKER_ID,
+        # poderíamos filtrar por bet/market aqui se necessário
+    }
+
+    try:
+        resp = await client.get(
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/odds",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception("Erro ao buscar odds para fixture=%s", fixture_id)
+        return None
+
+    response = data.get("response") or []
+    if not response:
+        return None
+
+    odds_item = response[0]
+    bookmakers = odds_item.get("bookmakers") or []
+
+    target_line_str = "{:.1f}".format(total_goals + 0.5)  # ex: 2 -> "2.5" etc.
+
+    for b in bookmakers:
+        try:
+            b_id_raw = b.get("id")
+            if b_id_raw is not None and int(b_id_raw) != BOOKMAKER_ID:
+                continue
+        except Exception:
+            # se não conseguir converter id, tenta mesmo assim
+            pass
+
+        bets = b.get("bets") or []
+        for bet in bets:
+            name = (bet.get("name") or "").lower()
+            # heurística: procura mercado de gols/over-under
+            if ("over" not in name) and ("under" not in name) and ("goal" not in name):
+                continue
+
+            values = bet.get("values") or []
+            for val in values:
+                vlabel = str(val.get("value") or "")
+                vlabel_low = vlabel.lower()
+                if "over" not in vlabel_low:
+                    continue
+                if target_line_str not in vlabel:
+                    continue
+
+                odd_raw = val.get("odd")
+                if odd_raw is None:
+                    continue
+                try:
+                    odd_val = float(str(odd_raw).replace(",", "."))
+                except (TypeError, ValueError):
+                    continue
+
+                if odd_val <= 1.0:
+                    continue
+
+                return odd_val
+
+    return None
+
+
 def _estimate_prob_and_odd(
     minute: int,
     stats: Dict[str, Any],
     home_goals: int,
     away_goals: int,
+    forced_odd_current: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Estima probabilidade de +1 gol e uma odd "aproximada" com base em:
@@ -294,7 +386,8 @@ def _estimate_prob_and_odd(
     - volume ofensivo (chutes, no alvo, ataques perigosos)
     - leve ajuste pelo placar.
 
-    NÃO é modelo calibrado oficial, é uma v0.2-lite pra colocar o cérebro em campo.
+    Se forced_odd_current for fornecida, ela é usada como odd do momento
+    (com clamp em [MIN_ODD, MAX_ODD]) em vez da odd aproximada.
     """
 
     total_goals = home_goals + away_goals
@@ -373,10 +466,14 @@ def _estimate_prob_and_odd(
     # Odd justa = 1 / p
     odd_fair = 1.0 / p_final
 
-    # Aproximação de odd atual:
-    # - Começa por algo próximo da odd justa
-    # - Joga dentro da janela [MIN_ODD, MAX_ODD]
+    # Odd atual aproximada
     odd_current = odd_fair * 1.03  # leve margem da casa
+
+    # Se houver odd real forçada (API ou cache), usamos ela
+    if forced_odd_current is not None and forced_odd_current > 1.0:
+        odd_current = forced_odd_current
+
+    # Clamp na faixa configurada
     if odd_current < MIN_ODD:
         odd_current = MIN_ODD
     if odd_current > MAX_ODD:
@@ -467,6 +564,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     - Busca jogos ao vivo na API-FOOTBALL
     - Aplica filtros de liga e janela
     - Calcula métrica de pressão/probabilidade/EV
+    - Usa odd em tempo real (com backup) quando possível
     - Retorna lista de textos de alerta prontos para enviar no Telegram
     """
     global last_status_text, last_scan_origin, last_scan_alerts
@@ -499,11 +597,34 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 if not stats:
                     continue
 
+                total_goals = fx["home_goals"] + fx["away_goals"]
+
+                # Busca odd ao vivo na API, com fallback para cache
+                api_odd: Optional[float] = None
+                try:
+                    api_odd = await _fetch_live_odds_for_fixture(
+                        client=client,
+                        fixture_id=fx["fixture_id"],
+                        total_goals=total_goals,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Erro inesperado ao buscar odds ao vivo para fixture=%s",
+                        fx["fixture_id"],
+                    )
+
+                if api_odd is not None:
+                    last_odd_cache[fx["fixture_id"]] = api_odd
+                else:
+                    # Se não vier nada agora, tenta usar odd anterior em cache
+                    api_odd = last_odd_cache.get(fx["fixture_id"])
+
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
                     stats=stats,
                     home_goals=fx["home_goals"],
                     away_goals=fx["away_goals"],
+                    forced_odd_current=api_odd,
                 )
 
                 if metrics["ev_pct"] < EV_MIN_PCT:
@@ -512,7 +633,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 alert_text = _format_alert_text(fx, metrics)
                 alerts.append(alert_text)
             except Exception:
-                logging.exception("Erro ao processar fixture_id=%s", fx.get("fixture_id"))
+                logging.exception(
+                    "Erro ao processar fixture_id=%s",
+                    fx.get("fixture_id"),
+                )
                 continue
 
     last_scan_alerts = len(alerts)
@@ -559,11 +683,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autoscan_status = "ativado" if AUTOSTART else "desativado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.2-lite + Telegram).",
+        "👋 EvRadar PRO online (cérebro v0.2-lite + Telegram, odds reais).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
-        "Faixa de odds (aprox.): {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
         "Autoscan: {auto} (intervalo {sec}s)".format(auto=autoscan_status, sec=CHECK_INTERVAL),
         "",
         "Comandos:",
@@ -578,15 +702,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Comando /scan: roda um ciclo de varredura manual com o cérebro v0.2-lite."""
     await update.message.reply_text(
-        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.2-lite)..."
+        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.2-lite, odds reais)..."
     )
 
     alerts = await run_scan_cycle(origin="manual", application=context.application)
 
     if not alerts:
-        await update.message.reply_text(
-            last_status_text
-        )
+        await update.message.reply_text(last_status_text)
         return
 
     for text in alerts:
@@ -607,18 +729,24 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     api_set = bool(API_FOOTBALL_KEY)
 
     lines = [
-        "🛠 Debug EvRadar PRO (cérebro v0.2-lite)",
+        "🛠 Debug EvRadar PRO (cérebro v0.2-lite, odds reais)",
         "",
         "TELEGRAM_BOT_TOKEN definido: {v}".format(v="sim" if token_set else "não"),
-        "TELEGRAM_CHAT_ID: {cid}".format(cid=TELEGRAM_CHAT_ID if chat_set else "não definido"),
+        "TELEGRAM_CHAT_ID: {cid}".format(
+            cid=TELEGRAM_CHAT_ID if chat_set else "não definido"
+        ),
         "AUTOSTART: {a}".format(a=AUTOSTART),
         "CHECK_INTERVAL: {sec}s".format(sec=CHECK_INTERVAL),
         "Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
-        "Faixa de odds aprox.: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
         "",
         "API_FOOTBALL_KEY definido: {v}".format(v="sim" if api_set else "não"),
-        "LEAGUE_IDS: {ids}".format(ids=",".join(str(x) for x in LEAGUE_IDS) if LEAGUE_IDS else "não definido"),
+        "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
+        "BOOKMAKER_ID: {bid}".format(bid=BOOKMAKER_ID),
+        "LEAGUE_IDS: {ids}".format(
+            ids=",".join(str(x) for x in LEAGUE_IDS) if LEAGUE_IDS else "não definido"
+        ),
         "",
         "Último scan:",
         "  origem: {origin}".format(origin=last_scan_origin),
@@ -665,7 +793,7 @@ def main() -> None:
         level=logging.INFO,
     )
 
-    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.2-lite + Telegram)...")
+    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.2-lite + Telegram, odds reais)...")
 
     application = (
         Application.builder()
