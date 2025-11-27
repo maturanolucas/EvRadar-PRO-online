@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.2-lite (Odds reais + backup + NewsBoost)
-----------------------------------------------------------------------------
+EvRadar PRO - Telegram + Cérebro v0.2-lite (Odds reais + backup + NewsBoost + Pré-jogo)
+---------------------------------------------------------------------------------------
 Base: EvRadar PRO - Base Telegram v0.1 (casca estável)
 
 Esta versão adiciona um "cérebro" simplificado que:
@@ -13,11 +13,12 @@ Esta versão adiciona um "cérebro" simplificado que:
 - Busca odd em tempo real (API-FOOTBALL odds) com backup da última odd
 - Aproxima odd se não houver dado real
 - Integra um "news boost" simples usando NewsAPI (opcional)
+- Integra um "pré-jogo boost" baseado em ratings manuais dos times
 - Calcula EV e dispara alertas no Telegram quando EV >= EV_MIN_PCT
 
 IMPORTANTE:
 - Ainda não é o modelo completo "parrudo" v0.2 (news/contexto avançado fino),
-  mas já é um cérebro real, com dados ao vivo + ajuste de noticiário.
+  mas já é um cérebro real, com dados ao vivo + ajuste de noticiário + pré-jogo.
 """
 
 import asyncio
@@ -119,6 +120,36 @@ USE_NEWS_API: int = _get_env_int("USE_NEWS_API", 0)
 NEWS_TIME_WINDOW_HOURS: int = _get_env_int("NEWS_TIME_WINDOW_HOURS", 24)
 
 # ---------------------------------------------------------------------------
+# Ratings pré-jogo (manual por enquanto)
+# ---------------------------------------------------------------------------
+"""
+PREMATCH_TEAM_RATINGS:
+- Escala sugerida: de -2.0 a +2.0
+- Foca no "quão propenso a jogo de gol" é o time / confronto.
+  Ex.: ataque forte, estilo ofensivo, bola parada forte, elenco que acelera
+       ⇒ nota positiva.
+  Ex.: time que trava, retranca, jogo pesado, muito under
+       ⇒ nota negativa.
+- Isso é um ajuste suave (+/- até ~2 pontos de probabilidade).
+- Se um time não estiver aqui, assume 0.0 (neutro).
+"""
+PREMATCH_TEAM_RATINGS: Dict[str, float] = {
+    # EXEMPLOS – ajuste à vontade, pode apagar ou trocar:
+    # "Santos": 1.5,
+    # "Palmeiras": 1.8,
+    # "Flamengo": 1.7,
+    # "Atlético Mineiro": 1.4,
+    # "Corinthians": 0.2,
+    # "Botafogo": 0.8,
+    # "Grêmio": 0.5,
+    # "São Paulo": 0.3,
+    # Times muito under / travados poderiam ter valores negativos:
+    # "Cuiabá": -0.4,
+    # "Goiás": -0.3,
+}
+
+
+# ---------------------------------------------------------------------------
 # Estado em memória
 # ---------------------------------------------------------------------------
 
@@ -133,6 +164,7 @@ last_odd_cache: Dict[int, float] = {}
 
 # Cache simples de último "news boost" por fixture (fixture_id -> boost)
 last_news_boost_cache: Dict[int, float] = {}
+
 
 # ---------------------------------------------------------------------------
 # Funções auxiliares do cérebro
@@ -499,6 +531,35 @@ async def _fetch_news_boost_for_fixture(
 
 
 # ---------------------------------------------------------------------------
+# Pré-jogo boost (ratings manuais dos times)
+# ---------------------------------------------------------------------------
+
+def _get_pregame_boost_for_fixture(fixture: Dict[str, Any]) -> float:
+    """
+    Converte ratings pré-jogo dos times em um pequeno ajuste de probabilidade.
+
+    Lógica simples:
+    - Lê PREMATCH_TEAM_RATINGS[home] e [away], default 0.0.
+    - Faz média: (home + away) / 2 => score em [-2.0, +2.0] normalmente.
+    - Mapeia isso para ~[-0.02, +0.02] de probabilidade (em termos absolutos).
+    """
+    home = fixture.get("home_team") or ""
+    away = fixture.get("away_team") or ""
+
+    rh = PREMATCH_TEAM_RATINGS.get(home, 0.0)
+    ra = PREMATCH_TEAM_RATINGS.get(away, 0.0)
+
+    avg = (rh + ra) / 2.0
+    # Cada ponto de rating => ~1pp de probabilidade, clamped em [-2pp, +2pp]
+    boost = avg * 0.01
+    if boost > 0.02:
+        boost = 0.02
+    if boost < -0.02:
+        boost = -0.02
+    return boost
+
+
+# ---------------------------------------------------------------------------
 # Estimador de probabilidade / odd / EV
 # ---------------------------------------------------------------------------
 
@@ -509,6 +570,7 @@ def _estimate_prob_and_odd(
     away_goals: int,
     forced_odd_current: Optional[float] = None,
     news_boost_prob: float = 0.0,
+    pregame_boost_prob: float = 0.0,
 ) -> Dict[str, float]:
     """
     Estima probabilidade de +1 gol e uma odd "aproximada" com base em:
@@ -516,6 +578,7 @@ def _estimate_prob_and_odd(
     - volume ofensivo (chutes, no alvo, ataques perigosos)
     - leve ajuste pelo placar
     - ajuste de noticiário (news_boost_prob, ex.: +0.02 = +2pp)
+    - ajuste pré-jogo (pregame_boost_prob, ex.: +0.02 = +2pp)
     """
 
     total_goals = home_goals + away_goals
@@ -580,8 +643,9 @@ def _estimate_prob_and_odd(
     else:
         base_prob -= 0.02
 
-    # Ajuste notícias
+    # Ajustes de notícias + pré-jogo
     base_prob += news_boost_prob
+    base_prob += pregame_boost_prob
 
     p_final = max(0.20, min(0.90, base_prob))
 
@@ -606,6 +670,7 @@ def _estimate_prob_and_odd(
         "ev_pct": ev_pct,
         "pressure_score": pressure_score,
         "news_boost_prob": news_boost_prob,
+        "pregame_boost_prob": pregame_boost_prob,
     }
 
 
@@ -630,9 +695,11 @@ def _format_alert_text(
     ev_pct = metrics["ev_pct"]
     pressure_score = metrics["pressure_score"]
     news_boost_prob = metrics.get("news_boost_prob", 0.0) * 100.0
+    pregame_boost_prob = metrics.get("pregame_boost_prob", 0.0) * 100.0
 
     interpretacao_parts: List[str] = []
 
+    # Pressão ao vivo
     if pressure_score >= 7.5:
         interpretacao_parts.append("pressão ofensiva alta")
     elif pressure_score >= 5.0:
@@ -640,11 +707,13 @@ def _format_alert_text(
     else:
         interpretacao_parts.append("pressão apenas ok (cuidado)")
 
+    # Placar
     if total_goals >= 3:
         interpretacao_parts.append("jogo aberto em gols")
     elif total_goals == 0:
         interpretacao_parts.append("placar magro, mas estatísticas sugerem risco/valor")
 
+    # News
     if news_boost_prob > 0.0:
         if news_boost_prob >= 2.0:
             interpretacao_parts.append("noticiário reforça tendência de gol")
@@ -653,6 +722,16 @@ def _format_alert_text(
     elif news_boost_prob < 0.0:
         interpretacao_parts.append("noticiário pesa um pouco contra (cautela)")
 
+    # Pré-jogo
+    if pregame_boost_prob > 0.0:
+        if pregame_boost_prob >= 2.0:
+            interpretacao_parts.append("força pré-jogo favorece gols")
+        else:
+            interpretacao_parts.append("leve viés pré-jogo pró-gol")
+    elif pregame_boost_prob < 0.0:
+        interpretacao_parts.append("pré-jogo sugeria menos gols (cautela)")
+
+    # EV
     if ev_pct >= EV_MIN_PCT + 2.0:
         ev_flag = "EV+ forte"
     elif ev_pct >= EV_MIN_PCT:
@@ -663,18 +742,25 @@ def _format_alert_text(
     interpretacao_parts.append(ev_flag)
     interpretacao = " / ".join(interpretacao_parts)
 
-    news_line = ""
+    # Linha de ajustes (news + pré-jogo)
+    adjust_parts: List[str] = []
     if news_boost_prob != 0.0:
-        news_line = " (ajuste notícias: {nb:+.1f} pp)".format(nb=news_boost_prob)
+        adjust_parts.append("news {nb:+.1f} pp".format(nb=news_boost_prob))
+    if pregame_boost_prob != 0.0:
+        adjust_parts.append("pré {pg:+.1f} pp".format(pg=pregame_boost_prob))
+
+    adjust_str = ""
+    if adjust_parts:
+        adjust_str = " (ajustes: {txt})".format(txt=", ".join(adjust_parts))
 
     lines = [
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha} @ {odd:.2f}".format(linha=linha, odd=odd_current),
-        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}{news}".format(
+        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}{adj}".format(
             p=p_final,
             odd_j=odd_fair,
-            news=news_line,
+            adj=adjust_str,
         ),
         "💰 EV: {ev:.2f}%".format(ev=ev_pct),
         "",
@@ -696,6 +782,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     - Calcula métrica de pressão/probabilidade/EV
     - Usa odd em tempo real (com backup) quando possível
     - Aplica news boost (quando habilitado)
+    - Aplica pré-jogo boost (ratings manuais)
     - Retorna lista de textos de alerta prontos para enviar no Telegram
     """
     global last_status_text, last_scan_origin, last_scan_alerts
@@ -761,6 +848,16 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     )
                     news_boost_prob = 0.0
 
+                pregame_boost_prob = 0.0
+                try:
+                    pregame_boost_prob = _get_pregame_boost_for_fixture(fx)
+                except Exception:
+                    logging.exception(
+                        "Erro inesperado ao calcular pré-jogo para fixture=%s",
+                        fx["fixture_id"],
+                    )
+                    pregame_boost_prob = 0.0
+
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
                     stats=stats,
@@ -768,6 +865,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     away_goals=fx["away_goals"],
                     forced_odd_current=api_odd,
                     news_boost_prob=news_boost_prob,
+                    pregame_boost_prob=pregame_boost_prob,
                 )
 
                 if metrics["ev_pct"] < EV_MIN_PCT:
@@ -825,7 +923,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autoscan_status = "ativado" if AUTOSTART else "desativado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.2-lite + Telegram, odds reais + news boost).",
+        "👋 EvRadar PRO online (cérebro v0.2-lite + Telegram, odds reais + news boost + pré-jogo).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
@@ -843,7 +941,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.2-lite, odds reais + news boost)..."
+        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.2-lite, odds reais + news boost + pré-jogo)..."
     )
 
     alerts = await run_scan_cycle(origin="manual", application=context.application)
@@ -869,7 +967,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     news_set = bool(NEWS_API_KEY)
 
     lines = [
-        "🛠 Debug EvRadar PRO (cérebro v0.2-lite, odds reais + news boost)",
+        "🛠 Debug EvRadar PRO (cérebro v0.2-lite, odds reais + news boost + pré-jogo)",
         "",
         "TELEGRAM_BOT_TOKEN definido: {v}".format(v="sim" if token_set else "não"),
         "TELEGRAM_CHAT_ID: {cid}".format(
@@ -891,6 +989,10 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "NEWS_API_KEY definido: {v}".format(v="sim" if news_set else "não"),
         "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
         "NEWS_TIME_WINDOW_HOURS: {h}".format(h=NEWS_TIME_WINDOW_HOURS),
+        "",
+        "Ratings pré-jogo configurados: {n} times".format(
+            n=len(PREMATCH_TEAM_RATINGS)
+        ),
         "",
         "Último scan:",
         "  origem: {origin}".format(origin=last_scan_origin),
@@ -933,7 +1035,7 @@ def main() -> None:
     )
 
     logging.info(
-        "Iniciando bot do EvRadar PRO (cérebro v0.2-lite + Telegram, odds reais + news boost)..."
+        "Iniciando bot do EvRadar PRO (cérebro v0.2-lite + Telegram, odds reais + news boost + pré-jogo)..."
     )
 
     application = (
