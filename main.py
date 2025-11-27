@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.2-lite (Odds reais + backup + NewsBoost + Pré-jogo)
----------------------------------------------------------------------------------------
-Base: EvRadar PRO - Base Telegram v0.1 (casca estável)
-
-Esta versão adiciona um "cérebro" simplificado que:
+EvRadar PRO - Telegram + Cérebro v0.3-lite
+------------------------------------------
+Features:
+- Telegram estável (python-telegram-bot v21)
 - Consulta jogos ao vivo na API-FOOTBALL
-- Aplica filtros de liga e janela de tempo
-- Calcula um score de pressão/chances
-- Estima uma probabilidade de 1 gol a mais
-- Busca odd em tempo real (API-FOOTBALL odds) com backup da última odd
-- Aproxima odd se não houver dado real
-- Integra um "news boost" simples usando NewsAPI (opcional)
-- Integra um "pré-jogo boost" baseado em ratings manuais dos times
-- Calcula EV e dispara alertas no Telegram quando EV >= EV_MIN_PCT
+- Filtro por ligas e janela de tempo
+- Score de pressão / chances ao vivo
+- Probabilidade de +1 gol no 2º tempo
+- Odds em tempo real (API-FOOTBALL) com backup em cache
+- News boost (NewsAPI, opcional)
+- Pré-jogo boost:
+    - Manual (PREMATCH_TEAM_RATINGS)
+    - Automático (API-FOOTBALL /teams/statistics, com cache diário)
+- Cálculo de EV e alertas Telegram quando EV >= EV_MIN_PCT
 
-IMPORTANTE:
-- Ainda não é o modelo completo "parrudo" v0.2 (news/contexto avançado fino),
-  mas já é um cérebro real, com dados ao vivo + ajuste de noticiário + pré-jogo.
+Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-jogo manual).
 """
 
 import asyncio
 import logging
 import os
 from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from telegram import Update
@@ -119,6 +118,10 @@ NEWS_API_KEY: str = _get_env_str("NEWS_API_KEY")
 USE_NEWS_API: int = _get_env_int("USE_NEWS_API", 0)
 NEWS_TIME_WINDOW_HOURS: int = _get_env_int("NEWS_TIME_WINDOW_HOURS", 24)
 
+# Pré-jogo auto (API-FOOTBALL /teams/statistics)
+USE_API_PREGAME: int = _get_env_int("USE_API_PREGAME", 0)
+PREGAME_CACHE_HOURS: int = _get_env_int("PREGAME_CACHE_HOURS", 12)
+
 # ---------------------------------------------------------------------------
 # Ratings pré-jogo (manual por enquanto)
 # ---------------------------------------------------------------------------
@@ -130,22 +133,15 @@ PREMATCH_TEAM_RATINGS:
        ⇒ nota positiva.
   Ex.: time que trava, retranca, jogo pesado, muito under
        ⇒ nota negativa.
-- Isso é um ajuste suave (+/- até ~2 pontos de probabilidade).
 - Se um time não estiver aqui, assume 0.0 (neutro).
 """
 PREMATCH_TEAM_RATINGS: Dict[str, float] = {
-    # EXEMPLOS – ajuste à vontade, pode apagar ou trocar:
+    # Exemplo: ajuste conforme teu faro
     # "Santos": 1.5,
     # "Palmeiras": 1.8,
     # "Flamengo": 1.7,
     # "Atlético Mineiro": 1.4,
-    # "Corinthians": 0.2,
-    # "Botafogo": 0.8,
-    # "Grêmio": 0.5,
-    # "São Paulo": 0.3,
-    # Times muito under / travados poderiam ter valores negativos:
     # "Cuiabá": -0.4,
-    # "Goiás": -0.3,
 }
 
 
@@ -164,6 +160,13 @@ last_odd_cache: Dict[int, float] = {}
 
 # Cache simples de último "news boost" por fixture (fixture_id -> boost)
 last_news_boost_cache: Dict[int, float] = {}
+
+# Cache de pré-jogo auto por time (chave: "league:season:team_id")
+pregame_auto_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +244,13 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
             if short not in ("1H", "2H"):
                 continue
 
-            home_team = (teams.get("home") or {}).get("name") or "Home"
-            away_team = (teams.get("away") or {}).get("name") or "Away"
+            home_team_obj = (teams.get("home") or {})
+            away_team_obj = (teams.get("away") or {})
+
+            home_team = home_team_obj.get("name") or "Home"
+            away_team = away_team_obj.get("name") or "Away"
+            home_team_id = home_team_obj.get("id")
+            away_team_id = away_team_obj.get("id")
 
             home_goals = goals.get("home")
             away_goals = goals.get("away")
@@ -251,15 +259,24 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
             if away_goals is None:
                 away_goals = 0
 
+            season_raw = league.get("season")
+            try:
+                season = int(season_raw) if season_raw is not None else None
+            except (TypeError, ValueError):
+                season = None
+
             fixtures.append(
                 {
                     "fixture_id": int(fixture.get("id")),
                     "league_id": league_id,
                     "league_name": league.get("name") or "",
+                    "season": season,
                     "minute": int(elapsed),
                     "status_short": short,
                     "home_team": home_team,
                     "away_team": away_team,
+                    "home_team_id": home_team_id,
+                    "away_team_id": away_team_id,
                     "home_goals": int(home_goals),
                     "away_goals": int(away_goals),
                 }
@@ -468,11 +485,16 @@ async def _fetch_news_boost_for_fixture(
 
     query = '"{home}" OR "{away}"'.format(home=home, away=away)
 
+    now = _now_utc()
+    from_dt = now - timedelta(hours=NEWS_TIME_WINDOW_HOURS)
+    from_param = from_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
     params = {
         "q": query,
         "language": "en",
         "sortBy": "publishedAt",
         "pageSize": 20,
+        "from": from_param,
         "apiKey": NEWS_API_KEY,
     }
 
@@ -531,17 +553,12 @@ async def _fetch_news_boost_for_fixture(
 
 
 # ---------------------------------------------------------------------------
-# Pré-jogo boost (ratings manuais dos times)
+# Pré-jogo boost (manual + automático)
 # ---------------------------------------------------------------------------
 
-def _get_pregame_boost_for_fixture(fixture: Dict[str, Any]) -> float:
+def _get_pregame_boost_manual(fixture: Dict[str, Any]) -> float:
     """
-    Converte ratings pré-jogo dos times em um pequeno ajuste de probabilidade.
-
-    Lógica simples:
-    - Lê PREMATCH_TEAM_RATINGS[home] e [away], default 0.0.
-    - Faz média: (home + away) / 2 => score em [-2.0, +2.0] normalmente.
-    - Mapeia isso para ~[-0.02, +0.02] de probabilidade (em termos absolutos).
+    Converte ratings pré-jogo manuais dos times em ajuste de probabilidade.
     """
     home = fixture.get("home_team") or ""
     away = fixture.get("away_team") or ""
@@ -557,6 +574,217 @@ def _get_pregame_boost_for_fixture(fixture: Dict[str, Any]) -> float:
     if boost < -0.02:
         boost = -0.02
     return boost
+
+
+async def _get_team_auto_rating(
+    client: httpx.AsyncClient,
+    team_id: Optional[int],
+    league_id: Optional[int],
+    season: Optional[int],
+) -> float:
+    """
+    Busca estatísticas do time / season na API-FOOTBALL e gera um rating em [-2, +2]
+    indicando quão "golento" o time costuma ser (gols pró+contra, forma, etc.).
+    """
+    if not API_FOOTBALL_KEY or not USE_API_PREGAME:
+        return 0.0
+
+    if team_id is None or league_id is None or season is None:
+        return 0.0
+
+    cache_key = "{lg}:{ss}:{tm}".format(lg=league_id, ss=season, tm=team_id)
+    now = _now_utc()
+
+    cached = pregame_auto_cache.get(cache_key)
+    if cached:
+        ts: datetime = cached.get("ts")  # type: ignore
+        rating_cached = float(cached.get("rating", 0.0))
+        if (now - ts) <= timedelta(hours=PREGAME_CACHE_HOURS):
+            return rating_cached
+
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    params = {
+        "team": team_id,
+        "league": league_id,
+        "season": season,
+    }
+
+    try:
+        resp = await client.get(
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/teams/statistics",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception(
+            "Erro ao buscar estatísticas de time (pré-jogo) team=%s league=%s season=%s",
+            team_id,
+            league_id,
+            season,
+        )
+        pregame_auto_cache[cache_key] = {"rating": 0.0, "ts": now}
+        return 0.0
+
+    stats = data.get("response") or {}
+    if not stats:
+        pregame_auto_cache[cache_key] = {"rating": 0.0, "ts": now}
+        return 0.0
+
+    rating = 0.0
+
+    # Fixtures / resultados
+    fixtures_info = stats.get("fixtures") or {}
+    played_total = (
+        ((fixtures_info.get("played") or {}).get("total")) or 0
+    )
+    wins_total = ((fixtures_info.get("wins") or {}).get("total")) or 0
+    draws_total = ((fixtures_info.get("draws") or {}).get("total")) or 0
+    loses_total = ((fixtures_info.get("loses") or {}).get("total")) or 0
+
+    # Gols
+    goals_info = stats.get("goals") or {}
+    gf_total = (
+        ((goals_info.get("for") or {}).get("total") or {}).get("total", 0) or 0
+    )
+    ga_total = (
+        ((goals_info.get("against") or {}).get("total") or {}).get("total", 0) or 0
+    )
+
+    gpm = 0.0  # gols pró+contra por jogo
+    if played_total > 0:
+        gpm = (gf_total + ga_total) / float(played_total)
+
+    # Rating baseado em gols por jogo (mais aberto => mais rating)
+    if gpm >= 3.2:
+        rating += 1.2
+    elif gpm >= 2.8:
+        rating += 0.9
+    elif gpm >= 2.4:
+        rating += 0.6
+    elif gpm >= 2.1:
+        rating += 0.3
+    elif gpm <= 1.6:
+        rating -= 0.4
+    elif gpm <= 1.3:
+        rating -= 0.7
+
+    # Forma recente (string tipo "WWDLW")
+    form_str = (stats.get("form") or "").upper()
+    if form_str:
+        form_score = 0.0
+        count_chars = 0
+        for ch in form_str:
+            if ch not in ("W", "D", "L"):
+                continue
+            count_chars += 1
+            if ch == "W":
+                form_score += 0.15
+            elif ch == "D":
+                form_score += 0.05
+            elif ch == "L":
+                form_score -= 0.15
+
+        if count_chars > 0:
+            rating += form_score
+
+    # Pequeno ajuste por time que marca bem mais do que sofre (time dominante)
+    if played_total > 0:
+        gf_per = gf_total / float(played_total)
+        ga_per = ga_total / float(played_total)
+        if gf_per >= 1.8 and ga_per >= 1.0:
+            # Marca muito e também sofre algo -> jogos abertos
+            rating += 0.3
+        elif gf_per >= 1.8 and ga_per < 0.8:
+            # Time muito dominante, pode abrir vantagem e depois segurar
+            rating += 0.15
+
+    # Clamp em [-2.0, +2.0]
+    if rating > 2.0:
+        rating = 2.0
+    if rating < -2.0:
+        rating = -2.0
+
+    pregame_auto_cache[cache_key] = {"rating": rating, "ts": now}
+    return rating
+
+
+async def _get_pregame_boost_auto(
+    client: httpx.AsyncClient,
+    fixture: Dict[str, Any],
+) -> float:
+    """
+    Converte ratings automáticos dos dois times em um ajuste de probabilidade.
+    """
+    if not USE_API_PREGAME:
+        return 0.0
+
+    league_id = fixture.get("league_id")
+    season = fixture.get("season")
+    home_team_id = fixture.get("home_team_id")
+    away_team_id = fixture.get("away_team_id")
+
+    if league_id is None or season is None:
+        return 0.0
+
+    rating_home = await _get_team_auto_rating(
+        client=client,
+        team_id=home_team_id,
+        league_id=league_id,
+        season=season,
+    )
+    rating_away = await _get_team_auto_rating(
+        client=client,
+        team_id=away_team_id,
+        league_id=league_id,
+        season=season,
+    )
+
+    avg_rating = (rating_home + rating_away) / 2.0
+
+    # Cada ponto de rating auto => ~0.8pp de probabilidade
+    boost = avg_rating * 0.008
+    # clamp mais curto para não dominar o modelo
+    if boost > 0.02:
+        boost = 0.02
+    if boost < -0.02:
+        boost = -0.02
+
+    return boost
+
+
+async def _get_pregame_boost_for_fixture(
+    client: httpx.AsyncClient,
+    fixture: Dict[str, Any],
+) -> float:
+    """
+    Combina pré-jogo manual + automático (quando habilitado).
+    """
+    manual_boost = _get_pregame_boost_manual(fixture)
+
+    if not USE_API_PREGAME:
+        return manual_boost
+
+    auto_boost = 0.0
+    try:
+        auto_boost = await _get_pregame_boost_auto(client, fixture)
+    except Exception:
+        logging.exception(
+            "Erro inesperado ao calcular pré-jogo automático para fixture=%s",
+            fixture.get("fixture_id"),
+        )
+        auto_boost = 0.0
+
+    total = manual_boost + auto_boost
+
+    # clamp global para o somatório pré-jogo em [-3pp, +3pp]
+    if total > 0.03:
+        total = 0.03
+    if total < -0.03:
+        total = -0.03
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +1010,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     - Calcula métrica de pressão/probabilidade/EV
     - Usa odd em tempo real (com backup) quando possível
     - Aplica news boost (quando habilitado)
-    - Aplica pré-jogo boost (ratings manuais)
+    - Aplica pré-jogo boost (ratings manuais + automáticos)
     - Retorna lista de textos de alerta prontos para enviar no Telegram
     """
     global last_status_text, last_scan_origin, last_scan_alerts
@@ -850,7 +1078,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 pregame_boost_prob = 0.0
                 try:
-                    pregame_boost_prob = _get_pregame_boost_for_fixture(fx)
+                    pregame_boost_prob = await _get_pregame_boost_for_fixture(
+                        client=client,
+                        fixture=fx,
+                    )
                 except Exception:
                     logging.exception(
                         "Erro inesperado ao calcular pré-jogo para fixture=%s",
@@ -923,7 +1154,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autoscan_status = "ativado" if AUTOSTART else "desativado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.2-lite + Telegram, odds reais + news boost + pré-jogo).",
+        "👋 EvRadar PRO online (cérebro v0.3-lite: odds reais + news + pré-jogo auto).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
@@ -941,7 +1172,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.2-lite, odds reais + news boost + pré-jogo)..."
+        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto)..."
     )
 
     alerts = await run_scan_cycle(origin="manual", application=context.application)
@@ -967,7 +1198,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     news_set = bool(NEWS_API_KEY)
 
     lines = [
-        "🛠 Debug EvRadar PRO (cérebro v0.2-lite, odds reais + news boost + pré-jogo)",
+        "🛠 Debug EvRadar PRO (cérebro v0.3-lite, odds reais + news + pré-jogo auto)",
         "",
         "TELEGRAM_BOT_TOKEN definido: {v}".format(v="sim" if token_set else "não"),
         "TELEGRAM_CHAT_ID: {cid}".format(
@@ -990,7 +1221,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
         "NEWS_TIME_WINDOW_HOURS: {h}".format(h=NEWS_TIME_WINDOW_HOURS),
         "",
-        "Ratings pré-jogo configurados: {n} times".format(
+        "USE_API_PREGAME: {v}".format(v=USE_API_PREGAME),
+        "PREGAME_CACHE_HOURS: {h}".format(h=PREGAME_CACHE_HOURS),
+        "Ratings pré-jogo manuais: {n} times".format(
             n=len(PREMATCH_TEAM_RATINGS)
         ),
         "",
@@ -1035,7 +1268,7 @@ def main() -> None:
     )
 
     logging.info(
-        "Iniciando bot do EvRadar PRO (cérebro v0.2-lite + Telegram, odds reais + news boost + pré-jogo)..."
+        "Iniciando bot do EvRadar PRO (cérebro v0.3-lite: odds reais + news + pré-jogo auto)..."
     )
 
     application = (
