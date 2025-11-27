@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.2-lite (Odds reais + backup)
-----------------------------------------------------------------
+EvRadar PRO - Telegram + Cérebro v0.2-lite (Odds reais + backup + NewsBoost)
+----------------------------------------------------------------------------
 Base: EvRadar PRO - Base Telegram v0.1 (casca estável)
 
 Esta versão adiciona um "cérebro" simplificado que:
@@ -12,11 +12,12 @@ Esta versão adiciona um "cérebro" simplificado que:
 - Estima uma probabilidade de 1 gol a mais
 - Busca odd em tempo real (API-FOOTBALL odds) com backup da última odd
 - Aproxima odd se não houver dado real
+- Integra um "news boost" simples usando NewsAPI (opcional)
 - Calcula EV e dispara alertas no Telegram quando EV >= EV_MIN_PCT
 
 IMPORTANTE:
-- Ainda não é o modelo completo "parrudo" v0.2 (news, contexto avançado etc.),
-  mas já é um cérebro real, com dados ao vivo.
+- Ainda não é o modelo completo "parrudo" v0.2 (news/contexto avançado fino),
+  mas já é um cérebro real, com dados ao vivo + ajuste de noticiário.
 """
 
 import asyncio
@@ -29,7 +30,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------------------------------------------------------------------------
-# Configuração básica via variáveis de ambiente
+# Helpers de env
 # ---------------------------------------------------------------------------
 
 def _get_env_int(name: str, default: int) -> int:
@@ -58,6 +59,25 @@ def _get_env_float(name: str, default: float) -> float:
 def _get_env_str(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
+
+def _parse_league_ids(raw: str) -> List[int]:
+    if not raw:
+        return []
+    parts = raw.replace(" ", "").split(",")
+    ids: List[int] = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            ids.append(int(p))
+        except ValueError:
+            continue
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Variáveis de ambiente
+# ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN: str = _get_env_str("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID: Optional[int] = None
@@ -88,28 +108,18 @@ API_FOOTBALL_BASE_URL: str = _get_env_str(
 )
 
 LEAGUE_IDS_RAW: str = _get_env_str("LEAGUE_IDS")
-USE_API_FOOTBALL_ODDS: int = _get_env_int("USE_API_FOOTBALL_ODDS", 0)
-BOOKMAKER_ID: int = _get_env_int("BOOKMAKER_ID", 34)  # 34 = Superbet (como já usamos)
-
-def _parse_league_ids(raw: str) -> List[int]:
-    if not raw:
-        return []
-    parts = raw.replace(" ", "").split(",")
-    ids: List[int] = []
-    for p in parts:
-        if not p:
-            continue
-        try:
-            ids.append(int(p))
-        except ValueError:
-            continue
-    return ids
-
-
 LEAGUE_IDS: List[int] = _parse_league_ids(LEAGUE_IDS_RAW)
 
+USE_API_FOOTBALL_ODDS: int = _get_env_int("USE_API_FOOTBALL_ODDS", 0)
+BOOKMAKER_ID: int = _get_env_int("BOOKMAKER_ID", 34)  # 34 = Superbet
+
+# NewsAPI (opcional)
+NEWS_API_KEY: str = _get_env_str("NEWS_API_KEY")
+USE_NEWS_API: int = _get_env_int("USE_NEWS_API", 0)
+NEWS_TIME_WINDOW_HOURS: int = _get_env_int("NEWS_TIME_WINDOW_HOURS", 24)
+
 # ---------------------------------------------------------------------------
-# Estado simples em memória
+# Estado em memória
 # ---------------------------------------------------------------------------
 
 last_status_text: str = "Ainda não foi rodada nenhuma varredura."
@@ -121,6 +131,8 @@ last_scan_window_matches: int = 0
 # Cache de última odd real por jogo (fixture_id -> odd)
 last_odd_cache: Dict[int, float] = {}
 
+# Cache simples de último "news boost" por fixture (fixture_id -> boost)
+last_news_boost_cache: Dict[int, float] = {}
 
 # ---------------------------------------------------------------------------
 # Funções auxiliares do cérebro
@@ -149,9 +161,7 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
         logging.warning("API_FOOTBALL_KEY não definido; não há como buscar jogos ao vivo.")
         return []
 
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
     params = {"live": "all"}
 
     try:
@@ -234,9 +244,7 @@ async def _fetch_statistics_for_fixture(
     fixture_id: int,
 ) -> Dict[str, Any]:
     """Busca estatísticas do jogo (shots, ataques, posse, etc.)."""
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
     params = {"fixture": fixture_id}
 
     try:
@@ -301,13 +309,10 @@ async def _fetch_live_odds_for_fixture(
     if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
         return None
 
-    headers = {
-        "x-apisports-key": API_FOOTBALL_KEY,
-    }
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
     params = {
         "fixture": fixture_id,
         "bookmaker": BOOKMAKER_ID,
-        # poderíamos filtrar por bet/market aqui se necessário
     }
 
     try:
@@ -330,7 +335,7 @@ async def _fetch_live_odds_for_fixture(
     odds_item = response[0]
     bookmakers = odds_item.get("bookmakers") or []
 
-    target_line_str = "{:.1f}".format(total_goals + 0.5)  # ex: 2 -> "2.5" etc.
+    target_line_str = "{:.1f}".format(total_goals + 0.5)  # ex: 2 -> "2.5"
 
     for b in bookmakers:
         try:
@@ -338,7 +343,6 @@ async def _fetch_live_odds_for_fixture(
             if b_id_raw is not None and int(b_id_raw) != BOOKMAKER_ID:
                 continue
         except Exception:
-            # se não conseguir converter id, tenta mesmo assim
             pass
 
         bets = b.get("bets") or []
@@ -373,21 +377,145 @@ async def _fetch_live_odds_for_fixture(
     return None
 
 
+# ---------------------------------------------------------------------------
+# News boost (heurística simples usando NewsAPI)
+# ---------------------------------------------------------------------------
+
+_POSITIVE_KEYWORDS = [
+    "back from injury",
+    "returns",
+    "returning",
+    "fit to play",
+    "star striker",
+    "must win",
+    "decisive match",
+    "title race",
+    "relegation battle",
+    "home crowd",
+    "sold out",
+    "full stadium",
+    "coach praises attack",
+    "goal spree",
+]
+
+_NEGATIVE_KEYWORDS = [
+    "injured",
+    "out for season",
+    "suspension",
+    "suspended",
+    "defensive approach",
+    "park the bus",
+    "missing key players",
+    "fatigue",
+    "tired legs",
+    "rotation",
+    "resting starters",
+    "heavy pitch",
+    "bad weather",
+]
+
+
+async def _fetch_news_boost_for_fixture(
+    client: httpx.AsyncClient,
+    fixture: Dict[str, Any],
+) -> float:
+    """
+    Busca notícias recentes sobre os times e retorna um "boost" de probabilidade:
+    - Resultado em delta de probabilidade (ex.: +0.02 = +2pp)
+    - Intervalo típico: ~[-0.02, +0.03]
+    """
+    if not NEWS_API_KEY or not USE_NEWS_API:
+        return 0.0
+
+    fixture_id = fixture.get("fixture_id")
+    if fixture_id in last_news_boost_cache:
+        return last_news_boost_cache[fixture_id]
+
+    home = fixture.get("home_team") or ""
+    away = fixture.get("away_team") or ""
+
+    query = '"{home}" OR "{away}"'.format(home=home, away=away)
+
+    params = {
+        "q": query,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 20,
+        "apiKey": NEWS_API_KEY,
+    }
+
+    try:
+        resp = await client.get(
+            "https://newsapi.org/v2/everything",
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception("Erro ao buscar notícias para fixture=%s", fixture_id)
+        last_news_boost_cache[fixture_id] = 0.0
+        return 0.0
+
+    articles = data.get("articles") or []
+    if not articles:
+        last_news_boost_cache[fixture_id] = 0.0
+        return 0.0
+
+    score = 0
+
+    for art in articles:
+        text_parts = [
+            art.get("title") or "",
+            art.get("description") or "",
+            art.get("content") or "",
+        ]
+        text = " ".join(text_parts).lower()
+
+        for kw in _POSITIVE_KEYWORDS:
+            if kw.lower() in text:
+                score += 1
+
+        for kw in _NEGATIVE_KEYWORDS:
+            if kw.lower() in text:
+                score -= 1
+
+    boost = 0.0
+    if score >= 3:
+        boost = 0.03
+    elif score == 2:
+        boost = 0.02
+    elif score == 1:
+        boost = 0.01
+    elif score == 0:
+        boost = 0.0
+    elif score == -1:
+        boost = -0.01
+    elif score <= -2:
+        boost = -0.02
+
+    last_news_boost_cache[fixture_id] = boost
+    return boost
+
+
+# ---------------------------------------------------------------------------
+# Estimador de probabilidade / odd / EV
+# ---------------------------------------------------------------------------
+
 def _estimate_prob_and_odd(
     minute: int,
     stats: Dict[str, Any],
     home_goals: int,
     away_goals: int,
     forced_odd_current: Optional[float] = None,
+    news_boost_prob: float = 0.0,
 ) -> Dict[str, float]:
     """
     Estima probabilidade de +1 gol e uma odd "aproximada" com base em:
     - tempo de jogo
     - volume ofensivo (chutes, no alvo, ataques perigosos)
-    - leve ajuste pelo placar.
-
-    Se forced_odd_current for fornecida, ela é usada como odd do momento
-    (com clamp em [MIN_ODD, MAX_ODD]) em vez da odd aproximada.
+    - leve ajuste pelo placar
+    - ajuste de noticiário (news_boost_prob, ex.: +0.02 = +2pp)
     """
 
     total_goals = home_goals + away_goals
@@ -403,7 +531,6 @@ def _estimate_prob_and_odd(
     total_on = home_on + away_on
     total_dang = home_dang + away_dang
 
-    # Score de pressão (0–10) aproximado
     pressure_score = 0.0
 
     # Volume de chutes
@@ -430,27 +557,20 @@ def _estimate_prob_and_odd(
     elif total_dang >= 18:
         pressure_score += 1.0
 
-    # Pequeno ajuste por gols já marcados (jogo mais aberto)
+    # Pequeno ajuste por gols já marcados
     if total_goals >= 3:
         pressure_score += 1.0
     elif total_goals == 2:
         pressure_score += 0.5
 
-    # Clipa score
     if pressure_score < 0.0:
         pressure_score = 0.0
     if pressure_score > 10.0:
         pressure_score = 10.0
 
-    # Converte score em um "impulso" de probabilidade (0.35–0.80)
-    # Base do 2º tempo: prob ~ 0.35
     base_prob = 0.35
+    base_prob += (pressure_score / 10.0) * 0.35
 
-    # Aumenta com pressão
-    base_prob += (pressure_score / 10.0) * 0.35  # até +0.35
-
-    # Ajuste por tempo restante (mais cedo no 2º tempo => mais tempo pra sair gol)
-    # minuto ~ 47–75: mais cedo => mais prob.
     if minute <= 55:
         base_prob += 0.05
     elif minute <= 65:
@@ -460,26 +580,22 @@ def _estimate_prob_and_odd(
     else:
         base_prob -= 0.02
 
-    # Clipa probabilidade em [0.20, 0.90]
+    # Ajuste notícias
+    base_prob += news_boost_prob
+
     p_final = max(0.20, min(0.90, base_prob))
 
-    # Odd justa = 1 / p
     odd_fair = 1.0 / p_final
+    odd_current = odd_fair * 1.03
 
-    # Odd atual aproximada
-    odd_current = odd_fair * 1.03  # leve margem da casa
-
-    # Se houver odd real forçada (API ou cache), usamos ela
     if forced_odd_current is not None and forced_odd_current > 1.0:
         odd_current = forced_odd_current
 
-    # Clamp na faixa configurada
     if odd_current < MIN_ODD:
         odd_current = MIN_ODD
     if odd_current > MAX_ODD:
         odd_current = MAX_ODD
 
-    # EV em %
     ev = p_final * odd_current - 1.0
     ev_pct = ev * 100.0
 
@@ -489,6 +605,7 @@ def _estimate_prob_and_odd(
         "odd_current": odd_current,
         "ev_pct": ev_pct,
         "pressure_score": pressure_score,
+        "news_boost_prob": news_boost_prob,
     }
 
 
@@ -505,15 +622,16 @@ def _format_alert_text(
     minuto = fixture["minute"]
     placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
     total_goals = fixture["home_goals"] + fixture["away_goals"]
-    linha = "Over (soma + 0,5)"  # padrão do projeto
+    linha = "Over (soma + 0,5)"
 
     p_final = metrics["p_final"] * 100.0
     odd_fair = metrics["odd_fair"]
     odd_current = metrics["odd_current"]
     ev_pct = metrics["ev_pct"]
     pressure_score = metrics["pressure_score"]
+    news_boost_prob = metrics.get("news_boost_prob", 0.0) * 100.0
 
-    interpretacao_parts = []
+    interpretacao_parts: List[str] = []
 
     if pressure_score >= 7.5:
         interpretacao_parts.append("pressão ofensiva alta")
@@ -527,6 +645,14 @@ def _format_alert_text(
     elif total_goals == 0:
         interpretacao_parts.append("placar magro, mas estatísticas sugerem risco/valor")
 
+    if news_boost_prob > 0.0:
+        if news_boost_prob >= 2.0:
+            interpretacao_parts.append("noticiário reforça tendência de gol")
+        else:
+            interpretacao_parts.append("noticiário levemente favorável a gol")
+    elif news_boost_prob < 0.0:
+        interpretacao_parts.append("noticiário pesa um pouco contra (cautela)")
+
     if ev_pct >= EV_MIN_PCT + 2.0:
         ev_flag = "EV+ forte"
     elif ev_pct >= EV_MIN_PCT:
@@ -535,16 +661,20 @@ def _format_alert_text(
         ev_flag = "EV borderline"
 
     interpretacao_parts.append(ev_flag)
-
     interpretacao = " / ".join(interpretacao_parts)
+
+    news_line = ""
+    if news_boost_prob != 0.0:
+        news_line = " (ajuste notícias: {nb:+.1f} pp)".format(nb=news_boost_prob)
 
     lines = [
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha} @ {odd:.2f}".format(linha=linha, odd=odd_current),
-        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
+        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}{news}".format(
             p=p_final,
             odd_j=odd_fair,
+            news=news_line,
         ),
         "💰 EV: {ev:.2f}%".format(ev=ev_pct),
         "",
@@ -565,6 +695,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     - Aplica filtros de liga e janela
     - Calcula métrica de pressão/probabilidade/EV
     - Usa odd em tempo real (com backup) quando possível
+    - Aplica news boost (quando habilitado)
     - Retorna lista de textos de alerta prontos para enviar no Telegram
     """
     global last_status_text, last_scan_origin, last_scan_alerts
@@ -586,7 +717,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     async with httpx.AsyncClient() as client:
         fixtures = await _fetch_live_fixtures(client)
 
-        last_scan_live_events = len(fixtures)  # aqui já são apenas os da janela/ligas
+        last_scan_live_events = len(fixtures)
         last_scan_window_matches = len(fixtures)
 
         alerts: List[str] = []
@@ -599,7 +730,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 total_goals = fx["home_goals"] + fx["away_goals"]
 
-                # Busca odd ao vivo na API, com fallback para cache
                 api_odd: Optional[float] = None
                 try:
                     api_odd = await _fetch_live_odds_for_fixture(
@@ -616,8 +746,20 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 if api_odd is not None:
                     last_odd_cache[fx["fixture_id"]] = api_odd
                 else:
-                    # Se não vier nada agora, tenta usar odd anterior em cache
                     api_odd = last_odd_cache.get(fx["fixture_id"])
+
+                news_boost_prob = 0.0
+                try:
+                    news_boost_prob = await _fetch_news_boost_for_fixture(
+                        client=client,
+                        fixture=fx,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Erro inesperado ao calcular news boost para fixture=%s",
+                        fx["fixture_id"],
+                    )
+                    news_boost_prob = 0.0
 
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
@@ -625,6 +767,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     home_goals=fx["home_goals"],
                     away_goals=fx["away_goals"],
                     forced_odd_current=api_odd,
+                    news_boost_prob=news_boost_prob,
                 )
 
                 if metrics["ev_pct"] < EV_MIN_PCT:
@@ -679,11 +822,10 @@ async def autoscan_loop(application: Application) -> None:
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /start: mensagem de boas-vindas e resumo de config."""
     autoscan_status = "ativado" if AUTOSTART else "desativado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.2-lite + Telegram, odds reais).",
+        "👋 EvRadar PRO online (cérebro v0.2-lite + Telegram, odds reais + news boost).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
@@ -700,9 +842,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /scan: roda um ciclo de varredura manual com o cérebro v0.2-lite."""
     await update.message.reply_text(
-        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.2-lite, odds reais)..."
+        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.2-lite, odds reais + news boost)..."
     )
 
     alerts = await run_scan_cycle(origin="manual", application=context.application)
@@ -718,18 +859,17 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /status: mostra o último resumo de varredura."""
     await update.message.reply_text(last_status_text)
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /debug: mostra informações técnicas básicas."""
     token_set = bool(TELEGRAM_BOT_TOKEN)
     chat_set = TELEGRAM_CHAT_ID is not None
     api_set = bool(API_FOOTBALL_KEY)
+    news_set = bool(NEWS_API_KEY)
 
     lines = [
-        "🛠 Debug EvRadar PRO (cérebro v0.2-lite, odds reais)",
+        "🛠 Debug EvRadar PRO (cérebro v0.2-lite, odds reais + news boost)",
         "",
         "TELEGRAM_BOT_TOKEN definido: {v}".format(v="sim" if token_set else "não"),
         "TELEGRAM_CHAT_ID: {cid}".format(
@@ -748,6 +888,10 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ids=",".join(str(x) for x in LEAGUE_IDS) if LEAGUE_IDS else "não definido"
         ),
         "",
+        "NEWS_API_KEY definido: {v}".format(v="sim" if news_set else "não"),
+        "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
+        "NEWS_TIME_WINDOW_HOURS: {h}".format(h=NEWS_TIME_WINDOW_HOURS),
+        "",
         "Último scan:",
         "  origem: {origin}".format(origin=last_scan_origin),
         "  eventos janela/ligas: {live}".format(live=last_scan_window_matches),
@@ -757,7 +901,6 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /links: exibe link da casa / recursos úteis."""
     lines = [
         "🔗 Links úteis",
         "",
@@ -768,32 +911,30 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# post_init e função principal
+# post_init e main
 # ---------------------------------------------------------------------------
 
 async def post_init(application: Application) -> None:
-    """Executado automaticamente por run_polling após initialize()."""
     logging.info("Application started (post_init executado).")
 
     if AUTOSTART:
-        # Inicia o loop de autoscan sem bloquear o polling.
         application.create_task(autoscan_loop(application), name="autoscan_loop")
 
 
 def main() -> None:
-    """Ponto de entrada do bot EvRadar PRO (cérebro v0.2-lite + Telegram)."""
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN não definido. Configure a variável de ambiente antes de rodar."
         )
 
-    # Configuração de logging
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=logging.INFO,
     )
 
-    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.2-lite + Telegram, odds reais)...")
+    logging.info(
+        "Iniciando bot do EvRadar PRO (cérebro v0.2-lite + Telegram, odds reais + news boost)..."
+    )
 
     application = (
         Application.builder()
@@ -802,17 +943,15 @@ def main() -> None:
         .build()
     )
 
-    # Handlers de comando
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("scan", cmd_scan))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
 
-    # Inicia polling (loop principal)
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,  # deixa o host (Railway/Replit) matar o processo
+        stop_signals=None,
     )
 
 
