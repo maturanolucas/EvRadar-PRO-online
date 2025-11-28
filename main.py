@@ -46,7 +46,7 @@ def _get_env_int(name: str, default: int) -> int:
             return default
 
 
-def _get_env_float(name: str, default: float) -> float:
+def _get_env_float(name: str, default: float)) -> float:
     raw = os.getenv(name)
     if raw is None or raw == "":
         return default
@@ -97,6 +97,9 @@ WINDOW_END: int = _get_env_int("WINDOW_END", 75)
 EV_MIN_PCT: float = _get_env_float("EV_MIN_PCT", 4.0)
 MIN_ODD: float = _get_env_float("MIN_ODD", 1.47)
 MAX_ODD: float = _get_env_float("MAX_ODD", 3.50)
+
+# Banca virtual para sugestão de stake
+BANKROLL_INITIAL: float = _get_env_float("BANKROLL_INITIAL", 5000.0)
 
 BOOKMAKER_NAME: str = _get_env_str("BOOKMAKER_NAME", "Superbet")
 BOOKMAKER_URL: str = _get_env_str("BOOKMAKER_URL", "https://www.superbet.com/")
@@ -155,7 +158,7 @@ last_scan_alerts: int = 0
 last_scan_live_events: int = 0
 last_scan_window_matches: int = 0
 
-# Cache de última odd real por jogo (fixture_id -> odd)
+# Cache de última odd real por jogo (fixture_id -> odd da linha correta)
 last_odd_cache: Dict[int, float] = {}
 
 # Cache simples de último "news boost" por fixture (fixture_id -> boost)
@@ -236,11 +239,9 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
             if elapsed is None:
                 elapsed = 0
 
-            # Apenas jogos no intervalo de tempo configurado
             if elapsed < WINDOW_START or elapsed > WINDOW_END:
                 continue
 
-            # Status ativos de jogo (1º ou 2º tempo)
             if short not in ("1H", "2H"):
                 continue
 
@@ -313,14 +314,12 @@ async def _fetch_statistics_for_fixture(
     if not response or len(response) < 2:
         return {}
 
-    # A API geralmente retorna 2 entradas: home e away
     home = response[0]
     away = response[1]
 
     home_stats = home.get("statistics") or []
     away_stats = away.get("statistics") or []
 
-    # Extração de algumas métricas básicas
     home_shots_total = _safe_get_stat(home_stats, "Total Shots")
     away_shots_total = _safe_get_stat(away_stats, "Total Shots")
     home_shots_on = _safe_get_stat(home_stats, "Shots on Goal")
@@ -365,7 +364,6 @@ async def _fetch_live_odds_for_fixture(
     }
 
     try:
-        # IMPORTANTE: usar odds LIVE (não pré-jogo)
         resp = await client.get(
             API_FOOTBALL_BASE_URL.rstrip("/") + "/odds/live",
             headers=headers,
@@ -385,7 +383,7 @@ async def _fetch_live_odds_for_fixture(
     odds_item = response[0]
     bookmakers = odds_item.get("bookmakers") or []
 
-    target_line_str = "{:.1f}".format(total_goals + 0.5)  # ex: 2 -> "2.5"
+    target_line_str = "{:.1f}".format(total_goals + 0.5)
 
     for b in bookmakers:
         try:
@@ -398,7 +396,6 @@ async def _fetch_live_odds_for_fixture(
         bets = b.get("bets") or []
         for bet in bets:
             name = (bet.get("name") or "").lower()
-            # heurística: procura mercado de gols/over-under
             if ("over" not in name) and ("under" not in name) and ("goal" not in name):
                 continue
 
@@ -568,7 +565,6 @@ def _get_pregame_boost_manual(fixture: Dict[str, Any]) -> float:
     ra = PREMATCH_TEAM_RATINGS.get(away, 0.0)
 
     avg = (rh + ra) / 2.0
-    # Cada ponto de rating => ~1pp de probabilidade, clamped em [-2pp, +2pp]
     boost = avg * 0.01
     if boost > 0.02:
         boost = 0.02
@@ -584,8 +580,7 @@ async def _get_team_auto_rating(
     season: Optional[int],
 ) -> float:
     """
-    Busca estatísticas do time / season na API-FOOTBALL e gera um rating em [-2, +2]
-    indicando quão "golento" o time costuma ser (gols pró+contra, forma, etc.).
+    Rating em [-2, +2] indicando quão "golento" o time costuma ser.
     """
     if not API_FOOTBALL_KEY or not USE_API_PREGAME:
         return 0.0
@@ -636,16 +631,12 @@ async def _get_team_auto_rating(
 
     rating = 0.0
 
-    # Fixtures / resultados
     fixtures_info = stats.get("fixtures") or {}
-    played_total = (
-        ((fixtures_info.get("played") or {}).get("total")) or 0
-    )
+    played_total = ((fixtures_info.get("played") or {}).get("total")) or 0
     wins_total = ((fixtures_info.get("wins") or {}).get("total")) or 0
     draws_total = ((fixtures_info.get("draws") or {}).get("total")) or 0
     loses_total = ((fixtures_info.get("loses") or {}).get("total")) or 0
 
-    # Gols
     goals_info = stats.get("goals") or {}
     gf_total = (
         ((goals_info.get("for") or {}).get("total") or {}).get("total", 0) or 0
@@ -654,11 +645,10 @@ async def _get_team_auto_rating(
         ((goals_info.get("against") or {}).get("total") or {}).get("total", 0) or 0
     )
 
-    gpm = 0.0  # gols pró+contra por jogo
+    gpm = 0.0
     if played_total > 0:
         gpm = (gf_total + ga_total) / float(played_total)
 
-    # Rating baseado em gols por jogo (mais aberto => mais rating)
     if gpm >= 3.2:
         rating += 1.2
     elif gpm >= 2.8:
@@ -672,7 +662,6 @@ async def _get_team_auto_rating(
     elif gpm <= 1.3:
         rating -= 0.7
 
-    # Forma recente (string tipo "WWDLW")
     form_str = (stats.get("form") or "").upper()
     if form_str:
         form_score = 0.0
@@ -691,18 +680,14 @@ async def _get_team_auto_rating(
         if count_chars > 0:
             rating += form_score
 
-    # Pequeno ajuste por time que marca bem mais do que sofre (time dominante)
     if played_total > 0:
         gf_per = gf_total / float(played_total)
         ga_per = ga_total / float(played_total)
         if gf_per >= 1.8 and ga_per >= 1.0:
-            # Marca muito e também sofre algo -> jogos abertos
             rating += 0.3
         elif gf_per >= 1.8 and ga_per < 0.8:
-            # Time muito dominante, pode abrir vantagem e depois segurar
             rating += 0.15
 
-    # Clamp em [-2.0, +2.0]
     if rating > 2.0:
         rating = 2.0
     if rating < -2.0:
@@ -716,9 +701,6 @@ async def _get_pregame_boost_auto(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
 ) -> float:
-    """
-    Converte ratings automáticos dos dois times em um ajuste de probabilidade.
-    """
     if not USE_API_PREGAME:
         return 0.0
 
@@ -745,9 +727,7 @@ async def _get_pregame_boost_auto(
 
     avg_rating = (rating_home + rating_away) / 2.0
 
-    # Cada ponto de rating auto => ~0.8pp de probabilidade
     boost = avg_rating * 0.008
-    # clamp mais curto para não dominar o modelo
     if boost > 0.02:
         boost = 0.02
     if boost < -0.02:
@@ -760,9 +740,6 @@ async def _get_pregame_boost_for_fixture(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
 ) -> float:
-    """
-    Combina pré-jogo manual + automático (quando habilitado).
-    """
     manual_boost = _get_pregame_boost_manual(fixture)
 
     if not USE_API_PREGAME:
@@ -780,7 +757,6 @@ async def _get_pregame_boost_for_fixture(
 
     total = manual_boost + auto_boost
 
-    # clamp global para o somatório pré-jogo em [-3pp, +3pp]
     if total > 0.03:
         total = 0.03
     if total < -0.03:
@@ -789,7 +765,7 @@ async def _get_pregame_boost_for_fixture(
 
 
 # ---------------------------------------------------------------------------
-# Estimador de probabilidade / odd / EV
+# Estimador de probabilidade / odd / EV + sugestão de stake
 # ---------------------------------------------------------------------------
 
 def _estimate_prob_and_odd(
@@ -802,16 +778,12 @@ def _estimate_prob_and_odd(
     pregame_boost_prob: float = 0.0,
 ) -> Dict[str, float]:
     """
-    Estima probabilidade de +1 gol e uma odd "aproximada" com base em:
-    - tempo de jogo
-    - volume ofensivo (chutes, no alvo, ataques perigosos)
-    - leve ajuste pelo placar
-    - ajuste de noticiário (news_boost_prob, ex.: +0.02 = +2pp)
-    - ajuste pré-jogo (pregame_boost_prob, ex.: +0.02 = +2pp)
+    Estima probabilidade de +1 gol e uma odd "aproximada".
 
-    IMPORTANTE: se forced_odd_current vier da API (odd real da casa),
-    NÃO fazemos clamp em [MIN_ODD, MAX_ODD] aqui. O filtro por faixa de
-    odds é feito fora, no scan, para não distorcer a odd real.
+    IMPORTANTE:
+    - Quando forced_odd_current vem da API (odd real da casa),
+      não fazemos clamp em [MIN_ODD, MAX_ODD] aqui.
+    - O filtro por faixa de odds é feito no scan.
     """
 
     total_goals = home_goals + away_goals
@@ -829,7 +801,6 @@ def _estimate_prob_and_odd(
 
     pressure_score = 0.0
 
-    # Volume de chutes
     if total_shots >= 20:
         pressure_score += 3.0
     elif total_shots >= 14:
@@ -837,7 +808,6 @@ def _estimate_prob_and_odd(
     elif total_shots >= 8:
         pressure_score += 1.0
 
-    # Chutes no alvo
     if total_on >= 8:
         pressure_score += 3.0
     elif total_on >= 5:
@@ -845,7 +815,6 @@ def _estimate_prob_and_odd(
     elif total_on >= 3:
         pressure_score += 1.0
 
-    # Ataques perigosos
     if total_dang >= 50:
         pressure_score += 3.0
     elif total_dang >= 30:
@@ -853,7 +822,6 @@ def _estimate_prob_and_odd(
     elif total_dang >= 18:
         pressure_score += 1.0
 
-    # Pequeno ajuste por gols já marcados
     if total_goals >= 3:
         pressure_score += 1.0
     elif total_goals == 2:
@@ -876,7 +844,6 @@ def _estimate_prob_and_odd(
     else:
         base_prob -= 0.02
 
-    # Ajustes de notícias + pré-jogo
     base_prob += news_boost_prob
     base_prob += pregame_boost_prob
 
@@ -884,7 +851,6 @@ def _estimate_prob_and_odd(
 
     odd_fair = 1.0 / p_final
 
-    # Odd atual: se vier da casa, usamos ela; senão, odd justa * pequeno overround
     if forced_odd_current is not None and forced_odd_current > 1.0:
         odd_current = forced_odd_current
     else:
@@ -904,11 +870,32 @@ def _estimate_prob_and_odd(
     }
 
 
+def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
+    """
+    Sugestão de stake em % da banca, aproximando tua lógica de tiers:
+
+    - EV >= 7%  → ~3.0% da banca
+    - 5%–7%     → ~2.5%
+    - 3%–5%     → ~2.0%
+    - 1.5%–3%   → ~1.2%
+    (rareando EV menor que isso, mas mantém algo simbólico)
+    """
+    if ev_pct >= 7.0:
+        return 3.0
+    if ev_pct >= 5.0:
+        return 2.5
+    if ev_pct >= 3.0:
+        return 2.0
+    if ev_pct >= 1.5:
+        return 1.2
+    return 0.8
+
+
 def _format_alert_text(
     fixture: Dict[str, Any],
     metrics: Dict[str, float],
 ) -> str:
-    """Formata texto do alerta no layout EvRadar."""
+    """Formata texto do alerta no layout EvRadar (agora com stake % e R$)."""
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
         away=fixture["away_team"],
@@ -916,7 +903,10 @@ def _format_alert_text(
     )
     minuto = fixture["minute"]
     placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
-    linha = "Over (soma + 0,5)"
+
+    total_goals = fixture["home_goals"] + fixture["away_goals"]
+    linha_gols = total_goals + 0.5
+    linha_str = "Over {v:.1f}".format(v=linha_gols).replace(".", ",")
 
     p_final = metrics["p_final"] * 100.0
     odd_fair = metrics["odd_fair"]
@@ -926,9 +916,11 @@ def _format_alert_text(
     news_boost_prob = metrics.get("news_boost_prob", 0.0) * 100.0
     pregame_boost_prob = metrics.get("pregame_boost_prob", 0.0) * 100.0
 
+    stake_pct = _suggest_stake_pct(ev_pct, odd_current)
+    stake_brl = BANKROLL_INITIAL * (stake_pct / 100.0)
+
     interpretacao_parts: List[str] = []
 
-    # Pressão ao vivo
     if pressure_score >= 7.5:
         interpretacao_parts.append("pressão ofensiva alta")
     elif pressure_score >= 5.0:
@@ -936,13 +928,11 @@ def _format_alert_text(
     else:
         interpretacao_parts.append("pressão apenas ok (cuidado)")
 
-    total_goals = fixture["home_goals"] + fixture["away_goals"]
     if total_goals >= 3:
         interpretacao_parts.append("jogo aberto em gols")
     elif total_goals == 0:
         interpretacao_parts.append("placar magro, mas estatísticas sugerem risco/valor")
 
-    # News
     if news_boost_prob > 0.0:
         if news_boost_prob >= 2.0:
             interpretacao_parts.append("noticiário reforça tendência de gol")
@@ -951,7 +941,6 @@ def _format_alert_text(
     elif news_boost_prob < 0.0:
         interpretacao_parts.append("noticiário pesa um pouco contra (cautela)")
 
-    # Pré-jogo
     if pregame_boost_prob > 0.0:
         if pregame_boost_prob >= 2.0:
             interpretacao_parts.append("força pré-jogo favorece gols")
@@ -960,7 +949,6 @@ def _format_alert_text(
     elif pregame_boost_prob < 0.0:
         interpretacao_parts.append("pré-jogo sugeria menos gols (cautela)")
 
-    # EV
     if ev_pct >= EV_MIN_PCT + 2.0:
         ev_flag = "EV+ forte"
     elif ev_pct >= EV_MIN_PCT:
@@ -971,7 +959,6 @@ def _format_alert_text(
     interpretacao_parts.append(ev_flag)
     interpretacao = " / ".join(interpretacao_parts)
 
-    # Linha de ajustes (news + pré-jogo)
     adjust_parts: List[str] = []
     if news_boost_prob != 0.0:
         adjust_parts.append("news {nb:+.1f} pp".format(nb=news_boost_prob))
@@ -985,16 +972,33 @@ def _format_alert_text(
     lines = [
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
-        "⚙️ Linha: {linha} @ {odd:.2f}".format(linha=linha, odd=odd_current),
+        "⚙️ Linha: {linha} @ {odd:.2f}".format(linha=linha_str, odd=odd_current),
         "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}{adj}".format(
             p=p_final,
             odd_j=odd_fair,
             adj=adjust_str,
         ),
         "💰 EV: {ev:.2f}%".format(ev=ev_pct),
+        "💵 Stake sugerida (banca virtual): {spct:.2f}% ≈ R$ {sbrl:.2f}".format(
+            spct=stake_pct,
+            sbrl=stake_brl,
+        ),
+        "",
+        "✅ Para registrar na banca virtual (manual):",
+        "   {spct:.2f}% (~R$ {sbrl:.2f}) em {linha} @ {odd:.2f}".format(
+            spct=stake_pct,
+            sbrl=stake_brl,
+            linha=linha_str,
+            odd=odd_current,
+        ),
         "",
         "🧩 Interpretação:",
         interpretacao,
+        "",
+        "🔗 Mercado: {book} → {url}".format(
+            book=BOOKMAKER_NAME,
+            url=BOOKMAKER_URL,
+        ),
     ]
     return "\n".join(lines)
 
@@ -1005,14 +1009,9 @@ def _format_alert_text(
 
 async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     """
-    Executa UM ciclo de varredura:
-    - Busca jogos ao vivo na API-FOOTBALL
-    - Aplica filtros de liga e janela
-    - Calcula métrica de pressão/probabilidade/EV
-    - Usa odd em tempo real (com backup) quando possível
-    - Aplica news boost (quando habilitado)
-    - Aplica pré-jogo boost (ratings manuais + automáticos)
-    - Retorna lista de textos de alerta prontos para enviar no Telegram
+    Executa UM ciclo de varredura.
+    Usa odd ao vivo ou, em caso de mercado suspenso, a última odd em cache
+    da linha correta. Se não houver nem live nem cache, ignora o jogo.
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -1047,22 +1046,38 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 total_goals = fx["home_goals"] + fx["away_goals"]
 
                 api_odd: Optional[float] = None
+                got_live_odd = False
+
                 try:
                     api_odd = await _fetch_live_odds_for_fixture(
                         client=client,
                         fixture_id=fx["fixture_id"],
                         total_goals=total_goals,
                     )
+                    if api_odd is not None:
+                        last_odd_cache[fx["fixture_id"]] = api_odd
+                        got_live_odd = True
+                    else:
+                        api_odd = last_odd_cache.get(fx["fixture_id"])
                 except Exception:
                     logging.exception(
                         "Erro inesperado ao buscar odds ao vivo para fixture=%s",
                         fx["fixture_id"],
                     )
-
-                if api_odd is not None:
-                    last_odd_cache[fx["fixture_id"]] = api_odd
-                else:
                     api_odd = last_odd_cache.get(fx["fixture_id"])
+
+                if api_odd is None:
+                    logging.info(
+                        "Fixture %s sem odd ao vivo nem cache (possível mercado suspenso). Ignorando jogo.",
+                        fx["fixture_id"],
+                    )
+                    continue
+
+                if not got_live_odd:
+                    logging.info(
+                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso).",
+                        fx["fixture_id"],
+                    )
 
                 news_boost_prob = 0.0
                 try:
@@ -1100,8 +1115,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     pregame_boost_prob=pregame_boost_prob,
                 )
 
-                # Filtro por faixa de odds REAL: se a odd atual estiver fora
-                # de [MIN_ODD, MAX_ODD], não enviamos alerta.
                 odd_cur = metrics["odd_current"]
                 if odd_cur < MIN_ODD or odd_cur > MAX_ODD:
                     continue
@@ -1166,6 +1179,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "Banca virtual para sugestão: R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
         "Autoscan: {auto} (intervalo {sec}s)".format(auto=autoscan_status, sec=CHECK_INTERVAL),
         "",
         "Comandos:",
@@ -1216,6 +1230,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "BANKROLL_INITIAL (banca virtual): R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
         "",
         "API_FOOTBALL_KEY definido: {v}".format(v="sim" if api_set else "não"),
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
