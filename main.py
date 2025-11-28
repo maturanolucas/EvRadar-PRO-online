@@ -46,7 +46,7 @@ def _get_env_int(name: str, default: int) -> int:
             return default
 
 
-def _get_env_float(name: str, default: float)) -> float:
+def _get_env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or raw == "":
         return default
@@ -383,6 +383,7 @@ async def _fetch_live_odds_for_fixture(
     odds_item = response[0]
     bookmakers = odds_item.get("bookmakers") or []
 
+    # Linha alvo: Over (total_goals + 0.5), ex: 0 gols -> Over 0.5, 1 gol -> Over 1.5...
     target_line_str = "{:.1f}".format(total_goals + 0.5)
 
     for b in bookmakers:
@@ -878,7 +879,7 @@ def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
     - 5%–7%     → ~2.5%
     - 3%–5%     → ~2.0%
     - 1.5%–3%   → ~1.2%
-    (rareando EV menor que isso, mas mantém algo simbólico)
+    - abaixo disso: 0.8% simbólico
     """
     if ev_pct >= 7.0:
         return 3.0
@@ -906,7 +907,8 @@ def _format_alert_text(
 
     total_goals = fixture["home_goals"] + fixture["away_goals"]
     linha_gols = total_goals + 0.5
-    linha_str = "Over {v:.1f}".format(v=linha_gols).replace(".", ",")
+    # AQUI: linha real 0.5, 1.5, 2.5, 3.5...
+    linha_str = "Over {v:.1f}".format(v=linha_gols)
 
     p_final = metrics["p_final"] * 100.0
     odd_fair = metrics["odd_fair"]
