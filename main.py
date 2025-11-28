@@ -98,6 +98,10 @@ EV_MIN_PCT: float = _get_env_float("EV_MIN_PCT", 4.0)
 MIN_ODD: float = _get_env_float("MIN_ODD", 1.47)
 MAX_ODD: float = _get_env_float("MAX_ODD", 3.50)
 
+# Cooldown e pressão mínima
+COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
+MIN_PRESSURE_SCORE: float = _get_env_float("MIN_PRESSURE_SCORE", 5.0)
+
 # Banca virtual para sugestão de stake
 BANKROLL_INITIAL: float = _get_env_float("BANKROLL_INITIAL", 5000.0)
 
@@ -166,6 +170,9 @@ last_news_boost_cache: Dict[int, float] = {}
 
 # Cache de pré-jogo auto por time (chave: "league:season:team_id")
 pregame_auto_cache: Dict[str, Dict[str, Any]] = {}
+
+# Cooldown por jogo (fixture_id -> datetime do último alerta)
+fixture_last_alert_at: Dict[int, datetime] = {}
 
 
 def _now_utc() -> datetime:
@@ -907,7 +914,7 @@ def _format_alert_text(
 
     total_goals = fixture["home_goals"] + fixture["away_goals"]
     linha_gols = total_goals + 0.5
-    # AQUI: linha real 0.5, 1.5, 2.5, 3.5...
+    # Linha real FT: 0.5, 1.5, 2.5, 3.5...
     linha_str = "Over {v:.1f}".format(v=linha_gols)
 
     p_final = metrics["p_final"] * 100.0
@@ -1121,8 +1128,25 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 if odd_cur < MIN_ODD or odd_cur > MAX_ODD:
                     continue
 
+                # Filtro de pressão mínima
+                if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
+                    continue
+
+                # Filtro de EV mínimo
                 if metrics["ev_pct"] < EV_MIN_PCT:
                     continue
+
+                # Cooldown por jogo
+                now = _now_utc()
+                fixture_id = fx["fixture_id"]
+                last_ts = fixture_last_alert_at.get(fixture_id)
+                if last_ts is not None:
+                    if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
+                        # Ainda em cooldown, pula
+                        continue
+
+                # Passou por todos os filtros → registra horário de alerta
+                fixture_last_alert_at[fixture_id] = now
 
                 alert_text = _format_alert_text(fx, metrics)
                 alerts.append(alert_text)
@@ -1182,6 +1206,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
         "Banca virtual para sugestão: R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
+        "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
+        "Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
         "Autoscan: {auto} (intervalo {sec}s)".format(auto=autoscan_status, sec=CHECK_INTERVAL),
         "",
         "Comandos:",
@@ -1232,6 +1258,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
+        "COOLDOWN_MINUTES: {cd} min".format(cd=COOLDOWN_MINUTES),
         "BANKROLL_INITIAL (banca virtual): R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
         "",
         "API_FOOTBALL_KEY definido: {v}".format(v="sim" if api_set else "não"),
