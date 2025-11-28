@@ -809,27 +809,31 @@ def _estimate_prob_and_odd(
 
     pressure_score = 0.0
 
-    if total_shots >= 20:
+    # CHUTES TOTAIS (mais sensível)
+    if total_shots >= 15:
         pressure_score += 3.0
-    elif total_shots >= 14:
+    elif total_shots >= 10:
         pressure_score += 2.0
-    elif total_shots >= 8:
+    elif total_shots >= 6:
         pressure_score += 1.0
 
-    if total_on >= 8:
+    # CHUTES NO ALVO (mais sensível)
+    if total_on >= 5:
         pressure_score += 3.0
-    elif total_on >= 5:
-        pressure_score += 2.0
     elif total_on >= 3:
-        pressure_score += 1.0
-
-    if total_dang >= 50:
-        pressure_score += 3.0
-    elif total_dang >= 30:
         pressure_score += 2.0
-    elif total_dang >= 18:
+    elif total_on >= 1:
         pressure_score += 1.0
 
+    # ATAQUES PERIGOSOS (mais sensível)
+    if total_dang >= 40:
+        pressure_score += 3.0
+    elif total_dang >= 25:
+        pressure_score += 2.0
+    elif total_dang >= 15:
+        pressure_score += 1.0
+
+    # GOLS NO JOGO
     if total_goals >= 3:
         pressure_score += 1.0
     elif total_goals == 2:
