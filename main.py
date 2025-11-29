@@ -360,6 +360,10 @@ async def _fetch_live_odds_for_fixture(
     """
     Busca odd em tempo real na API-FOOTBALL para a linha Over (soma + 0,5)
     usando o endpoint de odds LIVE. Se não achar nada, retorna None.
+
+    Ajustes importantes:
+    - Foca em mercados de GOLS (ignora corners, cartões, etc.).
+    - Procura especificamente a linha Over (total_goals + 0.5) FT.
     """
     if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
         return None
@@ -390,8 +394,10 @@ async def _fetch_live_odds_for_fixture(
     odds_item = response[0]
     bookmakers = odds_item.get("bookmakers") or []
 
-    # Linha alvo: Over (total_goals + 0.5), ex: 0 gols -> Over 0.5, 1 gol -> Over 1.5...
+    # Linha alvo: Over (total_goals + 0.5), ex: 0 gols -> Over 0.5, 1 gol -> Over 1.5, etc.
     target_line_str = "{:.1f}".format(total_goals + 0.5)
+
+    best_odd: Optional[float] = None
 
     for b in bookmakers:
         try:
@@ -399,21 +405,31 @@ async def _fetch_live_odds_for_fixture(
             if b_id_raw is not None and int(b_id_raw) != BOOKMAKER_ID:
                 continue
         except Exception:
+            # Se não conseguir converter id, segue mesmo assim
             pass
 
         bets = b.get("bets") or []
         for bet in bets:
             name = (bet.get("name") or "").lower()
-            if ("over" not in name) and ("under" not in name) and ("goal" not in name):
+
+            # Ignora mercados que não são de gols (corners, cartões, handicaps, etc.)
+            if any(ex in name for ex in ("corner", "corners", "card", "cards", "booking", "bookings", "yellow", "red", "handicap", "asian")):
+                continue
+
+            # Queremos mercados de gols / total goals / goals over-under
+            if "goal" not in name and "goals" not in name and "over/under" not in name and "total" not in name:
                 continue
 
             values = bet.get("values") or []
             for val in values:
-                vlabel = str(val.get("value") or "")
-                vlabel_low = vlabel.lower()
-                if "over" not in vlabel_low:
+                raw_val = str(val.get("value") or "")
+                # Combina valor com nome do mercado para ficar mais robusto
+                combo_text = (raw_val + " " + name).lower()
+
+                # Precisamos de "over" e da linha certa
+                if "over" not in combo_text:
                     continue
-                if target_line_str not in vlabel:
+                if target_line_str not in combo_text:
                     continue
 
                 odd_raw = val.get("odd")
@@ -427,9 +443,23 @@ async def _fetch_live_odds_for_fixture(
                 if odd_val <= 1.0:
                     continue
 
-                return odd_val
+                # Se houver mais de uma, pegamos a primeira ou a "melhor"
+                if best_odd is None:
+                    best_odd = odd_val
+                else:
+                    # Mantém a odd mais próxima do mercado (aqui podemos simplesmente pegar a maior)
+                    if odd_val > best_odd:
+                        best_odd = odd_val
 
-    return None
+    if best_odd is not None:
+        logging.info(
+            "Odd LIVE encontrada para fixture %s (linha Over %.1f): %.3f",
+            fixture_id,
+            total_goals + 0.5,
+            best_odd,
+        )
+
+    return best_odd
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +919,7 @@ def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
     - EV >= 7%  → ~3.0% da banca
     - 5%–7%     → ~2.5%
     - 3%–5%     → ~2.0%
-    - 1.5%–3%   → ~1.2%
+    - 1.5%–3%   → 1.2%
     - abaixo disso: 0.8% simbólico
     """
     if ev_pct >= 7.0:
