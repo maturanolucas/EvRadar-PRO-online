@@ -123,6 +123,8 @@ LEAGUE_IDS: List[int] = _parse_league_ids(LEAGUE_IDS_RAW)
 
 USE_API_FOOTBALL_ODDS: int = _get_env_int("USE_API_FOOTBALL_ODDS", 0)
 BOOKMAKER_ID: int = _get_env_int("BOOKMAKER_ID", 34)  # 34 = Superbet
+# Bet de Over/Under na API-FOOTBALL. Se 0, não filtra por bet.
+ODDS_BET_ID: int = _get_env_int("ODDS_BET_ID", 0)
 
 # NewsAPI (opcional)
 NEWS_API_KEY: str = _get_env_str("NEWS_API_KEY")
@@ -379,26 +381,26 @@ async def _fetch_live_odds_for_fixture(
     total_goals: int,
 ) -> Optional[float]:
     """
-    Busca odd em tempo real na API-FOOTBALL para a linha Over (soma + 0,5)
-    usando o endpoint de odds LIVE.
+    Busca odd em tempo real na API-FOOTBALL para a linha de gols do jogo.
 
-    Ajustes importantes:
-    - Usa mercado "Goals Over/Under" (bet=36) por padrão.
-    - Encontra a seleção com:
-        value = "Over"
-        handicap = str(total_goals + 0.5)  (ex: "2.5")
+    Lógica:
+    - Tenta achar a linha Over (soma do placar + 0,5) via 'handicap' ou número
+      dentro de 'value' (ex.: "Over 2.5").
+    - Se não encontrar exatamente essa linha, usa o PRIMEIRO mercado Over
+      elegível encontrado (primeira linha de gols em aberto), que na prática
+      tende a ser a linha soma+0,5, porque as casas removem mercados já liquidados.
     """
-
     if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
         return None
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
-    # 36 = Goals Over/Under (conforme docs / exemplo público)
-    params = {
+    params: Dict[str, Any] = {
         "fixture": fixture_id,
         "bookmaker": BOOKMAKER_ID,
-        "bet": 36,
     }
+    # Se ODDS_BET_ID > 0, filtra por bet específico (ex.: Over/Under)
+    if ODDS_BET_ID > 0:
+        params["bet"] = ODDS_BET_ID
 
     try:
         resp = await client.get(
@@ -415,102 +417,165 @@ async def _fetch_live_odds_for_fixture(
 
     response = data.get("response") or []
     if not response:
+        logging.info(
+            "Fixture %s: resposta de odds LIVE vazia (sem mercados).",
+            fixture_id,
+        )
         return None
 
     odds_item = response[0]
     bookmakers = odds_item.get("bookmakers") or []
     if not bookmakers:
+        logging.info(
+            "Fixture %s: odds LIVE sem lista de bookmakers.",
+            fixture_id,
+        )
         return None
 
-    target_line_str = "{:.1f}".format(total_goals + 0.5)
-    best_odd: Optional[float] = None
-
+    # Escolhe o bookmaker alvo (BOOKMAKER_ID) ou, se não achar, o primeiro.
+    selected_bm: Optional[Dict[str, Any]] = None
     for b in bookmakers:
-        # Filtra bookmaker, se vier mais de um
+        b_id_raw = b.get("id")
         try:
-            b_id_raw = b.get("id")
-            if b_id_raw is not None and int(b_id_raw) != BOOKMAKER_ID:
-                continue
+            if b_id_raw is not None and int(b_id_raw) == BOOKMAKER_ID:
+                selected_bm = b
+                break
         except Exception:
-            pass
+            continue
 
-        bets = b.get("bets") or []
-        for bet in bets:
-            name = (bet.get("name") or "").lower()
+    if selected_bm is None:
+        selected_bm = bookmakers[0]
 
-            # Ignora mercados que não são de gols (corners, cartões, handicaps, etc.)
-            if any(ex in name for ex in (
-                "corner", "corners", "card", "cards", "booking",
-                "yellow", "red", "handicap", "asian"
-            )):
-                continue
-
-            # Queremos apenas mercados de gols / over under
-            if "goal" not in name and "goals" not in name and "over/under" not in name and "total" not in name:
-                continue
-
-            # Evitar mercados de 1º/2º tempo se o nome deixar claro
-            if any(ex in name for ex in (
-                "1st half", "first half", "2nd half", "second half",
-                "1st period", "second period", "1st period", "2nd period"
-            )):
-                continue
-
-            values = bet.get("values") or []
-            for val in values:
-                value_label = str(val.get("value") or "").lower()
-                if "over" not in value_label:
-                    continue
-
-                # Normaliza a linha (handicap)
-                handicap_raw = val.get("handicap")
-                handicap_norm: Optional[str] = None
-
-                if handicap_raw is not None:
-                    try:
-                        handicap_norm = "{:.1f}".format(
-                            float(str(handicap_raw).replace(",", "."))
-                        )
-                    except Exception:
-                        handicap_norm = None
-
-                # Fallback: tentar extrair número do próprio value, se vier "Over 2.5"
-                if not handicap_norm:
-                    raw_val = str(val.get("value") or "").replace(",", ".")
-                    for token in raw_val.split():
-                        try:
-                            handicap_norm = "{:.1f}".format(float(token))
-                            break
-                        except Exception:
-                            continue
-
-                if handicap_norm != target_line_str:
-                    continue
-
-                odd_raw = val.get("odd")
-                if odd_raw is None:
-                    continue
-
-                try:
-                    odd_val = float(str(odd_raw).replace(",", "."))
-                except (TypeError, ValueError):
-                    continue
-
-                if odd_val <= 1.0:
-                    continue
-
-                if best_odd is None or odd_val > best_odd:
-                    best_odd = odd_val
-
-    if best_odd is not None:
+    bets = selected_bm.get("bets") or []
+    if not bets:
         logging.info(
-            "Odd LIVE encontrada para fixture %s (linha Over %.1f): %.3f",
+            "Fixture %s: bookmaker %s sem bets disponíveis em odds LIVE.",
             fixture_id,
-            total_goals + 0.5,
-            best_odd,
+            BOOKMAKER_ID,
         )
+        return None
 
-    return best_odd
+    target_line = float(total_goals) + 0.5
+    target_line_str = "{:.1f}".format(target_line)
+
+    exact_odd: Optional[float] = None
+    first_over_odd: Optional[float] = None
+    first_over_line: Optional[float] = None
+
+    negative_tokens = (
+        "corner",
+        "corners",
+        "card",
+        "cards",
+        "booking",
+        "yellow",
+        "red",
+        "handicap",
+        "asian",
+        "1st half",
+        "first half",
+        "2nd half",
+        "second half",
+        "1st period",
+        "second period",
+        "2nd period",
+    )
+
+    for bet in bets:
+        name = (bet.get("name") or "").lower()
+
+        # Ignora mercados que claramente não são de gols "full time"
+        if any(tok in name for tok in negative_tokens):
+            continue
+
+        # Queremos apenas mercados de gols / total goals / over under
+        if (
+            "goal" not in name
+            and "goals" not in name
+            and "over/under" not in name
+            and "total" not in name
+        ):
+            continue
+
+        values = bet.get("values") or []
+        for val in values:
+            side_raw = str(val.get("value") or "").strip()
+            side = side_raw.lower()
+            if "over" not in side:
+                continue
+
+            odd_raw = val.get("odd")
+            if odd_raw is None:
+                continue
+            try:
+                odd_val = float(str(odd_raw).replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+
+            if odd_val <= 1.0:
+                continue
+
+            # Tenta extrair a linha (handicap) como número
+            line_num: Optional[float] = None
+
+            handicap_raw = val.get("handicap")
+            if handicap_raw is not None:
+                try:
+                    line_num = float(str(handicap_raw).replace(",", "."))
+                except Exception:
+                    line_num = None
+
+            if line_num is None:
+                # Fallback: procurar número dentro de "Over 2.5"
+                for token in side_raw.replace(",", ".").split():
+                    try:
+                        line_num = float(token)
+                        break
+                    except Exception:
+                        continue
+
+            # Guarda o PRIMEIRO Over elegível como fallback
+            if first_over_odd is None:
+                first_over_odd = odd_val
+                first_over_line = line_num
+
+            # Se conseguir linha e bater com soma+0.5, usamos essa e encerramos
+            if line_num is not None:
+                line_str = "{:.1f}".format(line_num)
+                if line_str == target_line_str:
+                    exact_odd = odd_val
+                    logging.info(
+                        "Odd LIVE encontrada para fixture %s (linha Over %s = soma+0.5): %.3f",
+                        fixture_id,
+                        line_str,
+                        odd_val,
+                    )
+                    return exact_odd
+
+    if exact_odd is not None:
+        return exact_odd
+
+    if first_over_odd is not None:
+        if first_over_line is not None:
+            logging.info(
+                "Odd LIVE fallback (primeiro Over) para fixture %s (linha aprox %.1f): %.3f",
+                fixture_id,
+                first_over_line,
+                first_over_odd,
+            )
+        else:
+            logging.info(
+                "Odd LIVE fallback (primeiro Over) para fixture %s (linha sem handicap explícito): %.3f",
+                fixture_id,
+                first_over_odd,
+            )
+        return first_over_odd
+
+    logging.info(
+        "Fixture %s: odds LIVE presentes, mas nenhuma seleção Over elegível encontrada.",
+        fixture_id,
+    )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1791,6 +1856,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "API_FOOTBALL_KEY definido: {v}".format(v="sim" if api_set else "não"),
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
         "BOOKMAKER_ID: {bid}".format(bid=BOOKMAKER_ID),
+        "ODDS_BET_ID: {obid}".format(obid=ODDS_BET_ID),
         "LEAGUE_IDS: {ids}".format(
             ids=",".join(str(x) for x in LEAGUE_IDS) if LEAGUE_IDS else "não definido"
         ),
