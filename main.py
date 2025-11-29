@@ -14,6 +14,10 @@ Features:
 - Pré-jogo boost:
     - Manual (PREMATCH_TEAM_RATINGS)
     - Automático (API-FOOTBALL /teams/statistics, com cache diário)
+- Impacto de jogadores em campo:
+    - Stats por time/temporada (API-FOOTBALL /players)
+    - Lineups + substituições (fixtures/lineups + fixtures/events)
+    - Boost de probabilidade conforme “peso ofensivo” do XI atual
 - Cálculo de EV e alertas Telegram quando EV >= EV_MIN_PCT
 
 Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-jogo manual).
@@ -129,6 +133,14 @@ NEWS_TIME_WINDOW_HOURS: int = _get_env_int("NEWS_TIME_WINDOW_HOURS", 24)
 USE_API_PREGAME: int = _get_env_int("USE_API_PREGAME", 0)
 PREGAME_CACHE_HOURS: int = _get_env_int("PREGAME_CACHE_HOURS", 12)
 
+# Impacto de jogadores (camada nova)
+USE_PLAYER_IMPACT: int = _get_env_int("USE_PLAYER_IMPACT", 0)
+PLAYER_STATS_CACHE_HOURS: int = _get_env_int("PLAYER_STATS_CACHE_HOURS", 24)
+PLAYER_EVENTS_CACHE_MINUTES: int = _get_env_int("PLAYER_EVENTS_CACHE_MINUTES", 4)
+PLAYER_MAX_BOOST_PCT: float = _get_env_float("PLAYER_MAX_BOOST_PCT", 6.0)  # pp máx
+PLAYER_SUB_TRIGGER_WINDOW: int = _get_env_int("PLAYER_SUB_TRIGGER_WINDOW", 15)
+
+
 # ---------------------------------------------------------------------------
 # Ratings pré-jogo (manual por enquanto)
 # ---------------------------------------------------------------------------
@@ -173,6 +185,15 @@ pregame_auto_cache: Dict[str, Dict[str, Any]] = {}
 
 # Cooldown por jogo (fixture_id -> datetime do último alerta)
 fixture_last_alert_at: Dict[int, datetime] = {}
+
+# Caches da camada de jogadores
+# fixture_id -> lista de lineups (API /fixtures/lineups)
+fixture_lineups_cache: Dict[int, List[Dict[str, Any]]] = {}
+# fixture_id -> {"ts": datetime, "events": [...]}
+fixture_events_cache: Dict[int, Dict[str, Any]] = {}
+# chave "team_id:season" -> {player_id -> rating_ofensivo}
+team_player_ratings_cache: Dict[str, Dict[int, float]] = {}
+team_player_ratings_ts: Dict[str, datetime] = {}
 
 
 def _now_utc() -> datetime:
@@ -443,13 +464,8 @@ async def _fetch_live_odds_for_fixture(
                 if odd_val <= 1.0:
                     continue
 
-                # Se houver mais de uma, pegamos a primeira ou a "melhor"
-                if best_odd is None:
+                if best_odd is None or odd_val > best_odd:
                     best_odd = odd_val
-                else:
-                    # Mantém a odd mais próxima do mercado (aqui podemos simplesmente pegar a maior)
-                    if odd_val > best_odd:
-                        best_odd = odd_val
 
     if best_odd is not None:
         logging.info(
@@ -460,6 +476,438 @@ async def _fetch_live_odds_for_fixture(
         )
 
     return best_odd
+
+
+# ---------------------------------------------------------------------------
+# Camada de jogadores: lineups, eventos e ratings
+# ---------------------------------------------------------------------------
+
+async def _fetch_lineups_for_fixture(
+    client: httpx.AsyncClient,
+    fixture_id: int,
+) -> List[Dict[str, Any]]:
+    """Busca lineups do jogo (XI inicial + banco). Usa cache por fixture."""
+    if not API_FOOTBALL_KEY or not USE_PLAYER_IMPACT:
+        return []
+
+    cached = fixture_lineups_cache.get(fixture_id)
+    if cached is not None:
+        return cached
+
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    params = {"fixture": fixture_id}
+
+    try:
+        resp = await client.get(
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures/lineups",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception("Erro ao buscar lineups para fixture=%s", fixture_id)
+        fixture_lineups_cache[fixture_id] = []
+        return []
+
+    response = data.get("response") or []
+    fixture_lineups_cache[fixture_id] = response
+    return response
+
+
+async def _fetch_events_for_fixture(
+    client: httpx.AsyncClient,
+    fixture_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    Busca eventos do jogo (incluindo substituições), com cache de poucos minutos.
+    """
+    if not API_FOOTBALL_KEY or not USE_PLAYER_IMPACT:
+        return []
+
+    now = _now_utc()
+    cached = fixture_events_cache.get(fixture_id)
+    if cached is not None:
+        ts = cached.get("ts")
+        if isinstance(ts, datetime):
+            if (now - ts) <= timedelta(minutes=PLAYER_EVENTS_CACHE_MINUTES):
+                events_cached = cached.get("events") or []
+                return events_cached
+
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    params = {"fixture": fixture_id}
+
+    try:
+        resp = await client.get(
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures/events",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception("Erro ao buscar eventos para fixture=%s", fixture_id)
+        fixture_events_cache[fixture_id] = {"ts": now, "events": []}
+        return []
+
+    response = data.get("response") or []
+    fixture_events_cache[fixture_id] = {"ts": now, "events": response}
+    return response
+
+
+async def _ensure_team_player_ratings(
+    client: httpx.AsyncClient,
+    team_id: Optional[int],
+    season: Optional[int],
+) -> Dict[int, float]:
+    """
+    Garante um mapa {player_id -> rating_ofensivo} para (time, temporada)
+    usando /players da API-FOOTBALL, com cache em memória.
+
+    Rating aproximado:
+    - goals_per90 (peso maior)
+    - shots_on_target_per90
+    - total_shots_per90
+    """
+    if not API_FOOTBALL_KEY or not USE_PLAYER_IMPACT:
+        return {}
+
+    if team_id is None or season is None:
+        return {}
+
+    key = "{tm}:{ss}".format(tm=team_id, ss=season)
+    now = _now_utc()
+
+    cached = team_player_ratings_cache.get(key)
+    ts = team_player_ratings_ts.get(key)
+    if cached is not None and ts is not None:
+        if (now - ts) <= timedelta(hours=PLAYER_STATS_CACHE_HOURS):
+            return cached
+
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    ratings: Dict[int, float] = {}
+
+    page = 1
+    while True:
+        params = {
+            "team": team_id,
+            "season": season,
+            "page": page,
+        }
+        try:
+            resp = await client.get(
+                API_FOOTBALL_BASE_URL.rstrip("/") + "/players",
+                headers=headers,
+                params=params,
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logging.exception(
+                "Erro ao buscar stats de jogadores para team=%s season=%s (page=%s)",
+                team_id,
+                season,
+                page,
+            )
+            break
+
+        response = data.get("response") or []
+        if not response:
+            break
+
+        for item in response:
+            try:
+                player_info = item.get("player") or {}
+                player_id = player_info.get("id")
+                if player_id is None:
+                    continue
+                try:
+                    pid_int = int(player_id)
+                except Exception:
+                    continue
+
+                stats_list = item.get("statistics") or []
+                if not stats_list:
+                    continue
+                st = stats_list[0] or {}
+
+                games = st.get("games") or {}
+                minutes = games.get("minutes") or 0
+
+                goals_info = st.get("goals") or {}
+                goals_total = goals_info.get("total") or 0
+
+                shots_info = st.get("shots") or {}
+                shots_total = shots_info.get("total") or 0
+                shots_on = shots_info.get("on") or 0
+
+                try:
+                    minutes = int(minutes or 0)
+                except (TypeError, ValueError):
+                    minutes = 0
+
+                try:
+                    goals_total = int(goals_total or 0)
+                except (TypeError, ValueError):
+                    goals_total = 0
+
+                try:
+                    shots_total = int(shots_total or 0)
+                except (TypeError, ValueError):
+                    shots_total = 0
+
+                try:
+                    shots_on = int(shots_on or 0)
+                except (TypeError, ValueError):
+                    shots_on = 0
+
+                if minutes <= 0:
+                    # jogador quase não jogou, impacto ofensivo pequeno
+                    rating = 0.0
+                else:
+                    m = float(minutes)
+                    goals_per90 = (goals_total * 90.0) / m
+                    shots_total_per90 = (shots_total * 90.0) / m
+                    shots_on_per90 = (shots_on * 90.0) / m
+
+                    # Heurística de rating ofensivo:
+                    # - gols pesam mais, depois finalizações no alvo, depois chutes totais.
+                    rating = (
+                        goals_per90 * 1.8
+                        + shots_on_per90 * 0.9
+                        + shots_total_per90 * 0.3
+                    )
+
+                    if rating < 0.0:
+                        rating = 0.0
+                    if rating > 4.0:
+                        rating = 4.0
+
+                ratings[pid_int] = rating
+            except Exception:
+                logging.exception("Erro ao processar stats de jogador (team=%s)", team_id)
+                continue
+
+        paging = data.get("paging") or {}
+        total_pages = paging.get("total") or 1
+        try:
+            total_pages = int(total_pages or 1)
+        except Exception:
+            total_pages = 1
+
+        # Limitador simples de pages para não explodir requests
+        if page >= total_pages or page >= 2:
+            break
+        page += 1
+
+    team_player_ratings_cache[key] = ratings
+    team_player_ratings_ts[key] = now
+
+    return ratings
+
+
+async def _compute_player_boost_for_fixture(
+    client: httpx.AsyncClient,
+    fixture: Dict[str, Any],
+) -> float:
+    """
+    Calcula um boost de probabilidade baseado:
+    - na "força ofensiva" do XI em campo vs XI inicial
+    - na troca de jogadores recentes (substituições nos últimos N minutos)
+
+    Saída em delta de probabilidade (ex.: +0.03 = +3pp), clampado por
+    PLAYER_MAX_BOOST_PCT.
+    """
+    if not USE_PLAYER_IMPACT:
+        return 0.0
+
+    fixture_id = fixture.get("fixture_id")
+    if fixture_id is None:
+        return 0.0
+
+    minute = fixture.get("minute") or 0
+    try:
+        minute_int = int(minute)
+    except (TypeError, ValueError):
+        minute_int = 0
+
+    league_id = fixture.get("league_id")
+    season = fixture.get("season")
+    home_team_id = fixture.get("home_team_id")
+    away_team_id = fixture.get("away_team_id")
+
+    if home_team_id is None or away_team_id is None or season is None:
+        return 0.0
+
+    # Lineups (XI inicial)
+    lineups = await _fetch_lineups_for_fixture(client, fixture_id)
+    if not lineups:
+        return 0.0
+
+    start_on_field: Dict[int, set] = {}
+    on_field: Dict[int, set] = {}
+
+    for lu in lineups:
+        team_info = lu.get("team") or {}
+        t_id = team_info.get("id")
+        if t_id is None:
+            continue
+        try:
+            t_id_int = int(t_id)
+        except Exception:
+            continue
+
+        start_set = set()
+        start_list = lu.get("startXI") or []
+        for p in start_list:
+            pinfo = p.get("player") or {}
+            pid = pinfo.get("id")
+            if pid is None:
+                continue
+            try:
+                pid_int = int(pid)
+            except Exception:
+                continue
+            start_set.add(pid_int)
+
+        if start_set:
+            start_on_field[t_id_int] = set(start_set)
+            on_field[t_id_int] = set(start_set)
+
+    if home_team_id not in on_field or away_team_id not in on_field:
+        # se não conseguimos reconstruir os dois XIs, não aplicamos boost
+        return 0.0
+
+    # Eventos (substituições)
+    events = await _fetch_events_for_fixture(client, fixture_id)
+    recent_subs: List[tuple] = []
+
+    for ev in events:
+        ev_type = (ev.get("type") or "").lower()
+        if "subst" not in ev_type:
+            continue
+
+        team_info = ev.get("team") or {}
+        t_id = team_info.get("id")
+        if t_id is None:
+            continue
+        try:
+            t_id_int = int(t_id)
+        except Exception:
+            continue
+
+        if t_id_int not in on_field:
+            continue
+
+        time_info = ev.get("time") or {}
+        ev_min_raw = time_info.get("elapsed")
+        try:
+            ev_min = int(ev_min_raw) if ev_min_raw is not None else None
+        except (TypeError, ValueError):
+            ev_min = None
+
+        player_out_obj = ev.get("player") or {}
+        player_in_obj = ev.get("assist") or {}
+
+        pid_out_raw = player_out_obj.get("id")
+        pid_in_raw = player_in_obj.get("id")
+
+        pid_out_int: Optional[int] = None
+        pid_in_int: Optional[int] = None
+
+        if pid_out_raw is not None:
+            try:
+                pid_out_int = int(pid_out_raw)
+            except Exception:
+                pid_out_int = None
+
+        if pid_in_raw is not None:
+            try:
+                pid_in_int = int(pid_in_raw)
+            except Exception:
+                pid_in_int = None
+
+        if pid_out_int is not None and pid_out_int in on_field[t_id_int]:
+            on_field[t_id_int].discard(pid_out_int)
+        if pid_in_int is not None:
+            on_field[t_id_int].add(pid_in_int)
+
+        if ev_min is not None and minute_int:
+            diff = minute_int - ev_min
+            if diff >= 0 and diff <= PLAYER_SUB_TRIGGER_WINDOW:
+                if pid_out_int is not None and pid_in_int is not None:
+                    recent_subs.append((t_id_int, pid_out_int, pid_in_int))
+
+    # Ratings ofensivos por time/temporada
+    home_ratings = await _ensure_team_player_ratings(client, home_team_id, season)
+    away_ratings = await _ensure_team_player_ratings(client, away_team_id, season)
+
+    def _sum_ratings(ids_set: set, ratings_map: Dict[int, float]) -> float:
+        total = 0.0
+        for pid in ids_set:
+            r = ratings_map.get(pid)
+            if r is not None:
+                total += float(r)
+        return total
+
+    home_start_ids = start_on_field.get(home_team_id, set())
+    away_start_ids = start_on_field.get(away_team_id, set())
+    home_current_ids = on_field.get(home_team_id, set())
+    away_current_ids = on_field.get(away_team_id, set())
+
+    if not home_ratings and not away_ratings:
+        return 0.0
+
+    home_start_attack = _sum_ratings(home_start_ids, home_ratings)
+    away_start_attack = _sum_ratings(away_start_ids, away_ratings)
+    home_current_attack = _sum_ratings(home_current_ids, home_ratings)
+    away_current_attack = _sum_ratings(away_current_ids, away_ratings)
+
+    attack_start_total = home_start_attack + away_start_attack
+    attack_current_total = home_current_attack + away_current_attack
+
+    if attack_start_total <= 0.0:
+        # se não temos baseline, usa ataque atual mas com proteção
+        attack_start_total = attack_current_total if attack_current_total > 0 else 1.0
+
+    # Quanto o XI em campo está mais ofensivo que o XI inicial?
+    ratio = attack_current_total / attack_start_total
+    main_boost = (ratio - 1.0) * 0.04  # 4pp se o XI em campo estiver 100% mais ofensivo que o inicial
+
+    if main_boost > 0.04:
+        main_boost = 0.04
+    if main_boost < -0.03:
+        main_boost = -0.03
+
+    # Impacto específico de substituições recentes
+    delta_recent_total = 0.0
+    for t_id_int, pid_out_int, pid_in_int in recent_subs:
+        ratings_map = home_ratings if t_id_int == home_team_id else away_ratings
+        r_out = ratings_map.get(pid_out_int, 0.0)
+        r_in = ratings_map.get(pid_in_int, 0.0)
+        delta_recent_total += (r_in - r_out)
+
+    sub_boost = 0.0
+    if delta_recent_total != 0.0 and attack_start_total > 0:
+        # Se um sub troca um cara rating 1.0 por um rating 3.0 (delta 2.0) num contexto de ataque_total ~10,
+        # ganhamos algo na casa de 1–2pp de prob.
+        sub_boost = (delta_recent_total / attack_start_total) * 0.05
+        if sub_boost > 0.04:
+            sub_boost = 0.04
+        if sub_boost < -0.03:
+            sub_boost = -0.03
+
+    boost = main_boost + sub_boost
+    max_abs = PLAYER_MAX_BOOST_PCT / 100.0
+    if boost > max_abs:
+        boost = max_abs
+    if boost < -max_abs:
+        boost = -max_abs
+
+    return boost
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +1262,7 @@ def _estimate_prob_and_odd(
     forced_odd_current: Optional[float] = None,
     news_boost_prob: float = 0.0,
     pregame_boost_prob: float = 0.0,
+    player_boost_prob: float = 0.0,
 ) -> Dict[str, float]:
     """
     Estima probabilidade de +1 gol e uma odd "aproximada".
@@ -888,6 +1337,7 @@ def _estimate_prob_and_odd(
 
     base_prob += news_boost_prob
     base_prob += pregame_boost_prob
+    base_prob += player_boost_prob
 
     p_final = max(0.20, min(0.90, base_prob))
 
@@ -909,6 +1359,7 @@ def _estimate_prob_and_odd(
         "pressure_score": pressure_score,
         "news_boost_prob": news_boost_prob,
         "pregame_boost_prob": pregame_boost_prob,
+        "player_boost_prob": player_boost_prob,
     }
 
 
@@ -958,6 +1409,7 @@ def _format_alert_text(
     pressure_score = metrics["pressure_score"]
     news_boost_prob = metrics.get("news_boost_prob", 0.0) * 100.0
     pregame_boost_prob = metrics.get("pregame_boost_prob", 0.0) * 100.0
+    player_boost_prob = metrics.get("player_boost_prob", 0.0) * 100.0
 
     stake_pct = _suggest_stake_pct(ev_pct, odd_current)
     stake_brl = BANKROLL_INITIAL * (stake_pct / 100.0)
@@ -992,6 +1444,11 @@ def _format_alert_text(
     elif pregame_boost_prob < 0.0:
         interpretacao_parts.append("pré-jogo sugeria menos gols (cautela)")
 
+    if player_boost_prob > 0.5:
+        interpretacao_parts.append("elenco em campo puxa pró-gol (impacto jogadores)")
+    elif player_boost_prob < -0.5:
+        interpretacao_parts.append("elenco em campo tira um pouco da força ofensiva")
+
     if ev_pct >= EV_MIN_PCT + 2.0:
         ev_flag = "EV+ forte"
     elif ev_pct >= EV_MIN_PCT:
@@ -1007,6 +1464,8 @@ def _format_alert_text(
         adjust_parts.append("news {nb:+.1f} pp".format(nb=news_boost_prob))
     if pregame_boost_prob != 0.0:
         adjust_parts.append("pré {pg:+.1f} pp".format(pg=pregame_boost_prob))
+    if player_boost_prob != 0.0:
+        adjust_parts.append("jogadores {pl:+.1f} pp".format(pl=player_boost_prob))
 
     adjust_str = ""
     if adjust_parts:
@@ -1148,6 +1607,20 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     )
                     pregame_boost_prob = 0.0
 
+                player_boost_prob = 0.0
+                if USE_PLAYER_IMPACT:
+                    try:
+                        player_boost_prob = await _compute_player_boost_for_fixture(
+                            client=client,
+                            fixture=fx,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Erro inesperado ao calcular impacto de jogadores para fixture=%s",
+                            fx["fixture_id"],
+                        )
+                        player_boost_prob = 0.0
+
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
                     stats=stats,
@@ -1156,6 +1629,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     forced_odd_current=api_odd,
                     news_boost_prob=news_boost_prob,
                     pregame_boost_prob=pregame_boost_prob,
+                    player_boost_prob=player_boost_prob,
                 )
 
                 odd_cur = metrics["odd_current"]
@@ -1232,9 +1706,10 @@ async def autoscan_loop(application: Application) -> None:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autoscan_status = "ativado" if AUTOSTART else "desativado"
+    player_layer_status = "ligada" if USE_PLAYER_IMPACT else "desligada"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.3-lite: odds reais + news + pré-jogo auto).",
+        "👋 EvRadar PRO online (cérebro v0.3-lite: odds reais + news + pré-jogo auto + camada de jogadores).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
@@ -1242,6 +1717,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Banca virtual para sugestão: R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
         "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
+        "Camada de jogadores (impacto): {pl}".format(pl=player_layer_status),
         "Autoscan: {auto} (intervalo {sec}s)".format(auto=autoscan_status, sec=CHECK_INTERVAL),
         "",
         "Comandos:",
@@ -1255,7 +1731,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto)..."
+        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)..."
     )
 
     alerts = await run_scan_cycle(origin="manual", application=context.application)
@@ -1281,7 +1757,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     news_set = bool(NEWS_API_KEY)
 
     lines = [
-        "🛠 Debug EvRadar PRO (cérebro v0.3-lite, odds reais + news + pré-jogo auto)",
+        "🛠 Debug EvRadar PRO (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)",
         "",
         "TELEGRAM_BOT_TOKEN definido: {v}".format(v="sim" if token_set else "não"),
         "TELEGRAM_CHAT_ID: {cid}".format(
@@ -1312,6 +1788,12 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Ratings pré-jogo manuais: {n} times".format(
             n=len(PREMATCH_TEAM_RATINGS)
         ),
+        "",
+        "USE_PLAYER_IMPACT: {v}".format(v=USE_PLAYER_IMPACT),
+        "PLAYER_STATS_CACHE_HOURS: {h}".format(h=PLAYER_STATS_CACHE_HOURS),
+        "PLAYER_EVENTS_CACHE_MINUTES: {m}".format(m=PLAYER_EVENTS_CACHE_MINUTES),
+        "PLAYER_MAX_BOOST_PCT: {p:.1f}%".format(p=PLAYER_MAX_BOOST_PCT),
+        "PLAYER_SUB_TRIGGER_WINDOW: {w} min".format(w=PLAYER_SUB_TRIGGER_WINDOW),
         "",
         "Último scan:",
         "  origem: {origin}".format(origin=last_scan_origin),
@@ -1354,7 +1836,7 @@ def main() -> None:
     )
 
     logging.info(
-        "Iniciando bot do EvRadar PRO (cérebro v0.3-lite: odds reais + news + pré-jogo auto)..."
+        "Iniciando bot do EvRadar PRO (cérebro v0.3-lite: odds reais + news + pré-jogo auto + jogadores)..."
     )
 
     application = (
