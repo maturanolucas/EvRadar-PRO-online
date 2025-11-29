@@ -473,7 +473,6 @@ async def _fetch_live_odds_for_fixture(
 
         exact_odd: Optional[float] = None
         first_over_odd: Optional[float] = None
-        first_over_line: Optional[float] = None
 
         for bet in bets:
             name = (bet.get("name") or "").lower()
@@ -531,7 +530,6 @@ async def _fetch_live_odds_for_fixture(
                 # Guarda o PRIMEIRO Over elegível como fallback
                 if first_over_odd is None:
                     first_over_odd = odd_val
-                    first_over_line = line_num
 
                 # Se conseguir linha e bater com soma+0.5, usamos essa e encerramos
                 if line_num is not None:
@@ -1496,7 +1494,7 @@ def _format_alert_text(
     fixture: Dict[str, Any],
     metrics: Dict[str, float],
 ) -> str:
-    """Formata texto do alerta no layout EvRadar (agora com stake % e R$)."""
+    """Formata texto do alerta no layout EvRadar (alerta normal de entrada)."""
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
         away=fixture["away_team"],
@@ -1612,6 +1610,81 @@ def _format_alert_text(
     return "\n".join(lines)
 
 
+def _format_watch_text(
+    fixture: Dict[str, Any],
+    metrics: Dict[str, float],
+) -> str:
+    """
+    Alerta de OBSERVAÇÃO:
+    - cenário de gol está forte (pressão + EV),
+    - mas a odd ainda está abaixo da faixa mínima (ex.: < 1.47).
+    """
+    jogo = "{home} vs {away} — {league}".format(
+        home=fixture["home_team"],
+        away=fixture["away_team"],
+        league=fixture["league_name"],
+    )
+    minuto = fixture["minute"]
+    placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
+
+    total_goals = fixture["home_goals"] + fixture["away_goals"]
+    linha_gols = total_goals + 0.5
+    linha_str = "Over {v:.1f}".format(v=linha_gols)
+
+    p_final = metrics["p_final"] * 100.0
+    odd_fair = metrics["odd_fair"]
+    odd_current = metrics["odd_current"]
+    ev_pct = metrics["ev_pct"]
+    pressure_score = metrics["pressure_score"]
+
+    interpretacao_parts: List[str] = []
+
+    if pressure_score >= 7.5:
+        interpretacao_parts.append("pressão ofensiva alta (cenário quente para gol)")
+    elif pressure_score >= 5.0:
+        interpretacao_parts.append("pressão boa/decente para gol")
+    else:
+        interpretacao_parts.append("pressão ok, mas não absurda")
+
+    interpretacao_parts.append(
+        "odd ainda abaixo da tua faixa mínima (esperar melhorar preço)"
+    )
+
+    interpretacao_parts.append("EV calculado já positivo, mas mercado esmagado")
+    interpretacao = " / ".join(interpretacao_parts)
+
+    lines = [
+        "👀 Cenário de gol em observação",
+        "🏟️ {jogo}".format(jogo=jogo),
+        "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
+        "⚙️ Linha alvo: {linha}".format(linha=linha_str),
+        "📊 Probabilidade estimada: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
+            p=p_final,
+            odd_j=odd_fair,
+        ),
+        "⚠️ Odd atual: {odd:.2f} (abaixo da mínima configurada {mn:.2f})".format(
+            odd=odd_current,
+            mn=MIN_ODD,
+        ),
+        "💰 EV (na odd atual): {ev:.2f}%".format(ev=ev_pct),
+        "",
+        "🧩 Interpretação:",
+        interpretacao,
+        "",
+        "🎯 Plano: acompanhar este jogo e considerar entrada se o mercado",
+        "    bater ≥ {mn:.2f} na linha {linha} (ou se o contexto continuar forte).".format(
+            mn=MIN_ODD,
+            linha=linha_str,
+        ),
+        "",
+        "🔗 Referência de mercado: {book} → {url}".format(
+            book=BOOKMAKER_NAME,
+            url=BOOKMAKER_URL,
+        ),
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Função principal de scan (CÉREBRO)
 # ---------------------------------------------------------------------------
@@ -1620,7 +1693,11 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     """
     Executa UM ciclo de varredura.
     Usa odd ao vivo ou, em caso de mercado suspenso, a última odd em cache
-    da linha correta. Se não houver nem live nem cache, ignora o jogo.
+    da linha correta.
+
+    Tipos de alerta:
+    - ALERTA NORMAL: cenário bom + odd dentro da faixa [MIN_ODD, MAX_ODD]
+    - ALERTA OBSERVAÇÃO: cenário bom + odd POSITIVA mas abaixo de MIN_ODD
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -1740,15 +1817,20 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 )
 
                 odd_cur = metrics["odd_current"]
-                if odd_cur < MIN_ODD or odd_cur > MAX_ODD:
+
+                # Ignora odds muito altas (fora da filosofia do projeto)
+                if odd_cur > MAX_ODD:
                     continue
 
+                # Filtro de pressão mínima
                 if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
                     continue
 
+                # Filtro de EV mínimo
                 if metrics["ev_pct"] < EV_MIN_PCT:
                     continue
 
+                # Cooldown por jogo (tanto para alerta normal quanto observação)
                 now = _now_utc()
                 fixture_id = fx["fixture_id"]
                 last_ts = fixture_last_alert_at.get(fixture_id)
@@ -1756,10 +1838,15 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
                         continue
 
+                # Decide tipo de alerta
+                if odd_cur < MIN_ODD:
+                    alert_text = _format_watch_text(fx, metrics)
+                else:
+                    alert_text = _format_alert_text(fx, metrics)
+
+                alerts.append(alert_text)
                 fixture_last_alert_at[fixture_id] = now
 
-                alert_text = _format_alert_text(fx, metrics)
-                alerts.append(alert_text)
             except Exception:
                 logging.exception(
                     "Erro ao processar fixture_id=%s",
