@@ -123,6 +123,9 @@ LEAGUE_IDS: List[int] = _parse_league_ids(LEAGUE_IDS_RAW)
 
 USE_API_FOOTBALL_ODDS: int = _get_env_int("USE_API_FOOTBALL_ODDS", 0)
 BOOKMAKER_ID: int = _get_env_int("BOOKMAKER_ID", 34)  # 34 = Superbet
+# Lista de bookmakers fallback (por ex.: 6,8,9)
+BOOKMAKER_FALLBACK_IDS_RAW: str = _get_env_str("BOOKMAKER_FALLBACK_IDS", "")
+BOOKMAKER_FALLBACK_IDS: List[int] = _parse_league_ids(BOOKMAKER_FALLBACK_IDS_RAW)
 # Bet de Over/Under na API-FOOTBALL. Se 0, não filtra por bet.
 ODDS_BET_ID: int = _get_env_int("ODDS_BET_ID", 0)
 
@@ -157,12 +160,10 @@ PREMATCH_TEAM_RATINGS:
 - Se um time não estiver aqui, assume 0.0 (neutro).
 """
 PREMATCH_TEAM_RATINGS: Dict[str, float] = {
-    # Exemplo: ajuste conforme teu faro
+    # Ajuste conforme teu faro
     # "Santos": 1.5,
     # "Palmeiras": 1.8,
-    # "Flamengo": 1.7,
-    # "Atlético Mineiro": 1.4,
-    # "Cuiabá": -0.4,
+    # ...
 }
 
 
@@ -384,11 +385,14 @@ async def _fetch_live_odds_for_fixture(
     Busca odd em tempo real na API-FOOTBALL para a linha de gols do jogo.
 
     Lógica:
-    - Tenta achar a linha Over (soma do placar + 0,5) via 'handicap' ou número
-      dentro de 'value' (ex.: "Over 2.5").
-    - Se não encontrar exatamente essa linha, usa o PRIMEIRO mercado Over
-      elegível encontrado (primeira linha de gols em aberto), que na prática
-      tende a ser a linha soma+0,5, porque as casas removem mercados já liquidados.
+    - Faz UMA chamada para o fixture sem filtrar bookmaker, para trazer todos.
+    - Tenta na ordem:
+        1) BOOKMAKER_ID (se > 0)
+        2) BOOKMAKER_FALLBACK_IDS (na sequência)
+        3) Qualquer outro bookmaker com mercado Over elegível
+    - Dentro do bookmaker escolhido:
+        - Prioriza a linha Over (soma do placar + 0,5)
+        - Se não achar, usa o primeiro Over elegível (fallback)
     """
     if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
         return None
@@ -396,7 +400,6 @@ async def _fetch_live_odds_for_fixture(
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
     params: Dict[str, Any] = {
         "fixture": fixture_id,
-        "bookmaker": BOOKMAKER_ID,
     }
     # Se ODDS_BET_ID > 0, filtra por bet específico (ex.: Over/Under)
     if ODDS_BET_ID > 0:
@@ -418,7 +421,7 @@ async def _fetch_live_odds_for_fixture(
     response = data.get("response") or []
     if not response:
         logging.info(
-            "Fixture %s: resposta de odds LIVE vazia (sem mercados).",
+            "Fixture %s: resposta de odds LIVE vazia (sem mercados) para qualquer bookmaker.",
             fixture_id,
         )
         return None
@@ -432,35 +435,16 @@ async def _fetch_live_odds_for_fixture(
         )
         return None
 
-    # Escolhe o bookmaker alvo (BOOKMAKER_ID) ou, se não achar, o primeiro.
-    selected_bm: Optional[Dict[str, Any]] = None
-    for b in bookmakers:
-        b_id_raw = b.get("id")
-        try:
-            if b_id_raw is not None and int(b_id_raw) == BOOKMAKER_ID:
-                selected_bm = b
-                break
-        except Exception:
-            continue
-
-    if selected_bm is None:
-        selected_bm = bookmakers[0]
-
-    bets = selected_bm.get("bets") or []
-    if not bets:
-        logging.info(
-            "Fixture %s: bookmaker %s sem bets disponíveis em odds LIVE.",
-            fixture_id,
-            BOOKMAKER_ID,
-        )
-        return None
+    # Ordem de preferência de bookmakers
+    candidate_bookmaker_ids: List[int] = []
+    if BOOKMAKER_ID > 0:
+        candidate_bookmaker_ids.append(BOOKMAKER_ID)
+    for fb_id in BOOKMAKER_FALLBACK_IDS:
+        if fb_id > 0 and fb_id not in candidate_bookmaker_ids:
+            candidate_bookmaker_ids.append(fb_id)
 
     target_line = float(total_goals) + 0.5
     target_line_str = "{:.1f}".format(target_line)
-
-    exact_odd: Optional[float] = None
-    first_over_odd: Optional[float] = None
-    first_over_line: Optional[float] = None
 
     negative_tokens = (
         "corner",
@@ -481,98 +465,135 @@ async def _fetch_live_odds_for_fixture(
         "2nd period",
     )
 
-    for bet in bets:
-        name = (bet.get("name") or "").lower()
+    def _extract_from_bookmaker(bm: Dict[str, Any]) -> Optional[float]:
+        """Aplica a lógica de encontrar Over soma+0,5 ou primeiro Over naquele bookmaker."""
+        bets = bm.get("bets") or []
+        if not bets:
+            return None
 
-        # Ignora mercados que claramente não são de gols "full time"
-        if any(tok in name for tok in negative_tokens):
-            continue
+        exact_odd: Optional[float] = None
+        first_over_odd: Optional[float] = None
+        first_over_line: Optional[float] = None
 
-        # Queremos apenas mercados de gols / total goals / over under
-        if (
-            "goal" not in name
-            and "goals" not in name
-            and "over/under" not in name
-            and "total" not in name
-        ):
-            continue
+        for bet in bets:
+            name = (bet.get("name") or "").lower()
 
-        values = bet.get("values") or []
-        for val in values:
-            side_raw = str(val.get("value") or "").strip()
-            side = side_raw.lower()
-            if "over" not in side:
+            # Ignora mercados que claramente não são de gols "full time"
+            if any(tok in name for tok in negative_tokens):
                 continue
 
-            odd_raw = val.get("odd")
-            if odd_raw is None:
-                continue
-            try:
-                odd_val = float(str(odd_raw).replace(",", "."))
-            except (TypeError, ValueError):
-                continue
-
-            if odd_val <= 1.0:
+            # Queremos apenas mercados de gols / total goals / over under
+            if (
+                "goal" not in name
+                and "goals" not in name
+                and "over/under" not in name
+                and "total" not in name
+            ):
                 continue
 
-            # Tenta extrair a linha (handicap) como número
-            line_num: Optional[float] = None
+            values = bet.get("values") or []
+            for val in values:
+                side_raw = str(val.get("value") or "").strip()
+                side = side_raw.lower()
+                if "over" not in side:
+                    continue
 
-            handicap_raw = val.get("handicap")
-            if handicap_raw is not None:
+                odd_raw = val.get("odd")
+                if odd_raw is None:
+                    continue
                 try:
-                    line_num = float(str(handicap_raw).replace(",", "."))
-                except Exception:
-                    line_num = None
+                    odd_val = float(str(odd_raw).replace(",", "."))
+                except (TypeError, ValueError):
+                    continue
 
-            if line_num is None:
-                # Fallback: procurar número dentro de "Over 2.5"
-                for token in side_raw.replace(",", ".").split():
+                if odd_val <= 1.0:
+                    continue
+
+                # Tenta extrair a linha (handicap) como número
+                line_num: Optional[float] = None
+
+                handicap_raw = val.get("handicap")
+                if handicap_raw is not None:
                     try:
-                        line_num = float(token)
-                        break
+                        line_num = float(str(handicap_raw).replace(",", "."))
                     except Exception:
-                        continue
+                        line_num = None
 
-            # Guarda o PRIMEIRO Over elegível como fallback
-            if first_over_odd is None:
-                first_over_odd = odd_val
-                first_over_line = line_num
+                if line_num is None:
+                    # Fallback: procurar número dentro de "Over 2.5"
+                    for token in side_raw.replace(",", ".").split():
+                        try:
+                            line_num = float(token)
+                            break
+                        except Exception:
+                            continue
 
-            # Se conseguir linha e bater com soma+0.5, usamos essa e encerramos
-            if line_num is not None:
-                line_str = "{:.1f}".format(line_num)
-                if line_str == target_line_str:
-                    exact_odd = odd_val
-                    logging.info(
-                        "Odd LIVE encontrada para fixture %s (linha Over %s = soma+0.5): %.3f",
-                        fixture_id,
-                        line_str,
-                        odd_val,
-                    )
-                    return exact_odd
+                # Guarda o PRIMEIRO Over elegível como fallback
+                if first_over_odd is None:
+                    first_over_odd = odd_val
+                    first_over_line = line_num
 
-    if exact_odd is not None:
-        return exact_odd
+                # Se conseguir linha e bater com soma+0.5, usamos essa e encerramos
+                if line_num is not None:
+                    line_str = "{:.1f}".format(line_num)
+                    if line_str == target_line_str:
+                        exact_odd = odd_val
+                        return exact_odd
 
-    if first_over_odd is not None:
-        if first_over_line is not None:
+        if exact_odd is not None:
+            return exact_odd
+
+        if first_over_odd is not None:
+            return first_over_odd
+
+        return None
+
+    # 1) Tenta BOOKMAKER_ID e fallbacks na ordem
+    for bm_id in candidate_bookmaker_ids:
+        bm = None
+        for b in bookmakers:
+            b_id_raw = b.get("id")
+            try:
+                if b_id_raw is not None and int(b_id_raw) == bm_id:
+                    bm = b
+                    break
+            except Exception:
+                continue
+
+        if bm is None:
+            continue
+
+        odd_val = _extract_from_bookmaker(bm)
+        if odd_val is not None:
             logging.info(
-                "Odd LIVE fallback (primeiro Over) para fixture %s (linha aprox %.1f): %.3f",
+                "Odd LIVE encontrada para fixture %s usando bookmaker preferencial %s: %.3f (target Over %.1f)",
                 fixture_id,
-                first_over_line,
-                first_over_odd,
+                bm_id,
+                odd_val,
+                target_line,
             )
-        else:
+            return odd_val
+
+    # 2) Fallback: tenta qualquer bookmaker que tenha Over elegível
+    for b in bookmakers:
+        odd_val = _extract_from_bookmaker(b)
+        if odd_val is not None:
+            b_id_raw = b.get("id")
+            try:
+                b_id = int(b_id_raw) if b_id_raw is not None else None
+            except Exception:
+                b_id = None
             logging.info(
-                "Odd LIVE fallback (primeiro Over) para fixture %s (linha sem handicap explícito): %.3f",
+                "Odd LIVE fallback para fixture %s usando bookmaker %s: %.3f (target Over %.1f)",
                 fixture_id,
-                first_over_odd,
+                b_id,
+                odd_val,
+                target_line,
             )
-        return first_over_odd
+            return odd_val
 
     logging.info(
-        "Fixture %s: odds LIVE presentes, mas nenhuma seleção Over elegível encontrada.",
+        "Fixture %s: odds LIVE presentes, mas nenhuma seleção Over elegível encontrada em nenhum bookmaker.",
         fixture_id,
     )
     return None
@@ -1656,14 +1677,14 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 if api_odd is None:
                     logging.info(
-                        "Fixture %s sem odd ao vivo nem cache (possível mercado suspenso). Ignorando jogo.",
+                        "Fixture %s sem odd ao vivo nem cache (possível mercado suspenso ou sem mercado em nenhum bookmaker). Ignorando jogo.",
                         fx["fixture_id"],
                     )
                     continue
 
                 if not got_live_odd:
                     logging.info(
-                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso).",
+                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay).",
                         fx["fixture_id"],
                     )
 
@@ -1856,6 +1877,11 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "API_FOOTBALL_KEY definido: {v}".format(v="sim" if api_set else "não"),
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
         "BOOKMAKER_ID: {bid}".format(bid=BOOKMAKER_ID),
+        "BOOKMAKER_FALLBACK_IDS: {fb}".format(
+            fb=",".join(str(x) for x in BOOKMAKER_FALLBACK_IDS)
+            if BOOKMAKER_FALLBACK_IDS
+            else "nenhum"
+        ),
         "ODDS_BET_ID: {obid}".format(obid=ODDS_BET_ID),
         "LEAGUE_IDS: {ids}".format(
             ids=",".join(str(x) for x in LEAGUE_IDS) if LEAGUE_IDS else "não definido"
