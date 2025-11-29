@@ -380,19 +380,24 @@ async def _fetch_live_odds_for_fixture(
 ) -> Optional[float]:
     """
     Busca odd em tempo real na API-FOOTBALL para a linha Over (soma + 0,5)
-    usando o endpoint de odds LIVE. Se não achar nada, retorna None.
+    usando o endpoint de odds LIVE.
 
     Ajustes importantes:
-    - Foca em mercados de GOLS (ignora corners, cartões, etc.).
-    - Procura especificamente a linha Over (total_goals + 0.5) FT.
+    - Usa mercado "Goals Over/Under" (bet=36) por padrão.
+    - Encontra a seleção com:
+        value = "Over"
+        handicap = str(total_goals + 0.5)  (ex: "2.5")
     """
+
     if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
         return None
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    # 36 = Goals Over/Under (conforme docs / exemplo público)
     params = {
         "fixture": fixture_id,
         "bookmaker": BOOKMAKER_ID,
+        "bet": 36,
     }
 
     try:
@@ -414,19 +419,19 @@ async def _fetch_live_odds_for_fixture(
 
     odds_item = response[0]
     bookmakers = odds_item.get("bookmakers") or []
+    if not bookmakers:
+        return None
 
-    # Linha alvo: Over (total_goals + 0.5), ex: 0 gols -> Over 0.5, 1 gol -> Over 1.5, etc.
     target_line_str = "{:.1f}".format(total_goals + 0.5)
-
     best_odd: Optional[float] = None
 
     for b in bookmakers:
+        # Filtra bookmaker, se vier mais de um
         try:
             b_id_raw = b.get("id")
             if b_id_raw is not None and int(b_id_raw) != BOOKMAKER_ID:
                 continue
         except Exception:
-            # Se não conseguir converter id, segue mesmo assim
             pass
 
         bets = b.get("bets") or []
@@ -434,28 +439,58 @@ async def _fetch_live_odds_for_fixture(
             name = (bet.get("name") or "").lower()
 
             # Ignora mercados que não são de gols (corners, cartões, handicaps, etc.)
-            if any(ex in name for ex in ("corner", "corners", "card", "cards", "booking", "bookings", "yellow", "red", "handicap", "asian")):
+            if any(ex in name for ex in (
+                "corner", "corners", "card", "cards", "booking",
+                "yellow", "red", "handicap", "asian"
+            )):
                 continue
 
-            # Queremos mercados de gols / total goals / goals over-under
+            # Queremos apenas mercados de gols / over under
             if "goal" not in name and "goals" not in name and "over/under" not in name and "total" not in name:
+                continue
+
+            # Evitar mercados de 1º/2º tempo se o nome deixar claro
+            if any(ex in name for ex in (
+                "1st half", "first half", "2nd half", "second half",
+                "1st period", "second period", "1st period", "2nd period"
+            )):
                 continue
 
             values = bet.get("values") or []
             for val in values:
-                raw_val = str(val.get("value") or "")
-                # Combina valor com nome do mercado para ficar mais robusto
-                combo_text = (raw_val + " " + name).lower()
-
-                # Precisamos de "over" e da linha certa
-                if "over" not in combo_text:
+                value_label = str(val.get("value") or "").lower()
+                if "over" not in value_label:
                     continue
-                if target_line_str not in combo_text:
+
+                # Normaliza a linha (handicap)
+                handicap_raw = val.get("handicap")
+                handicap_norm: Optional[str] = None
+
+                if handicap_raw is not None:
+                    try:
+                        handicap_norm = "{:.1f}".format(
+                            float(str(handicap_raw).replace(",", "."))
+                        )
+                    except Exception:
+                        handicap_norm = None
+
+                # Fallback: tentar extrair número do próprio value, se vier "Over 2.5"
+                if not handicap_norm:
+                    raw_val = str(val.get("value") or "").replace(",", ".")
+                    for token in raw_val.split():
+                        try:
+                            handicap_norm = "{:.1f}".format(float(token))
+                            break
+                        except Exception:
+                            continue
+
+                if handicap_norm != target_line_str:
                     continue
 
                 odd_raw = val.get("odd")
                 if odd_raw is None:
                     continue
+
                 try:
                     odd_val = float(str(odd_raw).replace(",", "."))
                 except (TypeError, ValueError):
@@ -665,7 +700,6 @@ async def _ensure_team_player_ratings(
                     shots_on = 0
 
                 if minutes <= 0:
-                    # jogador quase não jogou, impacto ofensivo pequeno
                     rating = 0.0
                 else:
                     m = float(minutes)
@@ -673,8 +707,6 @@ async def _ensure_team_player_ratings(
                     shots_total_per90 = (shots_total * 90.0) / m
                     shots_on_per90 = (shots_on * 90.0) / m
 
-                    # Heurística de rating ofensivo:
-                    # - gols pesam mais, depois finalizações no alvo, depois chutes totais.
                     rating = (
                         goals_per90 * 1.8
                         + shots_on_per90 * 0.9
@@ -698,7 +730,6 @@ async def _ensure_team_player_ratings(
         except Exception:
             total_pages = 1
 
-        # Limitador simples de pages para não explodir requests
         if page >= total_pages or page >= 2:
             break
         page += 1
@@ -742,7 +773,6 @@ async def _compute_player_boost_for_fixture(
     if home_team_id is None or away_team_id is None or season is None:
         return 0.0
 
-    # Lineups (XI inicial)
     lineups = await _fetch_lineups_for_fixture(client, fixture_id)
     if not lineups:
         return 0.0
@@ -778,10 +808,8 @@ async def _compute_player_boost_for_fixture(
             on_field[t_id_int] = set(start_set)
 
     if home_team_id not in on_field or away_team_id not in on_field:
-        # se não conseguimos reconstruir os dois XIs, não aplicamos boost
         return 0.0
 
-    # Eventos (substituições)
     events = await _fetch_events_for_fixture(client, fixture_id)
     recent_subs: List[tuple] = []
 
@@ -841,7 +869,6 @@ async def _compute_player_boost_for_fixture(
                 if pid_out_int is not None and pid_in_int is not None:
                     recent_subs.append((t_id_int, pid_out_int, pid_in_int))
 
-    # Ratings ofensivos por time/temporada
     home_ratings = await _ensure_team_player_ratings(client, home_team_id, season)
     away_ratings = await _ensure_team_player_ratings(client, away_team_id, season)
 
@@ -870,19 +897,16 @@ async def _compute_player_boost_for_fixture(
     attack_current_total = home_current_attack + away_current_attack
 
     if attack_start_total <= 0.0:
-        # se não temos baseline, usa ataque atual mas com proteção
         attack_start_total = attack_current_total if attack_current_total > 0 else 1.0
 
-    # Quanto o XI em campo está mais ofensivo que o XI inicial?
     ratio = attack_current_total / attack_start_total
-    main_boost = (ratio - 1.0) * 0.04  # 4pp se o XI em campo estiver 100% mais ofensivo que o inicial
+    main_boost = (ratio - 1.0) * 0.04
 
     if main_boost > 0.04:
         main_boost = 0.04
     if main_boost < -0.03:
         main_boost = -0.03
 
-    # Impacto específico de substituições recentes
     delta_recent_total = 0.0
     for t_id_int, pid_out_int, pid_in_int in recent_subs:
         ratings_map = home_ratings if t_id_int == home_team_id else away_ratings
@@ -892,8 +916,6 @@ async def _compute_player_boost_for_fixture(
 
     sub_boost = 0.0
     if delta_recent_total != 0.0 and attack_start_total > 0:
-        # Se um sub troca um cara rating 1.0 por um rating 3.0 (delta 2.0) num contexto de ataque_total ~10,
-        # ganhamos algo na casa de 1–2pp de prob.
         sub_boost = (delta_recent_total / attack_start_total) * 0.05
         if sub_boost > 0.04:
             sub_boost = 0.04
@@ -1288,7 +1310,7 @@ def _estimate_prob_and_odd(
 
     pressure_score = 0.0
 
-    # CHUTES TOTAIS (mais sensível)
+    # CHUTES TOTAIS
     if total_shots >= 15:
         pressure_score += 3.0
     elif total_shots >= 10:
@@ -1296,7 +1318,7 @@ def _estimate_prob_and_odd(
     elif total_shots >= 6:
         pressure_score += 1.0
 
-    # CHUTES NO ALVO (mais sensível)
+    # CHUTES NO ALVO
     if total_on >= 5:
         pressure_score += 3.0
     elif total_on >= 3:
@@ -1304,7 +1326,7 @@ def _estimate_prob_and_odd(
     elif total_on >= 1:
         pressure_score += 1.0
 
-    # ATAQUES PERIGOSOS (mais sensível)
+    # ATAQUES PERIGOSOS
     if total_dang >= 40:
         pressure_score += 3.0
     elif total_dang >= 25:
@@ -1399,7 +1421,6 @@ def _format_alert_text(
 
     total_goals = fixture["home_goals"] + fixture["away_goals"]
     linha_gols = total_goals + 0.5
-    # Linha real FT: 0.5, 1.5, 2.5, 3.5...
     linha_str = "Over {v:.1f}".format(v=linha_gols)
 
     p_final = metrics["p_final"] * 100.0
@@ -1636,24 +1657,19 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 if odd_cur < MIN_ODD or odd_cur > MAX_ODD:
                     continue
 
-                # Filtro de pressão mínima
                 if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
                     continue
 
-                # Filtro de EV mínimo
                 if metrics["ev_pct"] < EV_MIN_PCT:
                     continue
 
-                # Cooldown por jogo
                 now = _now_utc()
                 fixture_id = fx["fixture_id"]
                 last_ts = fixture_last_alert_at.get(fixture_id)
                 if last_ts is not None:
                     if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
-                        # Ainda em cooldown, pula
                         continue
 
-                # Passou por todos os filtros → registra horário de alerta
                 fixture_last_alert_at[fixture_id] = now
 
                 alert_text = _format_alert_text(fx, metrics)
