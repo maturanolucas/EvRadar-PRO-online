@@ -102,6 +102,10 @@ EV_MIN_PCT: float = _get_env_float("EV_MIN_PCT", 4.0)
 MIN_ODD: float = _get_env_float("MIN_ODD", 1.47)
 MAX_ODD: float = _get_env_float("MAX_ODD", 3.50)
 
+# Quando a API não trouxer odd nem cache, usar odd "fake" para avaliar padrão?
+USE_FAKE_ODD_WHEN_MISSING: int = _get_env_int("USE_FAKE_ODD_WHEN_MISSING", 1)
+FAKE_ODD_BASE: float = _get_env_float("FAKE_ODD_BASE", MIN_ODD)
+
 # Cooldown e pressão mínima
 COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
 MIN_PRESSURE_SCORE: float = _get_env_float("MIN_PRESSURE_SCORE", 5.0)
@@ -1674,6 +1678,69 @@ def _format_watch_text(
     return "\n".join(lines)
 
 
+def _format_pattern_only_text(
+    fixture: Dict[str, Any],
+    metrics: Dict[str, float],
+) -> str:
+    """
+    Alerta de PADRÃO FORTE quando a API não trouxe odd nem cache:
+    - usa FAKE_ODD_BASE (ex.: 1.47) só para avaliar EV,
+    - você confere a odd real manualmente na casa.
+    """
+    jogo = "{home} vs {away} — {league}".format(
+        home=fixture["home_team"],
+        away=fixture["away_team"],
+        league=fixture["league_name"],
+    )
+    minuto = fixture["minute"]
+    placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
+
+    total_goals = fixture["home_goals"] + fixture["away_goals"]
+    linha_gols = total_goals + 0.5
+    linha_str = "Over {v:.1f}".format(v=linha_gols)
+
+    p_final = metrics["p_final"] * 100.0
+    odd_fair = metrics["odd_fair"]
+    odd_ref = metrics["odd_current"]
+    ev_pct = metrics["ev_pct"]
+    pressure_score = metrics["pressure_score"]
+
+    lines: List[str] = [
+        "👀 Padrão forte (sem odd na API)",
+        "🏟️ {jogo}".format(jogo=jogo),
+        "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
+        "⚙️ Linha alvo: {linha}".format(linha=linha_str),
+        "📊 Probabilidade estimada: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
+            p=p_final,
+            odd_j=odd_fair,
+        ),
+        "ℹ️ EV estimado usando odd de referência {od:.2f}: {ev:.2f}%".format(
+            od=odd_ref,
+            ev=ev_pct,
+        ),
+        "",
+        "🧩 Interpretação:",
+        "- Pressão {ps:.1f} indica cenário compatível com teu padrão de gol.".format(
+            ps=pressure_score
+        ),
+        "- A API-FOOTBALL não retornou odd ao vivo nesta linha.",
+        "- Usa este alerta como radar de padrão; confere a odd real na casa antes de entrar.",
+        "",
+        "🎯 Plano sugerido:",
+        "   Se o mercado estiver pagando ≥ {mn:.2f} na linha {linha}".format(
+            mn=MIN_ODD,
+            linha=linha_str,
+        ),
+        "   e o contexto seguir forte, faz sentido considerar entrada.",
+        "",
+        "🔗 Referência de mercado: {book} → {url}".format(
+            book=BOOKMAKER_NAME,
+            url=BOOKMAKER_URL,
+        ),
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Função principal de scan (CÉREBRO)
 # ---------------------------------------------------------------------------
@@ -1687,6 +1754,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     Tipos de alerta:
     - ALERTA NORMAL: cenário bom + odd dentro da faixa [MIN_ODD, MAX_ODD]
     - ALERTA OBSERVAÇÃO: cenário bom + odd POSITIVA mas abaixo de MIN_ODD
+    - ALERTA PADRÃO FORTE (sem odd): cenário bom + EV na odd de referência,
+      mas sem odd na API (você confere na casa).
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -1722,6 +1791,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 api_odd: Optional[float] = None
                 got_live_odd = False
+                used_cache_odd = False
+                used_fake_odd = False
 
                 try:
                     api_odd = await _fetch_live_odds_for_fixture(
@@ -1733,22 +1804,37 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         last_odd_cache[fx["fixture_id"]] = api_odd
                         got_live_odd = True
                     else:
-                        api_odd = last_odd_cache.get(fx["fixture_id"])
+                        cached_odd = last_odd_cache.get(fx["fixture_id"])
+                        if cached_odd is not None:
+                            api_odd = cached_odd
+                            used_cache_odd = True
                 except Exception:
                     logging.exception(
                         "Erro inesperado ao buscar odds ao vivo para fixture=%s",
                         fx["fixture_id"],
                     )
-                    api_odd = last_odd_cache.get(fx["fixture_id"])
+                    cached_odd = last_odd_cache.get(fx["fixture_id"])
+                    if cached_odd is not None:
+                        api_odd = cached_odd
+                        used_cache_odd = True
 
                 if api_odd is None:
-                    logging.info(
-                        "Fixture %s sem odd ao vivo nem cache (possível mercado suspenso ou sem Over soma+0,5 na API). Ignorando jogo.",
-                        fx["fixture_id"],
-                    )
-                    continue
+                    if USE_FAKE_ODD_WHEN_MISSING:
+                        api_odd = FAKE_ODD_BASE
+                        used_fake_odd = True
+                        logging.info(
+                            "Fixture %s sem odd ao vivo e sem cache; usando odd de referência %.2f para avaliar padrão.",
+                            fx["fixture_id"],
+                            api_odd,
+                        )
+                    else:
+                        logging.info(
+                            "Fixture %s sem odd ao vivo nem cache (possível mercado suspenso ou sem Over soma+0,5 na API). Ignorando jogo.",
+                            fx["fixture_id"],
+                        )
+                        continue
 
-                if not got_live_odd:
+                if used_cache_odd and not got_live_odd:
                     logging.info(
                         "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay).",
                         fx["fixture_id"],
@@ -1807,9 +1893,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 odd_cur = metrics["odd_current"]
 
-                if odd_cur > MAX_ODD:
-                    continue
-
+                # Primeiro: filtros de pressão e EV (independente de odd real ou fake)
                 if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
                     continue
 
@@ -1823,10 +1907,18 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
                         continue
 
-                if odd_cur < MIN_ODD:
-                    alert_text = _format_watch_text(fx, metrics)
+                # Se estamos usando odd fake (sem live e sem cache) → alerta de padrão
+                if used_fake_odd:
+                    alert_text = _format_pattern_only_text(fx, metrics)
                 else:
-                    alert_text = _format_alert_text(fx, metrics)
+                    # Aqui odd vem da API (ao vivo) ou de cache real → aplica faixa de odds
+                    if odd_cur > MAX_ODD:
+                        continue
+
+                    if odd_cur < MIN_ODD:
+                        alert_text = _format_watch_text(fx, metrics)
+                    else:
+                        alert_text = _format_alert_text(fx, metrics)
 
                 alerts.append(alert_text)
                 fixture_last_alert_at[fixture_id] = now
@@ -1941,6 +2033,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "USE_FAKE_ODD_WHEN_MISSING: {v}".format(v=USE_FAKE_ODD_WHEN_MISSING),
+        "FAKE_ODD_BASE: {od:.2f}".format(od=FAKE_ODD_BASE),
         "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "COOLDOWN_MINUTES: {cd} min".format(cd=COOLDOWN_MINUTES),
         "BANKROLL_INITIAL (banca virtual): R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
