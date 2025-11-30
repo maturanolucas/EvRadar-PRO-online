@@ -534,6 +534,10 @@ async def _fetch_live_odds_for_fixture(
         """
         Tenta encontrar APENAS a odd da linha Over (total_goals + 0.5) neste bookmaker.
         Se não achar, retorna None (sem fallback de Over aleatório).
+
+        IMPORTANTE: agora a linha é lida primeiro do texto ("Over 1.5", "Over 2.5"),
+        e só depois cai para o campo handicap. Isso reduz o risco de pegar a odd
+        da 2.5 com handicap errado.
         """
         bets = bm.get("bets") or []
         if not bets:
@@ -544,9 +548,9 @@ async def _fetch_live_odds_for_fixture(
         for bet in bets:
             name = (bet.get("name") or "").lower()
 
+            # Ignora mercados que não são de gols totais
             if any(tok in name for tok in negative_tokens):
                 continue
-
             if (
                 "goal" not in name
                 and "goals" not in name
@@ -573,22 +577,25 @@ async def _fetch_live_odds_for_fixture(
                 if odd_val <= 1.0:
                     continue
 
+                # --- NOVO: tentar pegar o número primeiro do texto "Over X.Y" ---
                 line_num: Optional[float] = None
 
-                handicap_raw = val.get("handicap")
-                if handicap_raw is not None:
+                # 1) número no próprio texto ("Over 1.5", "Over 2,5" etc.)
+                for token in side_raw.replace(",", ".").split():
                     try:
-                        line_num = float(str(handicap_raw).replace(",", "."))
+                        line_num = float(token)
+                        break
                     except Exception:
-                        line_num = None
+                        continue
 
+                # 2) fallback: usar handicap se ainda não achou nada
                 if line_num is None:
-                    for token in side_raw.replace(",", ".").split():
+                    handicap_raw = val.get("handicap")
+                    if handicap_raw is not None:
                         try:
-                            line_num = float(token)
-                            break
+                            line_num = float(str(handicap_raw).replace(",", "."))
                         except Exception:
-                            continue
+                            line_num = None
 
                 if line_num is None:
                     continue
@@ -597,12 +604,14 @@ async def _fetch_live_odds_for_fixture(
                 if line_str not in available_lines:
                     available_lines.append(line_str)
 
+                # Só aceitamos se for EXATAMENTE a linha alvo (soma do placar + 0,5)
                 if line_str == target_line_str:
                     logging.info(
-                        "Fixture %s: bookmaker %s → Over %s @ %.3f encontrado (API-FOOTBALL).",
+                        "Fixture %s: bookmaker %s → Over %s (target %s) @ %.3f (API-FOOTBALL).",
                         fixture_id,
                         bm_id_label,
                         line_str,
+                        target_line_str,
                         odd_val,
                     )
                     return odd_val
