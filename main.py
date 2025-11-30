@@ -10,6 +10,7 @@ Features:
 - Score de pressão / chances ao vivo
 - Probabilidade de +1 gol no 2º tempo
 - Odds em tempo real (API-FOOTBALL) com backup em cache
+- Integração opcional com The Odds API para odds ao vivo
 - News boost (NewsAPI, opcional)
 - Pré-jogo boost:
     - Manual (PREMATCH_TEAM_RATINGS)
@@ -77,6 +78,28 @@ def _parse_league_ids(raw: str) -> List[int]:
         except ValueError:
             continue
     return ids
+
+
+def _parse_odds_api_league_map(raw: str) -> Dict[int, str]:
+    """
+    Converte string "39:soccer_epl;140:soccer_spain_la_liga" em
+    {39: "soccer_epl", 140: "soccer_spain_la_liga"}.
+    """
+    mapping: Dict[int, str] = {}
+    if not raw:
+        return mapping
+    parts = raw.split(";")
+    for part in parts:
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        lid_str, sport_key = part.split(":", 1)
+        try:
+            lid = int(lid_str.strip())
+        except ValueError:
+            continue
+        mapping[lid] = sport_key.strip()
+    return mapping
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +172,27 @@ PLAYER_EVENTS_CACHE_MINUTES: int = _get_env_int("PLAYER_EVENTS_CACHE_MINUTES", 4
 PLAYER_MAX_BOOST_PCT: float = _get_env_float("PLAYER_MAX_BOOST_PCT", 6.0)  # pp máx
 PLAYER_SUB_TRIGGER_WINDOW: int = _get_env_int("PLAYER_SUB_TRIGGER_WINDOW", 15)
 
+# The Odds API (integração de odds ao vivo)
+ODDS_API_KEY: str = _get_env_str("ODDS_API_KEY")
+ODDS_API_USE: int = _get_env_int("ODDS_API_USE", 1)
+ODDS_API_BASE_URL: str = _get_env_str(
+    "ODDS_API_BASE_URL",
+    "https://api.the-odds-api.com/v4",
+)
+ODDS_API_REGIONS: str = _get_env_str("ODDS_API_REGIONS", "eu")
+ODDS_API_MARKETS: str = _get_env_str("ODDS_API_MARKETS", "totals")
+ODDS_API_DEFAULT_SPORT_KEY: str = _get_env_str("ODDS_API_DEFAULT_SPORT_KEY")
+ODDS_API_LEAGUE_MAP_RAW: str = _get_env_str("ODDS_API_LEAGUE_MAP", "")
+ODDS_API_LEAGUE_MAP: Dict[int, str] = _parse_odds_api_league_map(
+    ODDS_API_LEAGUE_MAP_RAW
+)
+ODDS_API_BOOKMAKERS_RAW: str = _get_env_str("ODDS_API_BOOKMAKERS", "")
+ODDS_API_BOOKMAKERS: List[str] = [
+    s.strip()
+    for s in ODDS_API_BOOKMAKERS_RAW.split(",")
+    if s.strip()
+]
+
 
 # ---------------------------------------------------------------------------
 # Ratings pré-jogo (manual por enquanto)
@@ -205,6 +249,33 @@ team_player_ratings_ts: Dict[str, datetime] = {}
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _normalize_team_name(name: str) -> str:
+    """
+    Normaliza nome de time para comparação entre APIs (remove "FC", acentos simples, etc.).
+    """
+    s = (name or "").lower()
+    # tira sufixos comuns
+    for token in [
+        " fc",
+        " cf",
+        " sc",
+        " afc",
+        " c.f.",
+        " s.c.",
+        " f.c.",
+        " de",
+        " ac",
+        " bc",
+        " u19",
+        " u21",
+    ]:
+        s = s.replace(token, " ")
+    # mantém apenas letras/números/espaço
+    s = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
+    # normaliza espaços
+    return " ".join(s.split())
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +603,7 @@ async def _fetch_live_odds_for_fixture(
 
                 if line_str == target_line_str:
                     logging.info(
-                        "Fixture %s: bookmaker %s → Over %s @ %.3f encontrado.",
+                        "Fixture %s: bookmaker %s → Over %s @ %.3f encontrado (API-FOOTBALL).",
                         fixture_id,
                         bm_id_label,
                         line_str,
@@ -542,7 +613,7 @@ async def _fetch_live_odds_for_fixture(
 
         if available_lines:
             logging.info(
-                "Fixture %s: bookmaker %s sem Over %s. Linhas Over encontradas: %s",
+                "Fixture %s: bookmaker %s sem Over %s. Linhas Over encontradas (API-FOOTBALL): %s",
                 fixture_id,
                 bm_id_label,
                 target_line_str,
@@ -583,9 +654,197 @@ async def _fetch_live_odds_for_fixture(
             return odd_val
 
     logging.info(
-        "Fixture %s: odds LIVE presentes, mas nenhuma seleção Over %s encontrada em nenhum bookmaker.",
+        "Fixture %s: odds LIVE presentes (API-FOOTBALL), mas nenhuma seleção Over %s encontrada em nenhum bookmaker.",
         fixture_id,
         target_line_str,
+    )
+    return None
+
+
+async def _fetch_live_odds_for_fixture_odds_api(
+    client: httpx.AsyncClient,
+    fixture: Dict[str, Any],
+    total_goals: int,
+) -> Optional[float]:
+    """
+    Busca odd em tempo real via The Odds API para a linha Over (soma do placar + 0,5).
+    Usa:
+      GET /v4/sports/{sport_key}/odds?regions=...&markets=totals&oddsFormat=decimal
+    e casa o evento pelo par (home_team, away_team).
+    """
+    if not ODDS_API_KEY or not ODDS_API_USE:
+        return None
+
+    league_id = fixture.get("league_id")
+    sport_key = None
+
+    if league_id is not None:
+        sport_key = ODDS_API_LEAGUE_MAP.get(int(league_id))
+
+    if not sport_key:
+        sport_key = ODDS_API_DEFAULT_SPORT_KEY
+
+    if not sport_key:
+        # sem sport_key, não dá para chamar The Odds API
+        return None
+
+    target_line = float(total_goals) + 0.5
+    target_line_str = "{:.1f}".format(target_line)
+
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": ODDS_API_REGIONS,
+        "markets": ODDS_API_MARKETS or "totals",
+        "oddsFormat": "decimal",
+    }
+
+    url = "{base}/sports/{sport_key}/odds".format(
+        base=ODDS_API_BASE_URL.rstrip("/"),
+        sport_key=sport_key,
+    )
+
+    try:
+        resp = await client.get(
+            url,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception(
+            "Erro ao buscar odds na The Odds API para sport_key=%s (fixture=%s)",
+            sport_key,
+            fixture.get("fixture_id"),
+        )
+        return None
+
+    events = data or []
+    if not isinstance(events, list) or not events:
+        logging.info(
+            "The Odds API retornou lista vazia de eventos para sport_key=%s",
+            sport_key,
+        )
+        return None
+
+    home_name_norm = _normalize_team_name(fixture.get("home_team") or "")
+    away_name_norm = _normalize_team_name(fixture.get("away_team") or "")
+
+    matched_event: Optional[Dict[str, Any]] = None
+
+    for ev in events:
+        ev_home = _normalize_team_name(str(ev.get("home_team") or ""))
+        ev_away = _normalize_team_name(str(ev.get("away_team") or ""))
+
+        # match direto home/away
+        if ev_home == home_name_norm and ev_away == away_name_norm:
+            matched_event = ev
+            break
+        # fallback: invertido (só pra segurança)
+        if ev_home == away_name_norm and ev_away == home_name_norm:
+            matched_event = ev
+            break
+
+    if matched_event is None:
+        logging.info(
+            "The Odds API: nenhum evento casou com %s vs %s em sport_key=%s",
+            fixture.get("home_team"),
+            fixture.get("away_team"),
+            sport_key,
+        )
+        return None
+
+    bookmakers = matched_event.get("bookmakers") or []
+    if not bookmakers:
+        logging.info(
+            "The Odds API: evento casado mas sem bookmakers para fixture=%s",
+            fixture.get("fixture_id"),
+        )
+        return None
+
+    # Ordena bookmakers pela preferência configurada, se houver
+    ordered_bookmakers: List[Dict[str, Any]] = []
+    used_indices = set()
+
+    if ODDS_API_BOOKMAKERS:
+        for pref_key in ODDS_API_BOOKMAKERS:
+            for idx, bk in enumerate(bookmakers):
+                if idx in used_indices:
+                    continue
+                if (bk.get("key") or "").lower() == pref_key.lower():
+                    ordered_bookmakers.append(bk)
+                    used_indices.add(idx)
+                    break
+
+    # adiciona o restante que não entrou na preferência
+    for idx, bk in enumerate(bookmakers):
+        if idx not in used_indices:
+            ordered_bookmakers.append(bk)
+
+    for bk in ordered_bookmakers:
+        bk_key = bk.get("key") or bk.get("title") or "unknown"
+        markets = bk.get("markets") or []
+        if not markets:
+            continue
+
+        available_lines: List[str] = []
+
+        for mkt in markets:
+            mkey = (mkt.get("key") or "").lower()
+            if mkey != "totals":
+                continue
+
+            outcomes = mkt.get("outcomes") or []
+            for oc in outcomes:
+                name_raw = str(oc.get("name") or "").lower()
+                if "over" not in name_raw:
+                    continue
+
+                price_raw = oc.get("price")
+                if price_raw is None:
+                    continue
+                try:
+                    price_val = float(str(price_raw).replace(",", "."))
+                except (TypeError, ValueError):
+                    continue
+                if price_val <= 1.0:
+                    continue
+
+                point_raw = oc.get("point")
+                if point_raw is None:
+                    continue
+                try:
+                    point_val = float(str(point_raw).replace(",", "."))
+                except Exception:
+                    continue
+
+                line_str = "{:.1f}".format(point_val)
+                if line_str not in available_lines:
+                    available_lines.append(line_str)
+
+                if abs(point_val - target_line) < 1e-6:
+                    logging.info(
+                        "The Odds API: fixture %s → bk=%s Over %s @ %.3f encontrado.",
+                        fixture.get("fixture_id"),
+                        bk_key,
+                        line_str,
+                        price_val,
+                    )
+                    return price_val
+
+        if available_lines:
+            logging.info(
+                "The Odds API: fixture %s, bk=%s sem Over %s. Linhas disponíveis (totals): %s",
+                fixture.get("fixture_id"),
+                bk_key,
+                target_line_str,
+                ", ".join(sorted(available_lines)),
+            )
+
+    logging.info(
+        "The Odds API: nenhuma seleção Over %s encontrada para fixture=%s em nenhum bookmaker.",
+        target_line_str,
+        fixture.get("fixture_id"),
     )
     return None
 
@@ -1723,7 +1982,7 @@ def _format_pattern_only_text(
         "- Pressão {ps:.1f} indica cenário compatível com teu padrão de gol.".format(
             ps=pressure_score
         ),
-        "- A API-FOOTBALL não retornou odd ao vivo nesta linha.",
+        "- Nenhuma odd ao vivo disponível nas fontes (API-FOOTBALL/The Odds API).",
         "- Usa este alerta como radar de padrão; confere a odd real na casa antes de entrar.",
         "",
         "🎯 Plano sugerido:",
@@ -1755,7 +2014,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     - ALERTA NORMAL: cenário bom + odd dentro da faixa [MIN_ODD, MAX_ODD]
     - ALERTA OBSERVAÇÃO: cenário bom + odd POSITIVA mas abaixo de MIN_ODD
     - ALERTA PADRÃO FORTE (sem odd): cenário bom + EV na odd de referência,
-      mas sem odd na API (você confere na casa).
+      mas sem odd nas APIs (você confere na casa).
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -1794,6 +2053,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 used_cache_odd = False
                 used_fake_odd = False
 
+                # 1) Tenta API-FOOTBALL
                 try:
                     api_odd = await _fetch_live_odds_for_fixture(
                         client=client,
@@ -1810,7 +2070,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             used_cache_odd = True
                 except Exception:
                     logging.exception(
-                        "Erro inesperado ao buscar odds ao vivo para fixture=%s",
+                        "Erro inesperado ao buscar odds ao vivo (API-FOOTBALL) para fixture=%s",
                         fx["fixture_id"],
                     )
                     cached_odd = last_odd_cache.get(fx["fixture_id"])
@@ -1818,18 +2078,38 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         api_odd = cached_odd
                         used_cache_odd = True
 
+                # 2) Se nada veio da API-FOOTBALL (nem cache), tenta The Odds API
+                if api_odd is None and ODDS_API_KEY and ODDS_API_USE:
+                    try:
+                        oddsapi_odd = await _fetch_live_odds_for_fixture_odds_api(
+                            client=client,
+                            fixture=fx,
+                            total_goals=total_goals,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Erro inesperado ao buscar odds via The Odds API para fixture=%s",
+                            fx["fixture_id"],
+                        )
+                        oddsapi_odd = None
+
+                    if oddsapi_odd is not None:
+                        api_odd = oddsapi_odd
+                        got_live_odd = True
+                        last_odd_cache[fx["fixture_id"]] = api_odd
+
                 if api_odd is None:
                     if USE_FAKE_ODD_WHEN_MISSING:
                         api_odd = FAKE_ODD_BASE
                         used_fake_odd = True
                         logging.info(
-                            "Fixture %s sem odd ao vivo e sem cache; usando odd de referência %.2f para avaliar padrão.",
+                            "Fixture %s sem odd ao vivo (API-FOOTBALL/The Odds API) e sem cache; usando odd de referência %.2f para avaliar padrão.",
                             fx["fixture_id"],
                             api_odd,
                         )
                     else:
                         logging.info(
-                            "Fixture %s sem odd ao vivo nem cache (possível mercado suspenso ou sem Over soma+0,5 na API). Ignorando jogo.",
+                            "Fixture %s sem odd ao vivo nem cache (APIs) e sem uso de odd fake. Ignorando jogo.",
                             fx["fixture_id"],
                         )
                         continue
@@ -1911,7 +2191,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 if used_fake_odd:
                     alert_text = _format_pattern_only_text(fx, metrics)
                 else:
-                    # Aqui odd vem da API (ao vivo) ou de cache real → aplica faixa de odds
+                    # Aqui odd vem das APIs ou de cache real → aplica faixa de odds
                     if odd_cur > MAX_ODD:
                         continue
 
@@ -2020,6 +2300,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_set = TELEGRAM_CHAT_ID is not None
     api_set = bool(API_FOOTBALL_KEY)
     news_set = bool(NEWS_API_KEY)
+    oddsapi_set = bool(ODDS_API_KEY)
 
     lines = [
         "🛠 Debug EvRadar PRO (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)",
@@ -2067,6 +2348,21 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "PLAYER_EVENTS_CACHE_MINUTES: {m}".format(m=PLAYER_EVENTS_CACHE_MINUTES),
         "PLAYER_MAX_BOOST_PCT: {p:.1f}%".format(p=PLAYER_MAX_BOOST_PCT),
         "PLAYER_SUB_TRIGGER_WINDOW: {w} min".format(w=PLAYER_SUB_TRIGGER_WINDOW),
+        "",
+        "ODDS_API_KEY definido: {v}".format(v="sim" if oddsapi_set else "não"),
+        "ODDS_API_USE: {v}".format(v=ODDS_API_USE),
+        "ODDS_API_BASE_URL: {u}".format(u=ODDS_API_BASE_URL),
+        "ODDS_API_REGIONS: {r}".format(r=ODDS_API_REGIONS),
+        "ODDS_API_MARKETS: {m}".format(m=ODDS_API_MARKETS),
+        "ODDS_API_DEFAULT_SPORT_KEY: {s}".format(
+            s=ODDS_API_DEFAULT_SPORT_KEY or "não definido"
+        ),
+        "ODDS_API_LEAGUE_MAP: {mp}".format(
+            mp=ODDS_API_LEAGUE_MAP_RAW or "não definido"
+        ),
+        "ODDS_API_BOOKMAKERS: {bk}".format(
+            bk=",".join(ODDS_API_BOOKMAKERS) if ODDS_API_BOOKMAKERS else "todos"
+        ),
         "",
         "Último scan:",
         "  origem: {origin}".format(origin=last_scan_origin),
