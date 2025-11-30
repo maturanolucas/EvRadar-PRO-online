@@ -728,16 +728,40 @@ async def _fetch_live_odds_for_fixture_odds_api(
 
     matched_event: Optional[Dict[str, Any]] = None
 
+    def _names_match(a: str, b: str) -> bool:
+        """
+        Casa nomes tolerando variações tipo:
+        - 'Twente' vs 'FC Twente Enschede'
+        - 'AZ' vs 'AZ Alkmaar'
+        """
+        a = a.strip()
+        b = b.strip()
+        if not a or not b:
+            return False
+
+        if a == b:
+            return True
+
+        # prefixo/sufixo
+        if a in b or b in a:
+            return True
+
+        # compartilham pelo menos 1 palavra mais forte (>=3 letras)
+        a_tokens = set(t for t in a.split() if len(t) >= 3)
+        b_tokens = set(t for t in b.split() if len(t) >= 3)
+        return len(a_tokens & b_tokens) >= 1
+
     for ev in events:
         ev_home = _normalize_team_name(str(ev.get("home_team") or ""))
         ev_away = _normalize_team_name(str(ev.get("away_team") or ""))
 
-        # match direto home/away
-        if ev_home == home_name_norm and ev_away == away_name_norm:
+        # home/away normal
+        if _names_match(ev_home, home_name_norm) and _names_match(ev_away, away_name_norm):
             matched_event = ev
             break
-        # fallback: invertido (só pra segurança)
-        if ev_home == away_name_norm and ev_away == home_name_norm:
+
+        # fallback invertido (por segurança)
+        if _names_match(ev_home, away_name_norm) and _names_match(ev_away, home_name_norm):
             matched_event = ev
             break
 
