@@ -1578,12 +1578,13 @@ def _compute_score_context_boost(
     """
     Ajuste de probabilidade baseado em CONTEXTO de placar + favorito.
 
-    Ideia:
-    - Favorito perdendo em casa → boost forte (maior necessidade de gol).
-    - Favorito perdendo fora → boost positivo, mas um pouco menor.
-    - Favorito empatando → leve boost.
-    - Favorito ganhando (principalmente em casa) → penalização (menos necessidade).
+    Ideia alinhada com teu faro:
+    - Favorito perdendo → necessidade alta de gol (+boost).
+    - Favorito empatando → leve boost (especialmente se for o mandante).
+    - Favorito ganhando, principalmente em casa e por 2+ gols → penalização forte
+      (torneira fecha, necessidade cai).
     """
+
     home_goals = fixture.get("home_goals") or 0
     away_goals = fixture.get("away_goals") or 0
     minute = fixture.get("minute") or 0
@@ -1594,7 +1595,7 @@ def _compute_score_context_boost(
 
     score_diff = home_goals - away_goals  # >0 = mandante na frente
 
-    # Detecta favorito a partir do rating pré-jogo
+    # Detecta favorito a partir dos ratings pré-jogo (auto ou manual)
     diff_rating = rating_home - rating_away
     fav_side = "none"
     if diff_rating >= 0.4:
@@ -1606,44 +1607,73 @@ def _compute_score_context_boost(
 
     if fav_side == "home":
         if score_diff < 0:
-            # favorito em casa perdendo
+            # favorito em casa perdendo → MUITA necessidade
             margin = -score_diff
             if margin >= 2:
-                boost = 0.05
+                boost = 0.06  # perdendo por 2+ em casa
             else:
-                boost = 0.04
+                boost = 0.05
         elif score_diff == 0:
             # favorito em casa empatando
-            boost = 0.02
+            boost = 0.025
         else:
             # favorito em casa ganhando
             margin = score_diff
-            if margin >= 2:
-                boost = -0.04
+
+            if margin >= 3:
+                # goleada em casa → necessidade praticamente zero
+                boost = -0.06
+            elif margin == 2:
+                boost = -0.05
             else:
-                boost = -0.02
+                # +1 gol: 1x0, 2x1 em casa
+                if minute_int >= 70:
+                    boost = -0.04
+                elif minute_int >= 55:
+                    boost = -0.03
+                else:
+                    boost = -0.02
+
     elif fav_side == "away":
         if score_diff > 0:
             # favorito fora perdendo (mandante na frente)
             margin = score_diff
             if margin >= 2:
-                boost = 0.035
+                boost = 0.045
             else:
-                boost = 0.025
+                boost = 0.03
         elif score_diff == 0:
             # favorito fora empatando
-            boost = 0.015
+            boost = 0.02
         else:
             # favorito fora ganhando
             margin = -score_diff
-            if margin >= 2:
-                boost = -0.03
+            if margin >= 3:
+                boost = -0.05
+            elif margin == 2:
+                boost = -0.035
             else:
-                boost = -0.015
+                if minute_int >= 70:
+                    boost = -0.025
+                elif minute_int >= 55:
+                    boost = -0.015
+                else:
+                    boost = -0.01
     else:
-        boost = 0.0
+        # jogo "equilibrado" em força pré-jogo
+        if abs(score_diff) == 0:
+            boost = 0.0
+        elif abs(score_diff) == 1:
+            # leve ajuste pró-gol quando quem está atrás ainda tem jogo
+            if minute_int <= 65:
+                boost = 0.01
+            else:
+                boost = 0.0
+        else:
+            # goleada sem favorito claro → tende a esfriar
+            boost = -0.03
 
-    # Escala pelo minuto (mais forte na janela do radar)
+    # Escala suave pelo minuto (mais peso na janela do radar)
     if minute_int <= 30:
         scale = 0.5
     elif minute_int <= 45:
@@ -1657,11 +1687,11 @@ def _compute_score_context_boost(
 
     boost *= scale
 
-    # Clamp final
-    if boost > 0.05:
-        boost = 0.05
-    if boost < -0.05:
-        boost = -0.05
+    # Clamp final (±6 pp é MUITO)
+    if boost > 0.06:
+        boost = 0.06
+    if boost < -0.06:
+        boost = -0.06
 
     return boost
 
@@ -2352,6 +2382,22 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 )
 
                 odd_cur = metrics["odd_current"]
+
+                # CORTE DE CONTEXTO:
+                # se o contexto for bem negativo (favorito confortável / pouca necessidade)
+                # e já estivermos em 60'+, descarta o jogo mesmo com EV+.
+                context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
+                minute_int = fx["minute"] or 0
+                try:
+                    minute_int = int(minute_int)
+                except (TypeError, ValueError):
+                    minute_int = 0
+
+                score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
+
+                if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
+                    # "torneira fechada": favorito confortável / necessidade baixa
+                    continue
 
                 # Primeiro: filtros de pressão e EV
                 if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
