@@ -1424,7 +1424,7 @@ async def _fetch_news_boost_for_fixture(
 
 
 # ---------------------------------------------------------------------------
-# Pré-jogo boost (manual + automático)
+# Pré-jogo boost (manual + automático + contexto de placar/favorito)
 # ---------------------------------------------------------------------------
 
 def _get_pregame_boost_manual(fixture: Dict[str, Any]) -> float:
@@ -1570,12 +1570,118 @@ async def _get_team_auto_rating(
     return rating
 
 
+def _compute_score_context_boost(
+    fixture: Dict[str, Any],
+    rating_home: float,
+    rating_away: float,
+) -> float:
+    """
+    Ajuste de probabilidade baseado em CONTEXTO de placar + favorito.
+
+    Ideia:
+    - Favorito perdendo em casa → boost forte (maior necessidade de gol).
+    - Favorito perdendo fora → boost positivo, mas um pouco menor.
+    - Favorito empatando → leve boost.
+    - Favorito ganhando (principalmente em casa) → penalização (menos necessidade).
+    """
+    home_goals = fixture.get("home_goals") or 0
+    away_goals = fixture.get("away_goals") or 0
+    minute = fixture.get("minute") or 0
+    try:
+        minute_int = int(minute)
+    except (TypeError, ValueError):
+        minute_int = 0
+
+    score_diff = home_goals - away_goals  # >0 = mandante na frente
+
+    # Detecta favorito a partir do rating pré-jogo
+    diff_rating = rating_home - rating_away
+    fav_side = "none"
+    if diff_rating >= 0.4:
+        fav_side = "home"
+    elif diff_rating <= -0.4:
+        fav_side = "away"
+
+    boost = 0.0
+
+    if fav_side == "home":
+        if score_diff < 0:
+            # favorito em casa perdendo
+            margin = -score_diff
+            if margin >= 2:
+                boost = 0.05
+            else:
+                boost = 0.04
+        elif score_diff == 0:
+            # favorito em casa empatando
+            boost = 0.02
+        else:
+            # favorito em casa ganhando
+            margin = score_diff
+            if margin >= 2:
+                boost = -0.04
+            else:
+                boost = -0.02
+    elif fav_side == "away":
+        if score_diff > 0:
+            # favorito fora perdendo (mandante na frente)
+            margin = score_diff
+            if margin >= 2:
+                boost = 0.035
+            else:
+                boost = 0.025
+        elif score_diff == 0:
+            # favorito fora empatando
+            boost = 0.015
+        else:
+            # favorito fora ganhando
+            margin = -score_diff
+            if margin >= 2:
+                boost = -0.03
+            else:
+                boost = -0.015
+    else:
+        boost = 0.0
+
+    # Escala pelo minuto (mais forte na janela do radar)
+    if minute_int <= 30:
+        scale = 0.5
+    elif minute_int <= 45:
+        scale = 0.9
+    elif minute_int <= 60:
+        scale = 1.0
+    elif minute_int <= 75:
+        scale = 0.9
+    else:
+        scale = 0.7
+
+    boost *= scale
+
+    # Clamp final
+    if boost > 0.05:
+        boost = 0.05
+    if boost < -0.05:
+        boost = -0.05
+
+    return boost
+
+
 async def _get_pregame_boost_auto(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
-) -> float:
+) -> Dict[str, float]:
+    """
+    Calcula boost pré-jogo automático e devolve também ratings de casa/fora.
+
+    Retorna:
+        {
+            "rating_home": float,
+            "rating_away": float,
+            "boost": float,
+        }
+    """
     if not USE_API_PREGAME:
-        return 0.0
+        return {"rating_home": 0.0, "rating_away": 0.0, "boost": 0.0}
 
     league_id = fixture.get("league_id")
     season = fixture.get("season")
@@ -1583,7 +1689,7 @@ async def _get_pregame_boost_auto(
     away_team_id = fixture.get("away_team_id")
 
     if league_id is None or season is None:
-        return 0.0
+        return {"rating_home": 0.0, "rating_away": 0.0, "boost": 0.0}
 
     rating_home = await _get_team_auto_rating(
         client=client,
@@ -1606,35 +1712,75 @@ async def _get_pregame_boost_auto(
     if boost < -0.02:
         boost = -0.02
 
-    return boost
+    return {
+        "rating_home": rating_home,
+        "rating_away": rating_away,
+        "boost": boost,
+    }
 
 
 async def _get_pregame_boost_for_fixture(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
-) -> float:
+) -> tuple[float, float]:
+    """
+    Retorna:
+        (pregame_boost_prob, context_boost_prob)
+
+    pregame_boost_prob → pré-jogo manual + automático
+    context_boost_prob → ajuste de necessidade de gol (favorito x placar x casa/fora)
+    """
     manual_boost = _get_pregame_boost_manual(fixture)
 
-    if not USE_API_PREGAME:
-        return manual_boost
+    home_name = fixture.get("home_team") or ""
+    away_name = fixture.get("away_team") or ""
+
+    # ratings manuais como fallback
+    rating_home = PREMATCH_TEAM_RATINGS.get(home_name, 0.0)
+    rating_away = PREMATCH_TEAM_RATINGS.get(away_name, 0.0)
 
     auto_boost = 0.0
+
+    if USE_API_PREGAME:
+        try:
+            auto_data = await _get_pregame_boost_auto(client, fixture)
+            auto_boost = float(auto_data.get("boost", 0.0))
+            rating_home = float(auto_data.get("rating_home", rating_home))
+            rating_away = float(auto_data.get("rating_away", rating_away))
+        except Exception:
+            logging.exception(
+                "Erro inesperado ao calcular pré-jogo automático para fixture=%s",
+                fixture.get("fixture_id"),
+            )
+            auto_boost = 0.0
+
+    pregame_total = manual_boost + auto_boost
+    if pregame_total > 0.03:
+        pregame_total = 0.03
+    if pregame_total < -0.03:
+        pregame_total = -0.03
+
+    context_boost = 0.0
     try:
-        auto_boost = await _get_pregame_boost_auto(client, fixture)
+        context_boost = _compute_score_context_boost(
+            fixture=fixture,
+            rating_home=rating_home,
+            rating_away=rating_away,
+        )
     except Exception:
         logging.exception(
-            "Erro inesperado ao calcular pré-jogo automático para fixture=%s",
+            "Erro inesperado ao calcular contexto de placar para fixture=%s",
             fixture.get("fixture_id"),
         )
-        auto_boost = 0.0
+        context_boost = 0.0
 
-    total = manual_boost + auto_boost
+    # Clamp de segurança para o contexto (±5 pp já é um empurrão forte)
+    if context_boost > 0.05:
+        context_boost = 0.05
+    if context_boost < -0.05:
+        context_boost = -0.05
 
-    if total > 0.03:
-        total = 0.03
-    if total < -0.03:
-        total = -0.03
-    return total
+    return pregame_total, context_boost
 
 
 # ---------------------------------------------------------------------------
@@ -1650,6 +1796,7 @@ def _estimate_prob_and_odd(
     news_boost_prob: float = 0.0,
     pregame_boost_prob: float = 0.0,
     player_boost_prob: float = 0.0,
+    context_boost_prob: float = 0.0,
 ) -> Dict[str, float]:
     """
     Estima probabilidade de +1 gol e uma odd "aproximada".
@@ -1725,6 +1872,7 @@ def _estimate_prob_and_odd(
     base_prob += news_boost_prob
     base_prob += pregame_boost_prob
     base_prob += player_boost_prob
+    base_prob += context_boost_prob
 
     p_final = max(0.20, min(0.90, base_prob))
 
@@ -1747,6 +1895,7 @@ def _estimate_prob_and_odd(
         "news_boost_prob": news_boost_prob,
         "pregame_boost_prob": pregame_boost_prob,
         "player_boost_prob": player_boost_prob,
+        "context_boost_prob": context_boost_prob,
     }
 
 
@@ -1796,6 +1945,7 @@ def _format_alert_text(
     news_boost_prob = metrics.get("news_boost_prob", 0.0) * 100.0
     pregame_boost_prob = metrics.get("pregame_boost_prob", 0.0) * 100.0
     player_boost_prob = metrics.get("player_boost_prob", 0.0) * 100.0
+    context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
 
     stake_pct = _suggest_stake_pct(ev_pct, odd_current)
     stake_brl = BANKROLL_INITIAL * (stake_pct / 100.0)
@@ -1835,6 +1985,14 @@ def _format_alert_text(
     elif player_boost_prob < -0.5:
         interpretacao_parts.append("elenco em campo tira um pouco da força ofensiva")
 
+    if context_boost_prob > 0.0:
+        if context_boost_prob >= 2.0:
+            interpretacao_parts.append("favorito em situação de necessidade (placar/contexto pró-gol)")
+        else:
+            interpretacao_parts.append("placar favorece busca de mais 1 gol do favorito")
+    elif context_boost_prob < 0.0:
+        interpretacao_parts.append("favorito confortável no placar (necessidade de gol menor)")
+
     if ev_pct >= EV_MIN_PCT + 2.0:
         ev_flag = "EV+ forte"
     elif ev_pct >= EV_MIN_PCT:
@@ -1852,6 +2010,8 @@ def _format_alert_text(
         adjust_parts.append("pré {pg:+.1f} pp".format(pg=pregame_boost_prob))
     if player_boost_prob != 0.0:
         adjust_parts.append("jogadores {pl:+.1f} pp".format(pl=player_boost_prob))
+    if context_boost_prob != 0.0:
+        adjust_parts.append("contexto {cx:+.1f} pp".format(cx=context_boost_prob))
 
     adjust_str = ""
     if adjust_parts:
@@ -1917,6 +2077,7 @@ def _format_watch_text(
     odd_current = metrics["odd_current"]
     ev_pct = metrics["ev_pct"]
     pressure_score = metrics["pressure_score"]
+    context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
 
     interpretacao_parts: List[str] = []
 
@@ -1926,6 +2087,11 @@ def _format_watch_text(
         interpretacao_parts.append("pressão boa/decente para gol")
     else:
         interpretacao_parts.append("pressão ok, mas não absurda")
+
+    if context_boost_prob > 0.0:
+        interpretacao_parts.append("favorito atrás/empatando reforça necessidade de gol")
+    elif context_boost_prob < 0.0:
+        interpretacao_parts.append("contexto de favorito confortável reduz pressão para mais gols")
 
     interpretacao_parts.append(
         "odd ainda abaixo da tua faixa mínima (esperar melhorar preço)"
@@ -2145,17 +2311,19 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     news_boost_prob = 0.0
 
                 pregame_boost_prob = 0.0
+                context_boost_prob = 0.0
                 try:
-                    pregame_boost_prob = await _get_pregame_boost_for_fixture(
+                    pregame_boost_prob, context_boost_prob = await _get_pregame_boost_for_fixture(
                         client=client,
                         fixture=fx,
                     )
                 except Exception:
                     logging.exception(
-                        "Erro inesperado ao calcular pré-jogo para fixture=%s",
+                        "Erro inesperado ao calcular pré-jogo/contexto para fixture=%s",
                         fx["fixture_id"],
                     )
                     pregame_boost_prob = 0.0
+                    context_boost_prob = 0.0
 
                 player_boost_prob = 0.0
                 if USE_PLAYER_IMPACT:
@@ -2180,6 +2348,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     news_boost_prob=news_boost_prob,
                     pregame_boost_prob=pregame_boost_prob,
                     player_boost_prob=player_boost_prob,
+                    context_boost_prob=context_boost_prob,
                 )
 
                 odd_cur = metrics["odd_current"]
