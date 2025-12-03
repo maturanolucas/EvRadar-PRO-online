@@ -27,7 +27,7 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 import asyncio
 import logging
 import os
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -666,6 +666,116 @@ async def _fetch_live_odds_for_fixture(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Helper para The Odds API: linha SUM_PLUS_HALF
+# ---------------------------------------------------------------------------
+
+def _pick_totals_over_sum_plus_half_from_the_odds_api(
+    events: List[Dict[str, Any]],
+    fixture_id: int,
+    home_goals: int,
+    away_goals: int,
+) -> Optional[Tuple[float, float, str]]:
+    """
+    Procura na resposta da The Odds API a linha de 'totals' correspondente a
+    SUM_PLUS_HALF (gols atuais + 0,5) e retorna (linha, odd, bookmaker_name).
+
+    NÃO filtra por MIN_ODD/MAX_ODD aqui, pra permitir alerta de observação
+    quando a odd estiver abaixo da mínima (watch).
+    """
+    target_line = float(home_goals + away_goals) + 0.5
+    target_line = float(f"{target_line:.1f}")
+
+    best_price: float = 0.0
+    best_book: str = ""
+    best_line: float = target_line
+
+    for ev in events:
+        bookmakers = ev.get("bookmakers") or []
+        for bk in bookmakers:
+            book_name = bk.get("title") or bk.get("key") or "desconhecido"
+            markets = bk.get("markets") or []
+            for market in markets:
+                if (market.get("key") or "").lower() != "totals":
+                    continue
+
+                outcomes = market.get("outcomes") or []
+                available_points = set()
+
+                # coleta todas as linhas numéricas deste bookmaker (pra log)
+                for oc in outcomes:
+                    pt_raw = oc.get("point")
+                    if pt_raw is None:
+                        continue
+                    try:
+                        pt_val = float(str(pt_raw).replace(",", "."))
+                        available_points.add(pt_val)
+                    except (TypeError, ValueError):
+                        continue
+
+                # agora tenta achar exatamente Over target_line
+                for oc in outcomes:
+                    name = (oc.get("name") or "").lower()
+                    if "over" not in name:
+                        continue
+
+                    price_raw = oc.get("price")
+                    if price_raw is None:
+                        continue
+                    try:
+                        price_val = float(str(price_raw).replace(",", "."))
+                    except (TypeError, ValueError):
+                        continue
+                    if price_val <= 1.0:
+                        continue
+
+                    point_raw = oc.get("point")
+                    if point_raw is None:
+                        continue
+                    try:
+                        point_val = float(str(point_raw).replace(",", "."))
+                    except (TypeError, ValueError):
+                        continue
+
+                    if abs(point_val - target_line) > 1e-6:
+                        continue
+
+                    # pega sempre a MAIOR odd dessa linha entre os bookmakers
+                    if price_val > best_price:
+                        best_price = price_val
+                        best_book = book_name
+                        best_line = point_val
+
+                if available_points:
+                    points_str = ", ".join(
+                        f"{p:.1f}" for p in sorted(available_points)
+                    )
+                    logging.info(
+                        "The Odds API: fixture %s, bk=%s, linhas totals disponíveis: %s (buscando Over %.1f)",
+                        fixture_id,
+                        book_name,
+                        points_str,
+                        target_line,
+                    )
+
+    if best_price > 0.0:
+        logging.info(
+            "The Odds API: fixture %s, selecionado Over %.1f @ %.2f (%s)",
+            fixture_id,
+            best_line,
+            best_price,
+            best_book,
+        )
+        return best_line, best_price, best_book
+
+    logging.info(
+        "The Odds API: nenhuma seleção Over %.1f encontrada para fixture=%s em nenhum bookmaker.",
+        target_line,
+        fixture_id,
+    )
+    return None
+
+
 async def _fetch_live_odds_for_fixture_odds_api(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
@@ -810,66 +920,34 @@ async def _fetch_live_odds_for_fixture_odds_api(
         if idx not in used_indices:
             ordered_bookmakers.append(bk)
 
-    for bk in ordered_bookmakers:
-        bk_key = bk.get("key") or bk.get("title") or "unknown"
-        markets = bk.get("markets") or []
-        if not markets:
-            continue
+    matched_event["bookmakers"] = ordered_bookmakers
 
-        available_lines: List[str] = []
+    # Usa helper centralizado para pegar a linha SUM_PLUS_HALF
+    home_goals = fixture.get("home_goals") or 0
+    away_goals = fixture.get("away_goals") or 0
 
-        for mkt in markets:
-            mkey = (mkt.get("key") or "").lower()
-            if mkey != "totals":
-                continue
+    picked = _pick_totals_over_sum_plus_half_from_the_odds_api(
+        events=[matched_event],
+        fixture_id=fixture.get("fixture_id") or 0,
+        home_goals=home_goals,
+        away_goals=away_goals,
+    )
 
-            outcomes = mkt.get("outcomes") or []
-            for oc in outcomes:
-                name_raw = str(oc.get("name") or "").lower()
-                if "over" not in name_raw:
-                    continue
-
-                price_raw = oc.get("price")
-                if price_raw is None:
-                    continue
-                try:
-                    price_val = float(str(price_raw).replace(",", "."))
-                except (TypeError, ValueError):
-                    continue
-                if price_val <= 1.0:
-                    continue
-
-                point_raw = oc.get("point")
-                if point_raw is None:
-                    continue
-                try:
-                    point_val = float(str(point_raw).replace(",", "."))
-                except Exception:
-                    continue
-
-                line_str = "{:.1f}".format(point_val)
-                if line_str not in available_lines:
-                    available_lines.append(line_str)
-
-                if abs(point_val - target_line) < 1e-6:
-                    logging.info(
-                        "The Odds API: fixture %s → bk=%s Over %s @ %.3f encontrado.",
-                        fixture.get("fixture_id"),
-                        bk_key,
-                        line_str,
-                        price_val,
-                    )
-                    return price_val
-
-        if available_lines:
+    if picked is not None:
+        total_line, price_val, book_name = picked
+        # só por garantia, confere se é mesmo a linha alvo esperada
+        line_str = "{:.1f}".format(total_line)
+        if line_str != target_line_str:
             logging.info(
-                "The Odds API: fixture %s, bk=%s sem Over %s. Linhas disponíveis (totals): %s",
+                "The Odds API: linha retornada (%.1f) difere da SUM_PLUS_HALF esperada (%.1f) para fixture=%s; descartando.",
+                total_line,
+                target_line,
                 fixture.get("fixture_id"),
-                bk_key,
-                target_line_str,
-                ", ".join(sorted(available_lines)),
             )
+            return None
+        return price_val
 
+    # Se helper não achou nada, já logou; só reforça
     logging.info(
         "The Odds API: nenhuma seleção Over %s encontrada para fixture=%s em nenhum bookmaker.",
         target_line_str,
