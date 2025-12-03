@@ -532,7 +532,7 @@ async def _fetch_live_odds_for_fixture(
 
     def _extract_from_bookmaker(bm: Dict[str, Any], bm_id_label: Optional[int]) -> Optional[float]:
         """
-        Tenta encontrar APENAS a odd da linha Over (total_goals + 0.5) neste bookmaker.
+        Tenta encontrar APENAS a odd da linha Over (total_goals + 0,5) neste bookmaker.
         Se não achar, retorna None (sem fallback de Over aleatório).
 
         IMPORTANTE: agora a linha é lida primeiro do texto ("Over 1.5", "Over 2.5"),
@@ -1814,6 +1814,73 @@ async def _get_pregame_boost_for_fixture(
 
 
 # ---------------------------------------------------------------------------
+# Boost extra "padrão Lucas" (faro de gol)
+# ---------------------------------------------------------------------------
+
+def _compute_lucas_pattern_boost(
+    minute: int,
+    home_goals: int,
+    away_goals: int,
+    pressure_score: float,
+    context_boost_prob: float,
+) -> float:
+    """
+    Boost adicional de probabilidade (0–10 pp) alinhado ao teu padrão:
+
+    - Pressão alta (muitos chutes / perigo).
+    - Placar tenso (diferença ≤ 1, nada de goleada confortável).
+    - Janela de minuto que você mais entra (55–70).
+    - Necessidade de gol via contexto (favorito atrás/empatando).
+    """
+    try:
+        minute_int = int(minute)
+    except (TypeError, ValueError):
+        minute_int = 0
+
+    total_goals = (home_goals or 0) + (away_goals or 0)
+    score_diff = (home_goals or 0) - (away_goals or 0)
+
+    boost = 0.0
+
+    # Pressão ao vivo
+    if pressure_score >= 8.5:
+        boost += 0.06
+    elif pressure_score >= 7.0:
+        boost += 0.04
+    elif pressure_score >= 5.5:
+        boost += 0.025
+
+    # Placar tenso / jogo vivo
+    if abs(score_diff) <= 1 and total_goals <= 4:
+        boost += 0.02
+    elif total_goals == 0 and pressure_score >= 5.5:
+        boost += 0.03
+
+    # Janela de tempo preferida (onde você costuma pegar 1.47–1.70)
+    if 55 <= minute_int <= 70:
+        boost += 0.02
+    elif 47 <= minute_int < 55 or 70 < minute_int <= 80:
+        boost += 0.01
+
+    # Necessidade de gol vinda do contexto (favorito atrás/empatando)
+    if context_boost_prob > 0.0:
+        # context_boost_prob está em probabilidade (0–1) → converte para peso
+        boost += min(context_boost_prob * 0.5, 0.03)
+
+    # Em goleadas o próprio contexto já derruba bastante, então não forçamos boost
+    if abs(score_diff) >= 3 and minute_int >= 55:
+        boost = 0.0
+
+    # Clamp final 0–10 pp
+    if boost < 0.0:
+        boost = 0.0
+    if boost > 0.10:
+        boost = 0.10
+
+    return boost
+
+
+# ---------------------------------------------------------------------------
 # Estimador de probabilidade / odd / EV + sugestão de stake
 # ---------------------------------------------------------------------------
 
@@ -1835,6 +1902,7 @@ def _estimate_prob_and_odd(
     - Quando forced_odd_current vem da API (odd real da casa),
       não fazemos clamp em [MIN_ODD, MAX_ODD] aqui.
     - O filtro por faixa de odds é feito no scan.
+    - Inclui boost extra "padrão Lucas" para cenários que batem com teu faro.
     """
 
     total_goals = home_goals + away_goals
@@ -1887,9 +1955,11 @@ def _estimate_prob_and_odd(
     if pressure_score > 10.0:
         pressure_score = 10.0
 
-    base_prob = 0.35
-    base_prob += (pressure_score / 10.0) * 0.35
+    # Base levemente mais agressiva que a versão anterior
+    base_prob = 0.38
+    base_prob += (pressure_score / 10.0) * 0.37
 
+    # Tempo de jogo
     if minute <= 55:
         base_prob += 0.05
     elif minute <= 65:
@@ -1899,12 +1969,24 @@ def _estimate_prob_and_odd(
     else:
         base_prob -= 0.02
 
+    # Boosts individuais
     base_prob += news_boost_prob
     base_prob += pregame_boost_prob
     base_prob += player_boost_prob
     base_prob += context_boost_prob
 
-    p_final = max(0.20, min(0.90, base_prob))
+    # Boost extra "padrão Lucas"
+    lucas_boost_prob = _compute_lucas_pattern_boost(
+        minute=minute,
+        home_goals=home_goals,
+        away_goals=away_goals,
+        pressure_score=pressure_score,
+        context_boost_prob=context_boost_prob,
+    )
+    base_prob += lucas_boost_prob
+
+    # Clamp final
+    p_final = max(0.20, min(0.93, base_prob))
 
     odd_fair = 1.0 / p_final
 
@@ -1926,6 +2008,7 @@ def _estimate_prob_and_odd(
         "pregame_boost_prob": pregame_boost_prob,
         "player_boost_prob": player_boost_prob,
         "context_boost_prob": context_boost_prob,
+        "lucas_boost_prob": lucas_boost_prob,
     }
 
 
@@ -1976,6 +2059,7 @@ def _format_alert_text(
     pregame_boost_prob = metrics.get("pregame_boost_prob", 0.0) * 100.0
     player_boost_prob = metrics.get("player_boost_prob", 0.0) * 100.0
     context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
+    lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
 
     stake_pct = _suggest_stake_pct(ev_pct, odd_current)
     stake_brl = BANKROLL_INITIAL * (stake_pct / 100.0)
@@ -2023,6 +2107,12 @@ def _format_alert_text(
     elif context_boost_prob < 0.0:
         interpretacao_parts.append("favorito confortável no placar (necessidade de gol menor)")
 
+    if lucas_boost_prob > 0.0:
+        if lucas_boost_prob >= 5.0:
+            interpretacao_parts.append("padrão muito alinhado ao teu faro de gol (Lucas boost forte)")
+        else:
+            interpretacao_parts.append("cenário bem encaixado no teu padrão de entrada")
+
     if ev_pct >= EV_MIN_PCT + 2.0:
         ev_flag = "EV+ forte"
     elif ev_pct >= EV_MIN_PCT:
@@ -2042,6 +2132,8 @@ def _format_alert_text(
         adjust_parts.append("jogadores {pl:+.1f} pp".format(pl=player_boost_prob))
     if context_boost_prob != 0.0:
         adjust_parts.append("contexto {cx:+.1f} pp".format(cx=context_boost_prob))
+    if lucas_boost_prob != 0.0:
+        adjust_parts.append("padrão Lucas {lc:+.1f} pp".format(lc=lucas_boost_prob))
 
     adjust_str = ""
     if adjust_parts:
@@ -2108,6 +2200,7 @@ def _format_watch_text(
     ev_pct = metrics["ev_pct"]
     pressure_score = metrics["pressure_score"]
     context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
+    lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
 
     interpretacao_parts: List[str] = []
 
@@ -2122,6 +2215,9 @@ def _format_watch_text(
         interpretacao_parts.append("favorito atrás/empatando reforça necessidade de gol")
     elif context_boost_prob < 0.0:
         interpretacao_parts.append("contexto de favorito confortável reduz pressão para mais gols")
+
+    if lucas_boost_prob > 0.0:
+        interpretacao_parts.append("cenário muito parecido com as tuas entradas, mas preço ainda baixo")
 
     interpretacao_parts.append(
         "odd ainda abaixo da tua faixa mínima (esperar melhorar preço)"
@@ -2383,17 +2479,22 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 odd_cur = metrics["odd_current"]
 
-                # CORTE DE CONTEXTO:
-                # se o contexto for bem negativo (favorito confortável / pouca necessidade)
-                # e já estivermos em 60'+, descarta o jogo mesmo com EV+.
-                context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
+                # CORTE POR GOLEADA (jogos que você quase sempre ignora)
+                score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
                 minute_int = fx["minute"] or 0
                 try:
                     minute_int = int(minute_int)
                 except (TypeError, ValueError):
                     minute_int = 0
 
-                score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
+                if abs(score_diff) >= 3 and minute_int >= 55:
+                    # goleada a partir dos 55' → quase sempre torneira fechada pra você
+                    continue
+
+                # CORTE DE CONTEXTO:
+                # se o contexto for bem negativo (favorito confortável / pouca necessidade)
+                # e já estivermos em 60'+, descarta o jogo mesmo com EV+.
+                context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
 
                 if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
                     # "torneira fechada": favorito confortável / necessidade baixa
