@@ -221,8 +221,8 @@ last_scan_alerts: int = 0
 last_scan_live_events: int = 0
 last_scan_window_matches: int = 0
 
-# Cache de última odd real por jogo (fixture_id -> odd da linha correta)
-last_odd_cache: Dict[int, float] = {}
+# Cache de última odd real por jogo/linha (fixture_id -> (total_goals, odd))
+last_odd_cache: Dict[int, Tuple[int, float]] = {}
 
 # Cache simples de último "news boost" por fixture (fixture_id -> boost)
 last_news_boost_cache: Dict[int, float] = {}
@@ -247,9 +247,29 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# aliases para normalizar nome de time entre APIs
+TEAM_NAME_ALIASES: Dict[str, str] = {
+    "wolverhampton wanderers": "wolverhampton",
+    "wolverhampton": "wolverhampton",
+    "wolves": "wolverhampton",
+    "tottenham hotspur": "tottenham",
+    "tottenham": "tottenham",
+    "spurs": "tottenham",
+    "paris saint germain": "paris saint germain",
+    "psg": "paris saint germain",
+    "paris sg": "paris saint germain",
+    "manchester united": "manchester united",
+    "man utd": "manchester united",
+    "manchester utd": "manchester united",
+    "manchester city": "manchester city",
+    "man city": "manchester city",
+}
+
+
 def _normalize_team_name(name: str) -> str:
     """
     Normaliza nome de time para comparação entre APIs (remove "FC", acentos simples, etc.).
+    Aplica também aliases para casar exemplos como "Wolverhampton" x "Wolves", "Spurs" x "Tottenham".
     """
     s = (name or "").lower()
     # tira sufixos comuns
@@ -271,7 +291,33 @@ def _normalize_team_name(name: str) -> str:
     # mantém apenas letras/números/espaço
     s = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
     # normaliza espaços
-    return " ".join(s.split())
+    s = " ".join(s.split())
+    alias = TEAM_NAME_ALIASES.get(s)
+    if alias:
+        s = alias
+    return s
+
+
+def _update_last_odd_cache(fixture_id: int, total_goals: int, odd_val: float) -> None:
+    """
+    Atualiza cache de odd: guarda por fixture + total de gols (linha SUM_PLUS_HALF).
+    Assim não reutilizamos odd de linha antiga depois que sai gol.
+    """
+    last_odd_cache[fixture_id] = (total_goals, odd_val)
+
+
+def _get_cached_odd_for_line(fixture_id: int, total_goals: int) -> Optional[float]:
+    """
+    Retorna odd em cache apenas se for da MESMA linha (mesma soma de gols).
+    Evita reaproveitar odd do Over 3.5 quando o jogo já virou 4x1 (linha correta 5.5).
+    """
+    cached = last_odd_cache.get(fixture_id)
+    if not cached:
+        return None
+    cached_goals, cached_odd = cached
+    if cached_goals == total_goals:
+        return cached_odd
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +414,14 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
             except (TypeError, ValueError):
                 season = None
 
+            fixture_ts_raw = fixture.get("timestamp")
+            kickoff_ts: Optional[int] = None
+            try:
+                if fixture_ts_raw is not None:
+                    kickoff_ts = int(fixture_ts_raw)
+            except (TypeError, ValueError):
+                kickoff_ts = None
+
             fixtures.append(
                 {
                     "fixture_id": int(fixture.get("id")),
@@ -382,6 +436,7 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
                     "away_team_id": away_team_id,
                     "home_goals": int(home_goals),
                     "away_goals": int(away_goals),
+                    "kickoff_ts": kickoff_ts,
                 }
             )
         except Exception:
@@ -528,6 +583,9 @@ async def _fetch_live_odds_for_fixture(
         "1st period",
         "second period",
         "2nd period",
+        "team",
+        "both teams",
+        "btts",
     )
 
     def _extract_from_bookmaker(bm: Dict[str, Any], bm_id_label: Optional[int]) -> Optional[float]:
@@ -537,7 +595,7 @@ async def _fetch_live_odds_for_fixture(
 
         IMPORTANTE: agora a linha é lida primeiro do texto ("Over 1.5", "Over 2.5"),
         e só depois cai para o campo handicap. Isso reduz o risco de pegar a odd
-        da 2.5 com handicap errado.
+        de mercados de time (team totals, BTTS etc.).
         """
         bets = bm.get("bets") or []
         if not bets:
@@ -548,7 +606,7 @@ async def _fetch_live_odds_for_fixture(
         for bet in bets:
             name = (bet.get("name") or "").lower()
 
-            # Ignora mercados que não são de gols totais
+            # Ignora mercados que não são de gols totais do jogo
             if any(tok in name for tok in negative_tokens):
                 continue
             if (
@@ -577,10 +635,9 @@ async def _fetch_live_odds_for_fixture(
                 if odd_val <= 1.0:
                     continue
 
-                # --- NOVO: tentar pegar o número primeiro do texto "Over X.Y" ---
+                # --- tenta pegar o número primeiro do texto "Over X.Y" ---
                 line_num: Optional[float] = None
 
-                # 1) número no próprio texto ("Over 1.5", "Over 2,5" etc.)
                 for token in side_raw.replace(",", ".").split():
                     try:
                         line_num = float(token)
@@ -588,7 +645,7 @@ async def _fetch_live_odds_for_fixture(
                     except Exception:
                         continue
 
-                # 2) fallback: usar handicap se ainda não achou nada
+                # fallback: usar handicap se ainda não achou nada
                 if line_num is None:
                     handicap_raw = val.get("handicap")
                     if handicap_raw is not None:
@@ -785,7 +842,7 @@ async def _fetch_live_odds_for_fixture_odds_api(
     Busca odd em tempo real via The Odds API para a linha Over (soma do placar + 0,5).
     Usa:
       GET /v4/sports/{sport_key}/odds?regions=...&markets=totals&oddsFormat=decimal
-    e casa o evento pelo par (home_team, away_team).
+    e casa o evento pelo par (home_team, away_team) + horário (kickoff).
     """
     if not ODDS_API_KEY or not ODDS_API_USE:
         return None
@@ -845,13 +902,32 @@ async def _fetch_live_odds_for_fixture_odds_api(
     home_name_norm = _normalize_team_name(fixture.get("home_team") or "")
     away_name_norm = _normalize_team_name(fixture.get("away_team") or "")
 
-    matched_event: Optional[Dict[str, Any]] = None
+    fixture_ts = fixture.get("kickoff_ts")
+    fixture_dt: Optional[datetime] = None
+    if fixture_ts is not None:
+        try:
+            fixture_dt = datetime.fromtimestamp(int(fixture_ts), tz=timezone.utc)
+        except Exception:
+            fixture_dt = None
+
+    def _parse_commence_time(ev: Dict[str, Any]) -> Optional[datetime]:
+        ct_raw = ev.get("commence_time")
+        if not ct_raw:
+            return None
+        try:
+            ct_str = str(ct_raw)
+            if ct_str.endswith("Z"):
+                ct_str = ct_str.replace("Z", "+00:00")
+            return datetime.fromisoformat(ct_str)
+        except Exception:
+            return None
 
     def _names_match(a: str, b: str) -> bool:
         """
         Casa nomes tolerando variações tipo:
         - 'Twente' vs 'FC Twente Enschede'
         - 'AZ' vs 'AZ Alkmaar'
+        - 'Wolves' vs 'Wolverhampton Wanderers'
         """
         a = a.strip()
         b = b.strip()
@@ -861,28 +937,64 @@ async def _fetch_live_odds_for_fixture_odds_api(
         if a == b:
             return True
 
-        # prefixo/sufixo
+        # prefixo/sufixo simples
         if a in b or b in a:
             return True
 
-        # compartilham pelo menos 1 palavra mais forte (>=3 letras)
-        a_tokens = set(t for t in a.split() if len(t) >= 3)
-        b_tokens = set(t for t in b.split() if len(t) >= 3)
-        return len(a_tokens & b_tokens) >= 1
+        a_tokens_all = [t for t in a.split() if t]
+        b_tokens_all = [t for t in b.split() if t]
+
+        a_tokens = set(t for t in a_tokens_all if len(t) >= 3)
+        b_tokens = set(t for t in b_tokens_all if len(t) >= 3)
+        if len(a_tokens & b_tokens) >= 1:
+            return True
+
+        # novo: checa prefixo de 3–4 letras em tokens
+        for ta in a_tokens:
+            for tb in b_tokens:
+                n = min(len(ta), len(tb), 4)
+                if n >= 3 and ta[:n] == tb[:n]:
+                    return True
+
+        return False
+
+    direct_candidates: List[Tuple[Dict[str, Any], float]] = []
+    swap_candidates: List[Tuple[Dict[str, Any], float]] = []
 
     for ev in events:
         ev_home = _normalize_team_name(str(ev.get("home_team") or ""))
         ev_away = _normalize_team_name(str(ev.get("away_team") or ""))
 
+        ev_dt = _parse_commence_time(ev)
+        if fixture_dt is not None and ev_dt is not None:
+            diff_min = abs((ev_dt - fixture_dt).total_seconds()) / 60.0
+        else:
+            diff_min = 999999.0
+
         # home/away normal
         if _names_match(ev_home, home_name_norm) and _names_match(ev_away, away_name_norm):
-            matched_event = ev
-            break
+            direct_candidates.append((ev, diff_min))
+            continue
 
         # fallback invertido (por segurança)
         if _names_match(ev_home, away_name_norm) and _names_match(ev_away, home_name_norm):
-            matched_event = ev
-            break
+            swap_candidates.append((ev, diff_min))
+            continue
+
+    matched_event: Optional[Dict[str, Any]] = None
+
+    chosen_diff = None
+    if direct_candidates:
+        ev_best, diff_best = min(direct_candidates, key=lambda t: t[1])
+        # se tiver horário confiável, rejeita se for muito distante (>4h)
+        if diff_best <= 240.0 or diff_best == 999999.0:
+            matched_event = ev_best
+            chosen_diff = diff_best
+    elif swap_candidates:
+        ev_best, diff_best = min(swap_candidates, key=lambda t: t[1])
+        if diff_best <= 240.0 or diff_best == 999999.0:
+            matched_event = ev_best
+            chosen_diff = diff_best
 
     if matched_event is None:
         logging.info(
@@ -892,6 +1004,20 @@ async def _fetch_live_odds_for_fixture_odds_api(
             sport_key,
         )
         return None
+
+    if chosen_diff is not None and chosen_diff != 999999.0:
+        logging.info(
+            "The Odds API: evento casado para fixture=%s (diferença de horário ~%.1f min, sport_key=%s)",
+            fixture.get("fixture_id"),
+            chosen_diff,
+            sport_key,
+        )
+    else:
+        logging.info(
+            "The Odds API: evento casado para fixture=%s (sem comparação confiável de horário, sport_key=%s)",
+            fixture.get("fixture_id"),
+            sport_key,
+        )
 
     bookmakers = matched_event.get("bookmakers") or []
     if not bookmakers:
@@ -2450,10 +2576,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         total_goals=total_goals,
                     )
                     if api_odd is not None:
-                        last_odd_cache[fx["fixture_id"]] = api_odd
+                        _update_last_odd_cache(fx["fixture_id"], total_goals, api_odd)
                         got_live_odd = True
                     else:
-                        cached_odd = last_odd_cache.get(fx["fixture_id"])
+                        cached_odd = _get_cached_odd_for_line(fx["fixture_id"], total_goals)
                         if cached_odd is not None:
                             api_odd = cached_odd
                             used_cache_odd = True
@@ -2462,7 +2588,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         "Erro inesperado ao buscar odds ao vivo (API-FOOTBALL) para fixture=%s",
                         fx["fixture_id"],
                     )
-                    cached_odd = last_odd_cache.get(fx["fixture_id"])
+                    cached_odd = _get_cached_odd_for_line(fx["fixture_id"], total_goals)
                     if cached_odd is not None:
                         api_odd = cached_odd
                         used_cache_odd = True
@@ -2485,7 +2611,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if oddsapi_odd is not None:
                         api_odd = oddsapi_odd
                         got_live_odd = True
-                        last_odd_cache[fx["fixture_id"]] = api_odd
+                        _update_last_odd_cache(fx["fixture_id"], total_goals, api_odd)
 
                 # 3) Se nenhuma fonte trouxe odd (nem cache), ignora o jogo
                 if api_odd is None:
@@ -2497,7 +2623,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 if used_cache_odd and not got_live_odd:
                     logging.info(
-                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay).",
+                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay, mesma linha SUM_PLUS_HALF).",
                         fx["fixture_id"],
                     )
 
