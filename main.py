@@ -189,6 +189,8 @@ ODDS_API_BOOKMAKERS: List[str] = [
     if s.strip()
 ]
 
+# Limite diário de chamadas à The Odds API (para proteger o plano grátis)
+ODDS_API_DAILY_LIMIT: int = _get_env_int("ODDS_API_DAILY_LIMIT", 15)
 
 # ---------------------------------------------------------------------------
 # Ratings pré-jogo (manual por enquanto)
@@ -241,6 +243,10 @@ fixture_events_cache: Dict[int, Dict[str, Any]] = {}
 # chave "team_id:season" -> {player_id -> rating_ofensivo}
 team_player_ratings_cache: Dict[str, Dict[int, float]] = {}
 team_player_ratings_ts: Dict[str, datetime] = {}
+
+# Controle simples de consumo diário da The Odds API (aproximado, só em memória)
+oddsapi_calls_today: int = 0        # quantas chamadas foram feitas hoje
+oddsapi_calls_date_key: str = ""    # dia (UTC) em que o contador foi atualizado
 
 
 def _now_utc() -> datetime:
@@ -847,6 +853,23 @@ async def _fetch_live_odds_for_fixture_odds_api(
     if not ODDS_API_KEY or not ODDS_API_USE:
         return None
 
+    # Controle de limite diário (aproximado, só em memória)
+    global oddsapi_calls_today, oddsapi_calls_date_key
+
+    today_key = _now_utc().strftime("%Y-%m-%d")
+    if oddsapi_calls_date_key != today_key:
+        # Mudou o dia (UTC) → reseta contador
+        oddsapi_calls_date_key = today_key
+        oddsapi_calls_today = 0
+
+    if ODDS_API_DAILY_LIMIT > 0 and oddsapi_calls_today >= ODDS_API_DAILY_LIMIT:
+        logging.info(
+            "The Odds API: limite diário de chamadas atingido (%s); pulando fixture=%s",
+            ODDS_API_DAILY_LIMIT,
+            fixture.get("fixture_id"),
+        )
+        return None
+
     league_id = fixture.get("league_id")
     sport_key = None
 
@@ -881,6 +904,21 @@ async def _fetch_live_odds_for_fixture_odds_api(
             params=params,
             timeout=10.0,
         )
+
+        # contamos essa chamada no limite diário
+        oddsapi_calls_today += 1
+
+        # (opcional) loga o header de créditos restantes se a API informar
+        remaining = (
+            resp.headers.get("x-requests-remaining")
+            or resp.headers.get("X-Requests-Remaining")
+        )
+        if remaining is not None:
+            logging.info(
+                "The Odds API: chamadas restantes reportadas pelo provedor: %s",
+                remaining,
+            )
+
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -2888,6 +2926,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "ODDS_API_BOOKMAKERS: {bk}".format(
             bk=",".join(ODDS_API_BOOKMAKERS) if ODDS_API_BOOKMAKERS else "todos"
         ),
+        "ODDS_API_DAILY_LIMIT: {lim}".format(lim=ODDS_API_DAILY_LIMIT),
+        "ODDS_API chamadas hoje (aprox.): {cnt}".format(cnt=oddsapi_calls_today),
         "",
         "Último scan:",
         "  origem: {origin}".format(origin=last_scan_origin),
