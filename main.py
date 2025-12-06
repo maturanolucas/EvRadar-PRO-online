@@ -192,6 +192,10 @@ ODDS_API_BOOKMAKERS: List[str] = [
 # Limite diário de chamadas à The Odds API (para proteger o plano grátis)
 ODDS_API_DAILY_LIMIT: int = _get_env_int("ODDS_API_DAILY_LIMIT", 15)
 
+# NOVO: modo de alerta manual quando não houver odd nas APIs
+ALLOW_ALERTS_WITHOUT_ODDS: int = _get_env_int("ALLOW_ALERTS_WITHOUT_ODDS", 1)
+MANUAL_MIN_ODD_HINT: float = _get_env_float("MANUAL_MIN_ODD_HINT", 1.47)
+
 # ---------------------------------------------------------------------------
 # Ratings pré-jogo (manual por enquanto)
 # ---------------------------------------------------------------------------
@@ -2500,14 +2504,97 @@ def _format_watch_text(
     return "\n".join(lines)
 
 
+def _format_manual_no_odds_text(
+    fixture: Dict[str, Any],
+    metrics: Dict[str, float],
+) -> str:
+    """
+    Alerta MANUAL quando não há odd em nenhuma API, mas o jogo está no teu padrão.
+
+    Ideia:
+    - Mostrar probabilidade do modelo e odd justa.
+    - Deixar claro que NÃO temos odd ao vivo.
+    - Orientar a só considerar entrada se a odd real estiver ≥ MANUAL_MIN_ODD_HINT.
+    """
+    jogo = "{home} vs {away} — {league}".format(
+        home=fixture["home_team"],
+        away=fixture["away_team"],
+        league=fixture["league_name"],
+    )
+    minuto = fixture["minute"]
+    placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
+
+    total_goals = fixture["home_goals"] + fixture["away_goals"]
+    linha_gols = total_goals + 0.5
+    linha_str = "Over {v:.1f}".format(v=linha_gols)
+
+    p_final = metrics["p_final"] * 100.0
+    odd_fair = metrics["odd_fair"]
+    pressure_score = metrics["pressure_score"]
+    context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
+    lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
+
+    interpretacao_parts: List[str] = []
+
+    if pressure_score >= 7.5:
+        interpretacao_parts.append("pressão ofensiva alta (perfil de gol forte)")
+    elif pressure_score >= 5.0:
+        interpretacao_parts.append("pressão boa para busca de mais 1 gol")
+    else:
+        interpretacao_parts.append("pressão ok, mas dentro do limite mínimo")
+
+    if context_boost_prob > 0.0:
+        interpretacao_parts.append("contexto/placar indicam necessidade real de gol")
+    elif context_boost_prob < 0.0:
+        interpretacao_parts.append("contexto não empurra tanto por mais gols (atenção)")
+
+    if lucas_boost_prob > 0.0:
+        interpretacao_parts.append("cenário encaixado no teu padrão (Lucas boost)")
+
+    interpretacao_parts.append(
+        "sem odd nas APIs; usar apenas como radar de padrão e conferir preço na casa"
+    )
+
+    interpretacao = " / ".join(interpretacao_parts)
+
+    lines: List[str] = [
+        "⚠️ Alerta manual (sem odd nas APIs)",
+        "🏟️ {jogo}".format(jogo=jogo),
+        "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
+        "⚙️ Linha sugerida: {linha}".format(linha=linha_str),
+        "📊 Probabilidade do modelo: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
+            p=p_final,
+            odd_j=odd_fair,
+        ),
+        "ℹ️ Nenhuma odd ao vivo disponível (API-FOOTBALL / The Odds API / cache).",
+        "",
+        "🧩 Interpretação:",
+        interpretacao,
+        "",
+        "🎯 Plano de ação:",
+        "- Abrir o mercado de {linha} na {book} e só considerar entrada se a odd atual".format(
+            linha=linha_str,
+            book=BOOKMAKER_NAME,
+        ),
+        "  estiver ≥ {mn:.2f} (e o ritmo/pressão continuarem fortes).".format(
+            mn=MANUAL_MIN_ODD_HINT,
+        ),
+        "",
+        "🔗 Referência de mercado: {book} → {url}".format(
+            book=BOOKMAKER_NAME,
+            url=BOOKMAKER_URL,
+        ),
+    ]
+    return "\n".join(lines)
+
+
 def _format_pattern_only_text(
     fixture: Dict[str, Any],
     metrics: Dict[str, float],
 ) -> str:
     """
-    (Atualmente NÃO usado)
+    (Atualmente não usado diretamente; mantido como backup)
     Alerta de PADRÃO FORTE quando a API não trouxer odd nem cache.
-    Mantido aqui caso você queira reativar esse modo no futuro.
     """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
@@ -2569,6 +2656,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     Tipos de alerta:
     - ALERTA NORMAL: cenário bom + odd dentro da faixa [MIN_ODD, MAX_ODD]
     - ALERTA OBSERVAÇÃO: cenário bom + odd POSITIVA mas abaixo de MIN_ODD
+    - ALERTA MANUAL: jogo muito no padrão, mas SEM odd nas APIs (você julga o preço)
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -2651,20 +2739,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         got_live_odd = True
                         _update_last_odd_cache(fx["fixture_id"], total_goals, api_odd)
 
-                # 3) Se nenhuma fonte trouxe odd (nem cache), ignora o jogo
-                if api_odd is None:
-                    logging.info(
-                        "Fixture %s sem odd ao vivo (API-FOOTBALL/The Odds API) e sem cache; ignorando jogo.",
-                        fx["fixture_id"],
-                    )
-                    continue
-
-                if used_cache_odd and not got_live_odd:
-                    logging.info(
-                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay, mesma linha SUM_PLUS_HALF).",
-                        fx["fixture_id"],
-                    )
-
+                # 3) Boosts que não dependem de odd (sempre calculados)
                 news_boost_prob = 0.0
                 try:
                     news_boost_prob = await _fetch_news_boost_for_fixture(
@@ -2706,6 +2781,84 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             fx["fixture_id"],
                         )
                         player_boost_prob = 0.0
+
+                # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
+                if api_odd is None:
+                    logging.info(
+                        "Fixture %s sem odd ao vivo (API-FOOTBALL/The Odds API) e sem cache.",
+                        fx["fixture_id"],
+                    )
+
+                    if not ALLOW_ALERTS_WITHOUT_ODDS:
+                        logging.info(
+                            "ALLOW_ALERTS_WITHOUT_ODDS=0; ignorando fixture %s.",
+                            fx["fixture_id"],
+                        )
+                        continue
+
+                    # Calcula probabilidade e pressão, sem EV baseado em odd real
+                    metrics = _estimate_prob_and_odd(
+                        minute=fx["minute"],
+                        stats=stats,
+                        home_goals=fx["home_goals"],
+                        away_goals=fx["away_goals"],
+                        forced_odd_current=None,
+                        news_boost_prob=news_boost_prob,
+                        pregame_boost_prob=pregame_boost_prob,
+                        player_boost_prob=player_boost_prob,
+                        context_boost_prob=context_boost_prob,
+                    )
+
+                    # Filtros de contexto / goleada / pressão semelhantes aos alertas normais
+                    score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
+                    minute_int = fx["minute"] or 0
+                    try:
+                        minute_int = int(minute_int)
+                    except (TypeError, ValueError):
+                        minute_int = 0
+
+                    # Goleada a partir dos 55' → em geral você ignora
+                    if abs(score_diff) >= 3 and minute_int >= 55:
+                        continue
+
+                    context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
+                    if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
+                        # contexto muito negativo (favorito confortável etc.)
+                        continue
+
+                    if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
+                        continue
+
+                    # Limiar de probabilidade para valer um alerta manual:
+                    # precisa ser maior que o break-even da odd mínima sugerida
+                    if MANUAL_MIN_ODD_HINT > 1.0:
+                        prob_min_for_manual = 1.0 / MANUAL_MIN_ODD_HINT
+                    else:
+                        prob_min_for_manual = 0.68  # fallback seguro
+
+                    if metrics["p_final"] < prob_min_for_manual:
+                        # prob baixa demais para o preço-alvo (ex.: < 1/1.47)
+                        continue
+
+                    # Cooldown por jogo
+                    now = _now_utc()
+                    fixture_id = fx["fixture_id"]
+                    last_ts = fixture_last_alert_at.get(fixture_id)
+                    if last_ts is not None:
+                        if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
+                            continue
+
+                    alert_text = _format_manual_no_odds_text(fx, metrics)
+                    alerts.append(alert_text)
+                    fixture_last_alert_at[fixture_id] = now
+                    continue  # pula restante da lógica (sem odd real)
+
+                # 5) Fluxo normal com odd real
+                if used_cache_odd and not got_live_odd:
+                    logging.info(
+                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay, mesma linha SUM_PLUS_HALF).",
+                        fx["fixture_id"],
+                    )
 
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
@@ -2817,6 +2970,7 @@ async def autoscan_loop(application: Application) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autoscan_status = "ativado" if AUTOSTART else "desativado"
     player_layer_status = "ligada" if USE_PLAYER_IMPACT else "desligada"
+    manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
 
     lines = [
         "👋 EvRadar PRO online (cérebro v0.3-lite: odds reais + news + pré-jogo auto + camada de jogadores).",
@@ -2824,6 +2978,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "Alertas sem odd na API (manual): {m} (odd mínima sugerida ≥ {od:.2f})".format(
+            m=manual_mode_status,
+            od=MANUAL_MIN_ODD_HINT,
+        ),
         "Banca virtual para sugestão: R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
         "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
@@ -2879,6 +3037,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "ALLOW_ALERTS_WITHOUT_ODDS: {v}".format(v=ALLOW_ALERTS_WITHOUT_ODDS),
+        "MANUAL_MIN_ODD_HINT: {v:.2f}".format(v=MANUAL_MIN_ODD_HINT),
         "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "COOLDOWN_MINUTES: {cd} min".format(cd=COOLDOWN_MINUTES),
         "BANKROLL_INITIAL (banca virtual): R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
