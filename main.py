@@ -1829,6 +1829,8 @@ def _compute_score_context_boost(
     - Favorito empatando → leve boost (especialmente se for o mandante).
     - Favorito ganhando, principalmente em casa e por 2+ gols → penalização forte
       (torneira fecha, necessidade cai).
+    - NOVO: mandante claramente "under" (rating_home bem negativo) e vencendo
+      → cenário estruturalmente ruim para over, penalizado com força.
     """
 
     home_goals = fixture.get("home_goals") or 0
@@ -1840,6 +1842,9 @@ def _compute_score_context_boost(
         minute_int = 0
 
     score_diff = home_goals - away_goals  # >0 = mandante na frente
+
+    # NOVO: identifica mandante "claramente under" pela nota automática
+    home_under = rating_home <= -0.7
 
     # Detecta favorito a partir dos ratings pré-jogo (auto ou manual)
     diff_rating = rating_home - rating_away
@@ -1918,6 +1923,15 @@ def _compute_score_context_boost(
         else:
             # goleada sem favorito claro → tende a esfriar
             boost = -0.03
+
+    # NOVO: penalização extra se o mandante for claramente under e estiver vencendo
+    if home_under and score_diff > 0 and minute_int >= 50:
+        # se for vitória magra, já é ruim; se for 2+ gols, pior ainda
+        margin = score_diff
+        if margin >= 2:
+            boost -= 0.06
+        else:
+            boost -= 0.04
 
     # Escala suave pelo minuto (mais peso na janela do radar)
     if minute_int <= 30:
@@ -1998,13 +2012,14 @@ async def _get_pregame_boost_auto(
 async def _get_pregame_boost_for_fixture(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     """
     Retorna:
-        (pregame_boost_prob, context_boost_prob)
+        (pregame_boost_prob, context_boost_prob, rating_home, rating_away)
 
     pregame_boost_prob → pré-jogo manual + automático
     context_boost_prob → ajuste de necessidade de gol (favorito x placar x casa/fora)
+    rating_home / rating_away → ratings usados para detectar cenário under, etc.
     """
     manual_boost = _get_pregame_boost_manual(fixture)
 
@@ -2056,7 +2071,7 @@ async def _get_pregame_boost_for_fixture(
     if context_boost < -0.05:
         context_boost = -0.05
 
-    return pregame_total, context_boost
+    return pregame_total, context_boost, rating_home, rating_away
 
 
 # ---------------------------------------------------------------------------
@@ -2755,8 +2770,15 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 pregame_boost_prob = 0.0
                 context_boost_prob = 0.0
+                rating_home = 0.0
+                rating_away = 0.0
                 try:
-                    pregame_boost_prob, context_boost_prob = await _get_pregame_boost_for_fixture(
+                    (
+                        pregame_boost_prob,
+                        context_boost_prob,
+                        rating_home,
+                        rating_away,
+                    ) = await _get_pregame_boost_for_fixture(
                         client=client,
                         fixture=fx,
                     )
@@ -2767,6 +2789,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     )
                     pregame_boost_prob = 0.0
                     context_boost_prob = 0.0
+                    rating_home = 0.0
+                    rating_away = 0.0
 
                 player_boost_prob = 0.0
                 if USE_PLAYER_IMPACT:
@@ -2781,6 +2805,9 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             fx["fixture_id"],
                         )
                         player_boost_prob = 0.0
+
+                # Flag de mandante claramente under (para filtros duros)
+                home_under = rating_home <= -0.7
 
                 # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
                 if api_odd is None:
@@ -2816,6 +2843,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         minute_int = int(minute_int)
                     except (TypeError, ValueError):
                         minute_int = 0
+
+                    # NOVO: corte duro se mandante under estiver vencendo (cenário que você evita)
+                    if home_under and score_diff > 0 and minute_int >= 50:
+                        continue
 
                     # Goleada a partir dos 55' → em geral você ignora
                     if abs(score_diff) >= 3 and minute_int >= 55:
@@ -2881,6 +2912,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     minute_int = int(minute_int)
                 except (TypeError, ValueError):
                     minute_int = 0
+
+                # NOVO: corte duro se mandante under estiver vencendo a partir dos 50'
+                if home_under and score_diff > 0 and minute_int >= 50:
+                    continue
 
                 if abs(score_diff) >= 3 and minute_int >= 55:
                     # goleada a partir dos 55' → quase sempre torneira fechada pra você
