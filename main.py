@@ -3269,13 +3269,35 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """
     Mostra um status rápido para consulta no meio do trampo.
     """
+    autoscan_status = "ativado" if AUTOSTART else "desativado"
+    player_layer_status = "ligada" if USE_PLAYER_IMPACT else "desligada"
+    manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
+
     lines = [
         "📊 Status do EvRadar PRO",
         last_status_text,
         "",
-        "Origem do último scan: {origin}".format(origin=last_scan_origin),
-        "Eventos ao vivo considerados: {live}".format(live=last_scan_window_matches),
-        "Alertas enviados no último scan: {alerts}".format(alerts=last_scan_alerts),
+        "Origem do último scan: {orig}".format(orig=last_scan_origin),
+        "Eventos na janela/ligas na última varredura: {cnt}".format(
+            cnt=last_scan_window_matches
+        ),
+        "Alertas gerados na última varredura: {al}".format(al=last_scan_alerts),
+        "",
+        "Configuração atual:",
+        "- Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
+        "- EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
+        "- Odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "- Pressão mínima: {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
+        "- Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
+        "- Alertas sem odd (manual): {m} (limiar ≥ {od:.2f})".format(
+            m=manual_mode_status,
+            od=MANUAL_MIN_ODD_HINT,
+        ),
+        "- Camada de jogadores: {pl}".format(pl=player_layer_status),
+        "- Autoscan: {auto} (intervalo {sec}s)".format(
+            auto=autoscan_status,
+            sec=CHECK_INTERVAL,
+        ),
     ]
     if update.message:
         await update.message.reply_text("\n".join(lines))
@@ -3283,48 +3305,34 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Info técnica/rápida pra você checar se o radar está rodando como esperado.
+    Debug rápido de ambiente e consumo de APIs.
     """
-    leagues_str = ", ".join(str(lid) for lid in LEAGUE_IDS) if LEAGUE_IDS else "todas (sem filtro)"
+    global oddsapi_calls_today, oddsapi_calls_date_key
 
     lines = [
         "🛠 Debug EvRadar PRO",
         "",
-        "Janela: {ws}–{we}ʼ | Pressão mínima: {ps:.1f}".format(
-            ws=WINDOW_START,
-            we=WINDOW_END,
-            ps=MIN_PRESSURE_SCORE,
-        ),
-        "EV mínimo: {ev:.2f}% | Odds: {mn:.2f}–{mx:.2f}".format(
-            ev=EV_MIN_PCT,
-            mn=MIN_ODD,
-            mx=MAX_ODD,
-        ),
-        "Cooldown por fixture: {cd} min".format(cd=COOLDOWN_MINUTES),
-        "",
-        "Ligas monitoradas (API-FOOTBALL):",
-        leagues_str,
-        "",
-        "API_FOOTBALL_KEY configurada: {ok}".format(
-            ok="sim" if bool(API_FOOTBALL_KEY) else "NÃO"
-        ),
-        "USE_API_PREGAME: {v}".format(v=USE_API_PREGAME),
+        "API_FOOTBALL_KEY definido: {ok}".format(ok="sim" if bool(API_FOOTBALL_KEY) else "não"),
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
-        "ODDS_API_USE: {v} | limite diário: {lim}".format(
-            v=ODDS_API_USE,
-            lim=ODDS_API_DAILY_LIMIT,
-        ),
-        "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
+        "USE_API_PREGAME: {v}".format(v=USE_API_PREGAME),
         "USE_PLAYER_IMPACT: {v}".format(v=USE_PLAYER_IMPACT),
+        "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
         "",
-        "Autoscan: {auto} (intervalo {sec}s)".format(
-            auto="ativado" if AUTOSTART else "desativado",
-            sec=CHECK_INTERVAL,
-        ),
+        "The Odds API:",
+        "- ODDS_API_USE: {v}".format(v=ODDS_API_USE),
+        "- Chave definida: {ok}".format(ok="sim" if bool(ODDS_API_KEY) else "não"),
+        "- Limite diário configurado: {lim}".format(lim=ODDS_API_DAILY_LIMIT),
+        "- Data do contador: {day}".format(day=oddsapi_calls_date_key or "n/d"),
+        "- Chamadas hoje (aprox): {calls}".format(calls=oddsapi_calls_today),
         "",
-        "Cache de odds (fixtures com última odd conhecida): {n}".format(
-            n=len(last_odd_cache),
-        ),
+        "Cache interno:",
+        "- Fixtures com odd em cache: {n}".format(n=len(last_odd_cache)),
+        "- Times com pré-jogo auto em cache: {n}".format(n=len(pregame_auto_cache)),
+        "- Fixtures com lineups em cache: {n}".format(n=len(fixture_lineups_cache)),
+        "- Fixtures com eventos em cache: {n}".format(n=len(fixture_events_cache)),
+        "",
+        "Ligas configuradas (LEAGUE_IDS):",
+        str(LEAGUE_IDS),
     ]
     if update.message:
         await update.message.reply_text("\n".join(lines))
@@ -3332,23 +3340,19 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Links rápidos: casa, docs das APIs, etc.
+    Links rápidos (bookmaker, SofaScore, etc.).
     """
+    sofascore_url = "https://www.sofascore.com/"
     lines = [
         "🔗 Links úteis",
         "",
-        "🏦 Casa principal: {name}".format(name=BOOKMAKER_NAME),
-        "   {url}".format(url=BOOKMAKER_URL),
+        "📒 Bookmaker principal:",
+        "- {name}: {url}".format(name=BOOKMAKER_NAME, url=BOOKMAKER_URL),
         "",
-        "📚 API-FOOTBALL (documentação v3):",
-        "   https://www.api-football.com/documentation-v3",
+        "📊 Estatísticas ao vivo:",
+        "- SofaScore: {url}".format(url=sofascore_url),
         "",
-        "📚 The Odds API (documentação):",
-        "   https://the-odds-api.com/",
-        "",
-        "🧠 Lembrete:",
-        "- Entrar sempre por over SUM_PLUS_HALF (soma do placar + 0.5).",
-        "- Evitar goleadas, mandante under vencendo e empates under/equilibrados sem favorito forte amassando.",
+        "Dica: deixa o SofaScore aberto na mesma tela e só confere os sinais que o radar mandar.",
     ]
     if update.message:
         await update.message.reply_text("\n".join(lines))
@@ -3360,50 +3364,41 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(application: Application) -> None:
     """
-    Hook chamado pelo Application antes de iniciar o polling.
-    Aqui ligamos o autoscan via create_task (sem JobQueue).
+    Hook pós-init: dispara autoscan se AUTOSTART=1.
     """
     if AUTOSTART:
-        try:
-            application.create_task(autoscan_loop(application), name="autoscan_loop")
-            logging.info("Autoscan agendado no post_init (AUTOSTART=1).")
-        except Exception:
-            logging.exception("Falha ao iniciar autoscan no post_init")
-
-
-def _setup_logging() -> None:
-    """
-    Configura logging simples para rodar no Railway / local.
-    """
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.INFO,
-    )
+        # cria tarefa em background (loop interno do PTB)
+        application.create_task(autoscan_loop(application), name="autoscan_loop")
+        logging.info("Autoscan agendado no post_init (AUTOSTART=1).")
 
 
 def main() -> None:
-    _setup_logging()
+    """
+    Entry point do EvRadar PRO.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     if not TELEGRAM_BOT_TOKEN:
         logging.error("TELEGRAM_BOT_TOKEN não definido. Configure o token do bot e reinicie.")
         return
 
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Handlers
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("scan", cmd_scan))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("debug", cmd_debug))
-    application.add_handler(CommandHandler("links", cmd_links))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("links", cmd_links))
 
-    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
-    application.run_polling(close_loop=False)
+    # post_init para autoscan
+    app.post_init = _post_init  # type: ignore[assignment]
+
+    logging.info("Iniciando bot do EvRadar PRO (v0.3-lite)...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
