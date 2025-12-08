@@ -216,10 +216,9 @@ PREMATCH_TEAM_RATINGS:
 - Se um time não estiver aqui, assume 0.0 (neutro).
 """
 PREMATCH_TEAM_RATINGS: Dict[str, float] = {
-    # Ajuste conforme teu faro
+    # Ajuste conforme teu faro, ex.:
     # "Nice": -0.8,
     # "Famalicão": -1.0,
-    # ...
 }
 
 
@@ -3240,165 +3239,178 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /debug  → info técnica",
         "  /links  → links úteis / bookmaker",
     ]
-    if update.message:
-        await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)..."
-        )
-
-    alerts = await run_scan_cycle(origin="manual", application=context.application)
-
-    if not alerts:
-        if update.message:
-            await update.message.reply_text(last_status_text)
-        return
-
-    for text in alerts:
-        if update.message:
-            await update.message.reply_text(text)
-
-    if update.message:
-        await update.message.reply_text(last_status_text)
+    text = "\n".join(lines)
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(text)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception:
+        logging.exception("Erro ao enviar resposta do /start")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Mostra um status rápido para consulta no meio do trampo.
-    """
-    autoscan_status = "ativado" if AUTOSTART else "desativado"
-    player_layer_status = "ligada" if USE_PLAYER_IMPACT else "desligada"
-    manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
-
     lines = [
-        "📊 Status do EvRadar PRO",
+        "📊 Último status do EvRadar PRO:",
+        "",
         last_status_text,
         "",
-        "Origem do último scan: {orig}".format(orig=last_scan_origin),
-        "Eventos na janela/ligas na última varredura: {cnt}".format(
-            cnt=last_scan_window_matches
+        "Origem da última varredura: {o}".format(o=last_scan_origin),
+        "Eventos analisados na janela/ligas: {live}".format(
+            live=last_scan_window_matches
         ),
-        "Alertas gerados na última varredura: {al}".format(al=last_scan_alerts),
-        "",
-        "Configuração atual:",
-        "- Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
-        "- EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
-        "- Odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
-        "- Pressão mínima: {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
-        "- Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
-        "- Alertas sem odd (manual): {m} (limiar ≥ {od:.2f})".format(
-            m=manual_mode_status,
-            od=MANUAL_MIN_ODD_HINT,
-        ),
-        "- Camada de jogadores: {pl}".format(pl=player_layer_status),
-        "- Autoscan: {auto} (intervalo {sec}s)".format(
-            auto=autoscan_status,
-            sec=CHECK_INTERVAL,
+        "Alertas enviados na última varredura: {al}".format(
+            al=last_scan_alerts
         ),
     ]
-    if update.message:
-        await update.message.reply_text("\n".join(lines))
+    text = "\n".join(lines)
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(text)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception:
+        logging.exception("Erro ao enviar resposta do /status")
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(
+                "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)..."
+            )
+    except Exception:
+        logging.exception("Erro ao enviar mensagem inicial do /scan")
+
+    alerts: List[str] = []
+    try:
+        alerts = await run_scan_cycle(origin="manual", application=context.application)
+    except Exception:
+        logging.exception("Erro ao rodar run_scan_cycle(manual)")
+
+    # Envia alertas (se houver)
+    if update.effective_chat and alerts:
+        for text in alerts:
+            try:
+                await update.effective_chat.send_message(text)
+            except Exception:
+                logging.exception("Erro ao enviar alerta de /scan")
+
+    # Resumo final
+    try:
+        resumo = last_status_text
+        if update.effective_chat:
+            await update.effective_chat.send_message(resumo)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=resumo)
+    except Exception:
+        logging.exception("Erro ao enviar resumo final do /scan")
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Debug rápido de ambiente e consumo de APIs.
-    """
-    global oddsapi_calls_today, oddsapi_calls_date_key
+    def _mask(key: str) -> str:
+        if not key:
+            return "(vazio)"
+        if len(key) <= 6:
+            return key[0:2] + "..." + key[-2:]
+        return key[0:4] + "..." + key[-4:]
 
     lines = [
         "🛠 Debug EvRadar PRO",
         "",
-        "API_FOOTBALL_KEY definido: {ok}".format(ok="sim" if bool(API_FOOTBALL_KEY) else "não"),
+        "LEAGUE_IDS: {ids}".format(ids=",".join(str(x) for x in LEAGUE_IDS) or "(nenhuma)"),
+        "WINDOW_START/END: {ws}/{we}".format(ws=WINDOW_START, we=WINDOW_END),
+        "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
+        "MIN_ODD/MAX_ODD: {mn:.2f}/{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "MIN_PRESSURE_SCORE: {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
+        "COOLDOWN_MINUTES: {cd}".format(cd=COOLDOWN_MINUTES),
+        "",
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
+        "BOOKMAKER_ID: {v}".format(v=BOOKMAKER_ID),
+        "BOOKMAKER_FALLBACK_IDS: {v}".format(
+            v=",".join(str(x) for x in BOOKMAKER_FALLBACK_IDS) or "(nenhum)"
+        ),
+        "ODDS_BET_ID: {v}".format(v=ODDS_BET_ID),
+        "",
         "USE_API_PREGAME: {v}".format(v=USE_API_PREGAME),
         "USE_PLAYER_IMPACT: {v}".format(v=USE_PLAYER_IMPACT),
         "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
         "",
-        "The Odds API:",
-        "- ODDS_API_USE: {v}".format(v=ODDS_API_USE),
-        "- Chave definida: {ok}".format(ok="sim" if bool(ODDS_API_KEY) else "não"),
-        "- Limite diário configurado: {lim}".format(lim=ODDS_API_DAILY_LIMIT),
-        "- Data do contador: {day}".format(day=oddsapi_calls_date_key or "n/d"),
-        "- Chamadas hoje (aprox): {calls}".format(calls=oddsapi_calls_today),
+        "ODDS_API_USE: {v}".format(v=ODDS_API_USE),
+        "ODDS_API_DAILY_LIMIT: {v}".format(v=ODDS_API_DAILY_LIMIT),
+        "ODDS_API_LEAGUE_MAP: {v}".format(v=ODDS_API_LEAGUE_MAP or "{}"),
         "",
-        "Cache interno:",
-        "- Fixtures com odd em cache: {n}".format(n=len(last_odd_cache)),
-        "- Times com pré-jogo auto em cache: {n}".format(n=len(pregame_auto_cache)),
-        "- Fixtures com lineups em cache: {n}".format(n=len(fixture_lineups_cache)),
-        "- Fixtures com eventos em cache: {n}".format(n=len(fixture_events_cache)),
-        "",
-        "Ligas configuradas (LEAGUE_IDS):",
-        str(LEAGUE_IDS),
+        "API_FOOTBALL_KEY: {v}".format(v=_mask(API_FOOTBALL_KEY)),
+        "ODDS_API_KEY: {v}".format(v=_mask(ODDS_API_KEY)),
+        "NEWS_API_KEY: {v}".format(v=_mask(NEWS_API_KEY)),
     ]
-    if update.message:
-        await update.message.reply_text("\n".join(lines))
+    text = "\n".join(lines)
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(text)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception:
+        logging.exception("Erro ao enviar resposta do /debug")
 
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Links rápidos (bookmaker, SofaScore, etc.).
-    """
-    sofascore_url = "https://www.sofascore.com/"
     lines = [
-        "🔗 Links úteis",
+        "🔗 Links úteis EvRadar PRO",
         "",
-        "📒 Bookmaker principal:",
-        "- {name}: {url}".format(name=BOOKMAKER_NAME, url=BOOKMAKER_URL),
+        "Casa/base para operar:",
+        "- {book}: {url}".format(book=BOOKMAKER_NAME, url=BOOKMAKER_URL),
         "",
-        "📊 Estatísticas ao vivo:",
-        "- SofaScore: {url}".format(url=sofascore_url),
+        "APIs utilizadas (requer chaves configuradas no Railway/.env):",
+        "- API-FOOTBALL (fixtures, estatísticas, odds): https://www.api-football.com/",
+        "- The Odds API (odds globais): https://the-odds-api.com/",
+        "- NewsAPI (notícias): https://newsapi.org/",
         "",
-        "Dica: deixa o SofaScore aberto na mesma tela e só confere os sinais que o radar mandar.",
+        "Dica: mantém essas chaves em variáveis de ambiente e NUNCA commita pro GitHub.",
     ]
-    if update.message:
-        await update.message.reply_text("\n".join(lines))
+    text = "\n".join(lines)
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(text)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception:
+        logging.exception("Erro ao enviar resposta do /links")
 
 
 # ---------------------------------------------------------------------------
-# Setup / main
+# Função main / bootstrap do bot
 # ---------------------------------------------------------------------------
-
-async def _post_init(application: Application) -> None:
-    """
-    Hook pós-init: dispara autoscan se AUTOSTART=1.
-    """
-    if AUTOSTART:
-        # cria tarefa em background (loop interno do PTB)
-        application.create_task(autoscan_loop(application), name="autoscan_loop")
-        logging.info("Autoscan agendado no post_init (AUTOSTART=1).")
-
 
 def main() -> None:
-    """
-    Entry point do EvRadar PRO.
-    """
     logging.basicConfig(
-        level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        level=logging.INFO,
     )
+    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
 
     if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN não definido. Configure o token do bot e reinicie.")
+        logging.error("TELEGRAM_BOT_TOKEN não definido; encerrando.")
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("links", cmd_links))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("scan", cmd_scan))
+    application.add_handler(CommandHandler("debug", cmd_debug))
+    application.add_handler(CommandHandler("links", cmd_links))
 
-    # post_init para autoscan
-    app.post_init = _post_init  # type: ignore[assignment]
+    # Autoscan via post_init (evita warning de create_task antes do start)
+    if AUTOSTART:
+        async def _post_init(app: Application) -> None:
+            app.create_task(autoscan_loop(app), name="autoscan_loop")
 
-    logging.info("Iniciando bot do EvRadar PRO (v0.3-lite)...")
-    app.run_polling(drop_pending_updates=True)
+        application.post_init = _post_init  # type: ignore[assignment]
+
+    # Polling
+    application.run_polling()
 
 
 if __name__ == "__main__":
