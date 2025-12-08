@@ -19,6 +19,12 @@ Features:
     - Stats por time/temporada (API-FOOTBALL /players)
     - Lineups + substituições (fixtures/lineups + fixtures/events)
     - Boost de probabilidade conforme “peso ofensivo” do XI atual
+- Filtros de contexto alinhados ao teu faro:
+    - Times under vs over (ataque/defesa por gols/jogo)
+    - Flag match_super_under (duas equipes bem under)
+    - Muito mais cautela em EMPATES (só libera favorito forte + pressão alta + defesa frágil)
+    - Mandante claramente under vencendo → torneira quase sempre fechada
+    - Linhas altas em jogos super under podem ser bloqueadas
 - Cálculo de EV e alertas Telegram quando EV >= EV_MIN_PCT
 
 Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-jogo manual).
@@ -234,6 +240,7 @@ last_odd_cache: Dict[int, Tuple[int, float]] = {}
 last_news_boost_cache: Dict[int, float] = {}
 
 # Cache de pré-jogo auto por time (chave: "league:season:team_id")
+# Agora também guarda attack_gpm / defense_gpm (gols feitos/sofridos por jogo).
 pregame_auto_cache: Dict[str, Dict[str, Any]] = {}
 
 # Cooldown por jogo (fixture_id -> datetime do último alerta)
@@ -249,8 +256,8 @@ team_player_ratings_cache: Dict[str, Dict[int, float]] = {}
 team_player_ratings_ts: Dict[str, datetime] = {}
 
 # Controle simples de consumo diário da The Odds API (aproximado, só em memória)
-oddsapi_calls_today: int = 0        # quantas chamadas foram feitas hoje
-oddsapi_calls_date_key: str = ""    # dia (UTC) em que o contador foi atualizado
+oddsapi_calls_today: int = 0
+oddsapi_calls_date_key: str = ""
 
 
 def _now_utc() -> datetime:
@@ -1700,6 +1707,9 @@ async def _get_team_auto_rating(
 ) -> float:
     """
     Rating em [-2, +2] indicando quão "golento" o time costuma ser.
+    Também preenche no cache:
+        attack_gpm  = gols marcados por jogo
+        defense_gpm = gols sofridos por jogo
     """
     if not API_FOOTBALL_KEY or not USE_API_PREGAME:
         return 0.0
@@ -1712,10 +1722,11 @@ async def _get_team_auto_rating(
 
     cached = pregame_auto_cache.get(cache_key)
     if cached:
-        ts: datetime = cached.get("ts")  # type: ignore
+        ts = cached.get("ts")
         rating_cached = float(cached.get("rating", 0.0))
-        if (now - ts) <= timedelta(hours=PREGAME_CACHE_HOURS):
-            return rating_cached
+        if isinstance(ts, datetime):
+            if (now - ts) <= timedelta(hours=PREGAME_CACHE_HOURS):
+                return rating_cached
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
     params = {
@@ -1740,12 +1751,22 @@ async def _get_team_auto_rating(
             league_id,
             season,
         )
-        pregame_auto_cache[cache_key] = {"rating": 0.0, "ts": now}
+        pregame_auto_cache[cache_key] = {
+            "rating": 0.0,
+            "ts": now,
+            "attack_gpm": 0.0,
+            "defense_gpm": 0.0,
+        }
         return 0.0
 
     stats = data.get("response") or {}
     if not stats:
-        pregame_auto_cache[cache_key] = {"rating": 0.0, "ts": now}
+        pregame_auto_cache[cache_key] = {
+            "rating": 0.0,
+            "ts": now,
+            "attack_gpm": 0.0,
+            "defense_gpm": 0.0,
+        }
         return 0.0
 
     rating = 0.0
@@ -1764,9 +1785,18 @@ async def _get_team_auto_rating(
         ((goals_info.get("against") or {}).get("total") or {}).get("total", 0) or 0
     )
 
+    try:
+        played_total_int = int(played_total or 0)
+    except Exception:
+        played_total_int = 0
+
+    gf_per = 0.0
+    ga_per = 0.0
     gpm = 0.0
-    if played_total > 0:
-        gpm = (gf_total + ga_total) / float(played_total)
+    if played_total_int > 0:
+        gf_per = gf_total / float(played_total_int)
+        ga_per = ga_total / float(played_total_int)
+        gpm = (gf_total + ga_total) / float(played_total_int)
 
     if gpm >= 3.2:
         rating += 1.2
@@ -1776,10 +1806,10 @@ async def _get_team_auto_rating(
         rating += 0.6
     elif gpm >= 2.1:
         rating += 0.3
-    elif gpm <= 1.6:
-        rating -= 0.4
     elif gpm <= 1.3:
         rating -= 0.7
+    elif gpm <= 1.6:
+        rating -= 0.4
 
     form_str = (stats.get("form") or "").upper()
     if form_str:
@@ -1799,9 +1829,7 @@ async def _get_team_auto_rating(
         if count_chars > 0:
             rating += form_score
 
-    if played_total > 0:
-        gf_per = gf_total / float(played_total)
-        ga_per = ga_total / float(played_total)
+    if played_total_int > 0:
         if gf_per >= 1.8 and ga_per >= 1.0:
             rating += 0.3
         elif gf_per >= 1.8 and ga_per < 0.8:
@@ -1812,8 +1840,62 @@ async def _get_team_auto_rating(
     if rating < -2.0:
         rating = -2.0
 
-    pregame_auto_cache[cache_key] = {"rating": rating, "ts": now}
+    pregame_auto_cache[cache_key] = {
+        "rating": rating,
+        "ts": now,
+        "attack_gpm": gf_per,
+        "defense_gpm": ga_per,
+    }
     return rating
+
+
+def _get_team_attack_defense_from_cache(
+    team_id: Optional[int],
+    league_id: Optional[int],
+    season: Optional[int],
+) -> Tuple[float, float]:
+    """
+    Lê do cache o perfil de ataque/defesa (gols marcados/sofridos por jogo)
+    calculado em _get_team_auto_rating.
+    """
+    if team_id is None or league_id is None or season is None:
+        return 0.0, 0.0
+    cache_key = "{lg}:{ss}:{tm}".format(lg=league_id, ss=season, tm=team_id)
+    cached = pregame_auto_cache.get(cache_key) or {}
+    try:
+        atk = float(cached.get("attack_gpm", 0.0))
+    except (TypeError, ValueError):
+        atk = 0.0
+    try:
+        dfn = float(cached.get("defense_gpm", 0.0))
+    except (TypeError, ValueError):
+        dfn = 0.0
+    return atk, dfn
+
+
+def _is_team_under_profile(attack_gpm: float, defense_gpm: float) -> bool:
+    """
+    Time claramente under:
+    - Ataque fraco (< 1.3 gol/jogo)
+    - Defesa sólida (< 1.3 gol sofrido/jogo)
+    """
+    if attack_gpm <= 0.0 or defense_gpm < 0.0:
+        return False
+    return attack_gpm < 1.3 and defense_gpm < 1.3
+
+
+def _is_match_super_under(
+    home_attack_gpm: float,
+    home_defense_gpm: float,
+    away_attack_gpm: float,
+    away_defense_gpm: float,
+) -> bool:
+    """
+    Flag de jogo super under: dois times under de forma clara.
+    """
+    return _is_team_under_profile(home_attack_gpm, home_defense_gpm) and _is_team_under_profile(
+        away_attack_gpm, away_defense_gpm
+    )
 
 
 def _compute_score_context_boost(
@@ -1829,7 +1911,7 @@ def _compute_score_context_boost(
     - Favorito empatando → leve boost (especialmente se for o mandante).
     - Favorito ganhando, principalmente em casa e por 2+ gols → penalização forte
       (torneira fecha, necessidade cai).
-    - NOVO: mandante claramente "under" (rating_home bem negativo) e vencendo
+    - Mandante claramente "under" (rating_home bem negativo) e vencendo
       → cenário estruturalmente ruim para over, penalizado com força.
     """
 
@@ -1843,7 +1925,7 @@ def _compute_score_context_boost(
 
     score_diff = home_goals - away_goals  # >0 = mandante na frente
 
-    # NOVO: identifica mandante "claramente under" pela nota automática
+    # Mandante "claramente under" pela nota automática
     home_under = rating_home <= -0.7
 
     # Detecta favorito a partir dos ratings pré-jogo (auto ou manual)
@@ -1924,9 +2006,8 @@ def _compute_score_context_boost(
             # goleada sem favorito claro → tende a esfriar
             boost = -0.03
 
-    # NOVO: penalização extra se o mandante for claramente under e estiver vencendo
+    # Penalização extra se o mandante for claramente under e estiver vencendo
     if home_under and score_diff > 0 and minute_int >= 50:
-        # se for vitória magra, já é ruim; se for 2+ gols, pior ainda
         margin = score_diff
         if margin >= 2:
             boost -= 0.06
@@ -2020,6 +2101,10 @@ async def _get_pregame_boost_for_fixture(
     pregame_boost_prob → pré-jogo manual + automático
     context_boost_prob → ajuste de necessidade de gol (favorito x placar x casa/fora)
     rating_home / rating_away → ratings usados para detectar cenário under, etc.
+    Além disso, preenche no fixture:
+        - attack_home_gpm / defense_home_gpm
+        - attack_away_gpm / defense_away_gpm
+        - match_super_under (bool)
     """
     manual_boost = _get_pregame_boost_manual(fixture)
 
@@ -2029,6 +2114,11 @@ async def _get_pregame_boost_for_fixture(
     # ratings manuais como fallback
     rating_home = PREMATCH_TEAM_RATINGS.get(home_name, 0.0)
     rating_away = PREMATCH_TEAM_RATINGS.get(away_name, 0.0)
+
+    league_id = fixture.get("league_id")
+    season = fixture.get("season")
+    home_team_id = fixture.get("home_team_id")
+    away_team_id = fixture.get("away_team_id")
 
     auto_boost = 0.0
 
@@ -2044,6 +2134,27 @@ async def _get_pregame_boost_for_fixture(
                 fixture.get("fixture_id"),
             )
             auto_boost = 0.0
+
+    # Pega perfis de ataque/defesa (gols por jogo) do cache
+    attack_home_gpm, defense_home_gpm = _get_team_attack_defense_from_cache(
+        home_team_id, league_id, season
+    )
+    attack_away_gpm, defense_away_gpm = _get_team_attack_defense_from_cache(
+        away_team_id, league_id, season
+    )
+
+    fixture["attack_home_gpm"] = attack_home_gpm
+    fixture["defense_home_gpm"] = defense_home_gpm
+    fixture["attack_away_gpm"] = attack_away_gpm
+    fixture["defense_away_gpm"] = defense_away_gpm
+
+    match_super_under = _is_match_super_under(
+        attack_home_gpm,
+        defense_home_gpm,
+        attack_away_gpm,
+        defense_away_gpm,
+    )
+    fixture["match_super_under"] = match_super_under
 
     pregame_total = manual_boost + auto_boost
     if pregame_total > 0.03:
@@ -2064,6 +2175,30 @@ async def _get_pregame_boost_for_fixture(
             fixture.get("fixture_id"),
         )
         context_boost = 0.0
+
+    # Ajuste do contexto pelo tipo de time (over x under)
+    try:
+        # times claramente over (ataque forte ou defesa vazada)
+        home_overish = attack_home_gpm >= 1.8 or defense_away_gpm >= 1.6
+        away_overish = attack_away_gpm >= 1.8 or defense_home_gpm >= 1.6
+        any_overish = home_overish or away_overish
+        both_underish = _is_team_under_profile(
+            attack_home_gpm, defense_home_gpm
+        ) and _is_team_under_profile(
+            attack_away_gpm, defense_away_gpm
+        )
+
+        if both_underish:
+            # jogo muito under → necessidade de gol não pode inflar tanto
+            context_boost *= 0.4
+        elif any_overish:
+            # jogo com característica over → peso levemente maior
+            context_boost *= 1.1
+        else:
+            # meio termo → leve redução
+            context_boost *= 0.9
+    except Exception:
+        pass
 
     # Clamp de segurança para o contexto (±5 pp já é um empurrão forte)
     if context_boost > 0.05:
@@ -2809,6 +2944,13 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # Flag de mandante claramente under (para filtros duros)
                 home_under = rating_home <= -0.7
 
+                # Perfis de ataque/defesa e flag super under preenchidos no fixture
+                attack_home_gpm = float(fx.get("attack_home_gpm", 0.0))
+                defense_home_gpm = float(fx.get("defense_home_gpm", 0.0))
+                attack_away_gpm = float(fx.get("attack_away_gpm", 0.0))
+                defense_away_gpm = float(fx.get("defense_away_gpm", 0.0))
+                match_super_under = bool(fx.get("match_super_under", False))
+
                 # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
                 if api_odd is None:
                     logging.info(
@@ -2844,7 +2986,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     except (TypeError, ValueError):
                         minute_int = 0
 
-                    # NOVO: corte duro se mandante under estiver vencendo (cenário que você evita)
+                    # Mandante under vencendo: cenário que você geralmente evita
                     if home_under and score_diff > 0 and minute_int >= 50:
                         continue
 
@@ -2853,8 +2995,46 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         continue
 
                     context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
+
+                    # Filtro forte para jogos com contexto negativo (favorito confortável etc.)
                     if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
-                        # contexto muito negativo (favorito confortável etc.)
+                        continue
+
+                    # NOVO: filtro pesado para empates em jogos under/equilibrados
+                    is_draw = (score_diff == 0)
+                    if is_draw:
+                        under_draw_block = False
+
+                        # super under + tempo avançado
+                        if match_super_under and minute_int >= 50:
+                            under_draw_block = True
+
+                        # dois times com rating ruim para gols, pressão fraca
+                        if not under_draw_block:
+                            if (
+                                rating_home <= 0.0
+                                and rating_away <= 0.0
+                                and minute_int >= 50
+                                and metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 1.0)
+                            ):
+                                under_draw_block = True
+
+                        # jogo empatado, sem grande favorito pressionando
+                        if not under_draw_block:
+                            if context_pp < 1.0 and metrics["pressure_score"] < 7.0 and minute_int >= 55:
+                                under_draw_block = True
+
+                        # exceção: favorito pressionando muito + defesa frágil do outro lado
+                        if under_draw_block:
+                            if context_pp >= 2.0 and metrics["pressure_score"] >= 7.0:
+                                under_draw_block = False
+
+                        if under_draw_block:
+                            continue
+
+                    # Bloqueio extra: linhas altas em jogos super under
+                    linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
+                    if match_super_under and linha_num >= 2.5:
                         continue
 
                     if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
@@ -2905,7 +3085,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 odd_cur = metrics["odd_current"]
 
-                # CORTE POR GOLEADA (jogos que você quase sempre ignora)
+                # CORTE POR GOLEADA / CONTEXTO / PERFIL UNDER/OVER
                 score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
                 minute_int = fx["minute"] or 0
                 try:
@@ -2913,7 +3093,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 except (TypeError, ValueError):
                     minute_int = 0
 
-                # NOVO: corte duro se mandante under estiver vencendo a partir dos 50'
+                # Mandante claramente under vencendo a partir dos 50'
                 if home_under and score_diff > 0 and minute_int >= 50:
                     continue
 
@@ -2921,13 +3101,47 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     # goleada a partir dos 55' → quase sempre torneira fechada pra você
                     continue
 
-                # CORTE DE CONTEXTO:
-                # se o contexto for bem negativo (favorito confortável / pouca necessidade)
-                # e já estivermos em 60'+, descarta o jogo mesmo com EV+.
                 context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
 
+                # Filtro forte para contexto muito negativo (favorito confortável) com tempo avançado
                 if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
-                    # "torneira fechada": favorito confortável / necessidade baixa
+                    continue
+
+                # NOVO: filtro pesado para empates em jogos under/equilibrados
+                is_draw = (score_diff == 0)
+                if is_draw:
+                    under_draw_block = False
+
+                    # super under + tempo avançado
+                    if match_super_under and minute_int >= 50:
+                        under_draw_block = True
+
+                    # dois times com rating ruim para gols, pressão fraca
+                    if not under_draw_block:
+                        if (
+                            rating_home <= 0.0
+                            and rating_away <= 0.0
+                            and minute_int >= 50
+                            and metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 1.0)
+                        ):
+                            under_draw_block = True
+
+                    # jogo empatado, sem grande favorito pressionando
+                    if not under_draw_block:
+                        if context_pp < 1.0 and metrics["pressure_score"] < 7.0 and minute_int >= 55:
+                            under_draw_block = True
+
+                    # exceção: favorito pressionando muito + defesa frágil
+                    if under_draw_block:
+                        if context_pp >= 2.0 and metrics["pressure_score"] >= 7.0:
+                            under_draw_block = False
+
+                    if under_draw_block:
+                        continue
+
+                # Bloqueio extra: linhas altas em jogos super under
+                linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
+                if match_super_under and linha_num >= 2.5:
                     continue
 
                 # Primeiro: filtros de pressão e EV
