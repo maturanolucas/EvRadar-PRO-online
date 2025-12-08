@@ -217,8 +217,8 @@ PREMATCH_TEAM_RATINGS:
 """
 PREMATCH_TEAM_RATINGS: Dict[str, float] = {
     # Ajuste conforme teu faro
-    # "Santos": 1.5,
-    # "Palmeiras": 1.8,
+    # "Nice": -0.8,
+    # "Famalicão": -1.0,
     # ...
 }
 
@@ -1773,9 +1773,6 @@ async def _get_team_auto_rating(
 
     fixtures_info = stats.get("fixtures") or {}
     played_total = ((fixtures_info.get("played") or {}).get("total")) or 0
-    wins_total = ((fixtures_info.get("wins") or {}).get("total")) or 0
-    draws_total = ((fixtures_info.get("draws") or {}).get("total")) or 0
-    loses_total = ((fixtures_info.get("loses") or {}).get("total")) or 0
 
     goals_info = stats.get("goals") or {}
     gf_total = (
@@ -2505,7 +2502,7 @@ def _format_alert_text(
 
     if lucas_boost_prob > 0.0:
         if lucas_boost_prob >= 5.0:
-            interpretacao_parts.append("padrão muito alinhado ao teu faro de gol (Lucas boost forte)")
+            interpretacao_parts.append("padrão muito alinhado ao teu faro de gol")
         else:
             interpretacao_parts.append("cenário bem encaixado no teu padrão de entrada")
 
@@ -3243,162 +3240,170 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /debug  → info técnica",
         "  /links  → links úteis / bookmaker",
     ]
-    await update.message.reply_text("\n".join(lines))
+    if update.message:
+        await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)..."
-    )
+    if update.message:
+        await update.message.reply_text(
+            "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)..."
+        )
 
     alerts = await run_scan_cycle(origin="manual", application=context.application)
 
     if not alerts:
-        await update.message.reply_text(last_status_text)
+        if update.message:
+            await update.message.reply_text(last_status_text)
         return
 
     for text in alerts:
-        await update.message.reply_text(text)
+        if update.message:
+            await update.message.reply_text(text)
 
-    await update.message.reply_text(last_status_text)
+    if update.message:
+        await update.message.reply_text(last_status_text)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(last_status_text)
+    """
+    Mostra um status rápido para consulta no meio do trampo.
+    """
+    lines = [
+        "📊 Status do EvRadar PRO",
+        last_status_text,
+        "",
+        "Origem do último scan: {origin}".format(origin=last_scan_origin),
+        "Eventos ao vivo considerados: {live}".format(live=last_scan_window_matches),
+        "Alertas enviados no último scan: {alerts}".format(alerts=last_scan_alerts),
+    ]
+    if update.message:
+        await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    token_set = bool(TELEGRAM_BOT_TOKEN)
-    chat_set = TELEGRAM_CHAT_ID is not None
-    api_set = bool(API_FOOTBALL_KEY)
-    news_set = bool(NEWS_API_KEY)
-    oddsapi_set = bool(ODDS_API_KEY)
+    """
+    Info técnica/rápida pra você checar se o radar está rodando como esperado.
+    """
+    leagues_str = ", ".join(str(lid) for lid in LEAGUE_IDS) if LEAGUE_IDS else "todas (sem filtro)"
 
     lines = [
-        "🛠 Debug EvRadar PRO (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)",
+        "🛠 Debug EvRadar PRO",
         "",
-        "TELEGRAM_BOT_TOKEN definido: {v}".format(v="sim" if token_set else "não"),
-        "TELEGRAM_CHAT_ID: {cid}".format(
-            cid=TELEGRAM_CHAT_ID if chat_set else "não definido"
+        "Janela: {ws}–{we}ʼ | Pressão mínima: {ps:.1f}".format(
+            ws=WINDOW_START,
+            we=WINDOW_END,
+            ps=MIN_PRESSURE_SCORE,
         ),
-        "AUTOSTART: {a}".format(a=AUTOSTART),
-        "CHECK_INTERVAL: {sec}s".format(sec=CHECK_INTERVAL),
-        "Janela: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
-        "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
-        "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
-        "ALLOW_ALERTS_WITHOUT_ODDS: {v}".format(v=ALLOW_ALERTS_WITHOUT_ODDS),
-        "MANUAL_MIN_ODD_HINT: {v:.2f}".format(v=MANUAL_MIN_ODD_HINT),
-        "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
-        "COOLDOWN_MINUTES: {cd} min".format(cd=COOLDOWN_MINUTES),
-        "BANKROLL_INITIAL (banca virtual): R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
-        "",
-        "API_FOOTBALL_KEY definido: {v}".format(v="sim" if api_set else "não"),
-        "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
-        "BOOKMAKER_ID: {bid}".format(bid=BOOKMAKER_ID),
-        "BOOKMAKER_FALLBACK_IDS: {fb}".format(
-            fb=",".join(str(x) for x in BOOKMAKER_FALLBACK_IDS)
-            if BOOKMAKER_FALLBACK_IDS
-            else "nenhum"
+        "EV mínimo: {ev:.2f}% | Odds: {mn:.2f}–{mx:.2f}".format(
+            ev=EV_MIN_PCT,
+            mn=MIN_ODD,
+            mx=MAX_ODD,
         ),
-        "ODDS_BET_ID: {obid}".format(obid=ODDS_BET_ID),
-        "LEAGUE_IDS: {ids}".format(
-            ids=",".join(str(x) for x in LEAGUE_IDS) if LEAGUE_IDS else "não definido"
+        "Cooldown por fixture: {cd} min".format(cd=COOLDOWN_MINUTES),
+        "",
+        "Ligas monitoradas (API-FOOTBALL):",
+        leagues_str,
+        "",
+        "API_FOOTBALL_KEY configurada: {ok}".format(
+            ok="sim" if bool(API_FOOTBALL_KEY) else "NÃO"
         ),
-        "",
-        "NEWS_API_KEY definido: {v}".format(v="sim" if news_set else "não"),
-        "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
-        "NEWS_TIME_WINDOW_HOURS: {h}".format(h=NEWS_TIME_WINDOW_HOURS),
-        "",
         "USE_API_PREGAME: {v}".format(v=USE_API_PREGAME),
-        "PREGAME_CACHE_HOURS: {h}".format(h=PREGAME_CACHE_HOURS),
-        "Ratings pré-jogo manuais: {n} times".format(
-            n=len(PREMATCH_TEAM_RATINGS)
+        "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
+        "ODDS_API_USE: {v} | limite diário: {lim}".format(
+            v=ODDS_API_USE,
+            lim=ODDS_API_DAILY_LIMIT,
         ),
-        "",
+        "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
         "USE_PLAYER_IMPACT: {v}".format(v=USE_PLAYER_IMPACT),
-        "PLAYER_STATS_CACHE_HOURS: {h}".format(h=PLAYER_STATS_CACHE_HOURS),
-        "PLAYER_EVENTS_CACHE_MINUTES: {m}".format(m=PLAYER_EVENTS_CACHE_MINUTES),
-        "PLAYER_MAX_BOOST_PCT: {p:.1f}%".format(p=PLAYER_MAX_BOOST_PCT),
-        "PLAYER_SUB_TRIGGER_WINDOW: {w} min".format(w=PLAYER_SUB_TRIGGER_WINDOW),
         "",
-        "ODDS_API_KEY definido: {v}".format(v="sim" if oddsapi_set else "não"),
-        "ODDS_API_USE: {v}".format(v=ODDS_API_USE),
-        "ODDS_API_BASE_URL: {u}".format(u=ODDS_API_BASE_URL),
-        "ODDS_API_REGIONS: {r}".format(r=ODDS_API_REGIONS),
-        "ODDS_API_MARKETS: {m}".format(m=ODDS_API_MARKETS),
-        "ODDS_API_DEFAULT_SPORT_KEY: {s}".format(
-            s=ODDS_API_DEFAULT_SPORT_KEY or "não definido"
+        "Autoscan: {auto} (intervalo {sec}s)".format(
+            auto="ativado" if AUTOSTART else "desativado",
+            sec=CHECK_INTERVAL,
         ),
-        "ODDS_API_LEAGUE_MAP: {mp}".format(
-            mp=ODDS_API_LEAGUE_MAP_RAW or "não definido"
-        ),
-        "ODDS_API_BOOKMAKERS: {bk}".format(
-            bk=",".join(ODDS_API_BOOKMAKERS) if ODDS_API_BOOKMAKERS else "todos"
-        ),
-        "ODDS_API_DAILY_LIMIT: {lim}".format(lim=ODDS_API_DAILY_LIMIT),
-        "ODDS_API chamadas hoje (aprox.): {cnt}".format(cnt=oddsapi_calls_today),
         "",
-        "Último scan:",
-        "  origem: {origin}".format(origin=last_scan_origin),
-        "  eventos janela/ligas: {live}".format(live=last_scan_window_matches),
-        "  alertas: {alerts}".format(alerts=last_scan_alerts),
+        "Cache de odds (fixtures com última odd conhecida): {n}".format(
+            n=len(last_odd_cache),
+        ),
     ]
-    await update.message.reply_text("\n".join(lines))
+    if update.message:
+        await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Links rápidos: casa, docs das APIs, etc.
+    """
     lines = [
         "🔗 Links úteis",
         "",
-        "Casa principal: {name}".format(name=BOOKMAKER_NAME),
-        "Site: {url}".format(url=BOOKMAKER_URL),
+        "🏦 Casa principal: {name}".format(name=BOOKMAKER_NAME),
+        "   {url}".format(url=BOOKMAKER_URL),
+        "",
+        "📚 API-FOOTBALL (documentação v3):",
+        "   https://www.api-football.com/documentation-v3",
+        "",
+        "📚 The Odds API (documentação):",
+        "   https://the-odds-api.com/",
+        "",
+        "🧠 Lembrete:",
+        "- Entrar sempre por over SUM_PLUS_HALF (soma do placar + 0.5).",
+        "- Evitar goleadas, mandante under vencendo e empates under/equilibrados sem favorito forte amassando.",
     ]
-    await update.message.reply_text("\n".join(lines))
+    if update.message:
+        await update.message.reply_text("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
-# post_init e main
+# Setup / main
 # ---------------------------------------------------------------------------
 
-async def post_init(application: Application) -> None:
-    logging.info("Application started (post_init executado).")
-
+async def _post_init(application: Application) -> None:
+    """
+    Hook chamado pelo Application antes de iniciar o polling.
+    Aqui ligamos o autoscan via create_task (sem JobQueue).
+    """
     if AUTOSTART:
-        application.create_task(autoscan_loop(application), name="autoscan_loop")
+        try:
+            application.create_task(autoscan_loop(application), name="autoscan_loop")
+            logging.info("Autoscan agendado no post_init (AUTOSTART=1).")
+        except Exception:
+            logging.exception("Falha ao iniciar autoscan no post_init")
 
 
-def main() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN não definido. Configure a variável de ambiente antes de rodar."
-        )
-
+def _setup_logging() -> None:
+    """
+    Configura logging simples para rodar no Railway / local.
+    """
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=logging.INFO,
     )
 
-    logging.info(
-        "Iniciando bot do EvRadar PRO (cérebro v0.3-lite: odds reais + news + pré-jogo auto + jogadores)..."
-    )
+
+def main() -> None:
+    _setup_logging()
+
+    if not TELEGRAM_BOT_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN não definido. Configure o token do bot e reinicie.")
+        return
 
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
+        .post_init(_post_init)
         .build()
     )
 
+    # Handlers
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("scan", cmd_scan))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,
-    )
+    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
+    application.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
