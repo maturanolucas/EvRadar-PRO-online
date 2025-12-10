@@ -221,7 +221,6 @@ PREMATCH_TEAM_RATINGS: Dict[str, float] = {
     # "Famalicão": -1.0,
 }
 
-
 # ---------------------------------------------------------------------------
 # Estado em memória
 # ---------------------------------------------------------------------------
@@ -1959,7 +1958,7 @@ def _compute_score_context_boost(
                 if minute_int >= 70:
                     boost = -0.04
                 elif minute_int >= 55:
-                    boost = -0.03
+                    boost = -0.035  # penaliza mais forte esse cenário (ex.: Barcelona/Monaco ganhando em casa)
                 else:
                     boost = -0.02
 
@@ -2263,6 +2262,15 @@ def _compute_lucas_pattern_boost(
     if abs(score_diff) >= 3 and minute_int >= 55:
         boost = 0.0
 
+    # Penalização para contextos claramente negativos (favorito confortável no placar)
+    if context_boost_prob < 0.0:
+        context_pp = context_boost_prob * 100.0
+        # contexto bem negativo (ex.: favorito forte ganhando em casa)
+        if context_pp <= -2.0 and minute_int >= 55:
+            boost *= 0.2
+        elif context_pp < 0.0 and minute_int >= 50:
+            boost *= 0.5
+
     # Clamp final 0–10 pp
     if boost < 0.0:
         boost = 0.0
@@ -2456,102 +2464,45 @@ def _format_alert_text(
     stake_pct = _suggest_stake_pct(ev_pct, odd_current)
     stake_brl = BANKROLL_INITIAL * (stake_pct / 100.0)
 
+    # Interpretação curta e objetiva
     interpretacao_parts: List[str] = []
 
     if pressure_score >= 7.5:
-        interpretacao_parts.append("pressão ofensiva alta")
+        interpretacao_parts.append("pressão forte, jogo bem vivo")
     elif pressure_score >= 5.0:
-        interpretacao_parts.append("jogo com pressão moderada para cima")
+        interpretacao_parts.append("pressão boa pra buscar +1 gol")
     else:
-        interpretacao_parts.append("pressão apenas ok (cuidado)")
+        interpretacao_parts.append("pressão no limite, entrada mais delicada")
 
-    if total_goals >= 3:
-        interpretacao_parts.append("jogo aberto em gols")
-    elif total_goals == 0:
-        interpretacao_parts.append("placar magro, mas estatísticas sugerem risco/valor")
-
-    if news_boost_prob > 0.0:
-        if news_boost_prob >= 2.0:
-            interpretacao_parts.append("noticiário reforça tendência de gol")
-        else:
-            interpretacao_parts.append("noticiário levemente favorável a gol")
-    elif news_boost_prob < 0.0:
-        interpretacao_parts.append("noticiário pesa um pouco contra (cautela)")
-
-    if pregame_boost_prob > 0.0:
-        if pregame_boost_prob >= 2.0:
-            interpretacao_parts.append("força pré-jogo favorece gols")
-        else:
-            interpretacao_parts.append("leve viés pré-jogo pró-gol")
-    elif pregame_boost_prob < 0.0:
-        interpretacao_parts.append("pré-jogo sugeria menos gols (cautela)")
-
-    if player_boost_prob > 0.5:
-        interpretacao_parts.append("elenco em campo puxa pró-gol (impacto jogadores)")
-    elif player_boost_prob < -0.5:
-        interpretacao_parts.append("elenco em campo tira um pouco da força ofensiva")
-
-    if context_boost_prob > 0.0:
-        if context_boost_prob >= 2.0:
-            interpretacao_parts.append("favorito em situação de necessidade (placar/contexto pró-gol)")
-        else:
-            interpretacao_parts.append("placar favorece busca de mais 1 gol do favorito")
-    elif context_boost_prob < 0.0:
-        interpretacao_parts.append("favorito confortável no placar (necessidade de gol menor)")
+    if context_boost_prob > 0.5:
+        interpretacao_parts.append("favorito ainda precisa do gol")
+    elif context_boost_prob < -0.5:
+        interpretacao_parts.append("favorito confortável, necessidade menor")
 
     if lucas_boost_prob > 0.0:
-        if lucas_boost_prob >= 5.0:
-            interpretacao_parts.append("padrão muito alinhado ao teu faro de gol")
-        else:
-            interpretacao_parts.append("cenário bem encaixado no teu padrão de entrada")
+        interpretacao_parts.append("padrão bem alinhado ao teu faro")
 
     if ev_pct >= EV_MIN_PCT + 2.0:
-        ev_flag = "EV+ forte"
+        interpretacao_parts.append("EV+ forte")
     elif ev_pct >= EV_MIN_PCT:
-        ev_flag = "EV+"
+        interpretacao_parts.append("EV+ dentro do padrão")
     else:
-        ev_flag = "EV borderline"
+        interpretacao_parts.append("EV borderline")
 
-    interpretacao_parts.append(ev_flag)
     interpretacao = " / ".join(interpretacao_parts)
-
-    adjust_parts: List[str] = []
-    if news_boost_prob != 0.0:
-        adjust_parts.append("news {nb:+.1f} pp".format(nb=news_boost_prob))
-    if pregame_boost_prob != 0.0:
-        adjust_parts.append("pré {pg:+.1f} pp".format(pg=pregame_boost_prob))
-    if player_boost_prob != 0.0:
-        adjust_parts.append("jogadores {pl:+.1f} pp".format(pl=player_boost_prob))
-    if context_boost_prob != 0.0:
-        adjust_parts.append("contexto {cx:+.1f} pp".format(cx=context_boost_prob))
-    if lucas_boost_prob != 0.0:
-        adjust_parts.append("padrão Lucas {lc:+.1f} pp".format(lc=lucas_boost_prob))
-
-    adjust_str = ""
-    if adjust_parts:
-        adjust_str = " (ajustes: {txt})".format(txt=", ".join(adjust_parts))
 
     lines = [
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha} @ {odd:.2f}".format(linha=linha_str, odd=odd_current),
-        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}{adj}".format(
+        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
             p=p_final,
             odd_j=odd_fair,
-            adj=adjust_str,
         ),
         "💰 EV: {ev:.2f}%".format(ev=ev_pct),
-        "💵 Stake sugerida (banca virtual): {spct:.2f}% ≈ R$ {sbrl:.2f}".format(
+        "💵 Stake sugerida: {spct:.2f}% (~R$ {sbrl:.2f})".format(
             spct=stake_pct,
             sbrl=stake_brl,
-        ),
-        "",
-        "✅ Para registrar na banca virtual (manual):",
-        "   {spct:.2f}% (~R$ {sbrl:.2f}) em {linha} @ {odd:.2f}".format(
-            spct=stake_pct,
-            sbrl=stake_brl,
-            linha=linha_str,
-            odd=odd_current,
         ),
         "",
         "🧩 Interpretação:",
@@ -2597,25 +2548,21 @@ def _format_watch_text(
     interpretacao_parts: List[str] = []
 
     if pressure_score >= 7.5:
-        interpretacao_parts.append("pressão ofensiva alta (cenário quente para gol)")
+        interpretacao_parts.append("pressão forte, cenário quente pra gol")
     elif pressure_score >= 5.0:
-        interpretacao_parts.append("pressão boa/decente para gol")
+        interpretacao_parts.append("pressão boa pra gol")
     else:
-        interpretacao_parts.append("pressão ok, mas não absurda")
+        interpretacao_parts.append("pressão ok, mas nada absurdo")
 
     if context_boost_prob > 0.0:
-        interpretacao_parts.append("favorito atrás/empatando reforça necessidade de gol")
+        interpretacao_parts.append("favorito ainda precisa marcar")
     elif context_boost_prob < 0.0:
-        interpretacao_parts.append("contexto de favorito confortável reduz pressão para mais gols")
+        interpretacao_parts.append("contexto de favorito confortável")
 
     if lucas_boost_prob > 0.0:
-        interpretacao_parts.append("cenário muito parecido com as tuas entradas, mas preço ainda baixo")
+        interpretacao_parts.append("padrão alinhado, mas preço ainda baixo")
 
-    interpretacao_parts.append(
-        "odd ainda abaixo da tua faixa mínima (esperar melhorar preço)"
-    )
-
-    interpretacao_parts.append("EV calculado já positivo, mas mercado esmagado")
+    interpretacao_parts.append("esperar a odd bater a mínima antes de entrar")
     interpretacao = " / ".join(interpretacao_parts)
 
     lines = [
@@ -2636,13 +2583,7 @@ def _format_watch_text(
         "🧩 Interpretação:",
         interpretacao,
         "",
-        "🎯 Plano: acompanhar este jogo e considerar entrada se o mercado",
-        "    bater ≥ {mn:.2f} na linha {linha} (ou se o contexto continuar forte).".format(
-            mn=MIN_ODD,
-            linha=linha_str,
-        ),
-        "",
-        "🔗 Referência de mercado: {book} → {url}".format(
+        "🔗 Mercado: {book} → {url}".format(
             book=BOOKMAKER_NAME,
             url=BOOKMAKER_URL,
         ),
@@ -2656,11 +2597,6 @@ def _format_manual_no_odds_text(
 ) -> str:
     """
     Alerta MANUAL quando não há odd em nenhuma API, mas o jogo está no teu padrão.
-
-    Ideia:
-    - Mostrar probabilidade do modelo e odd justa.
-    - Deixar claro que NÃO temos odd ao vivo.
-    - Orientar a só considerar entrada se a odd real estiver ≥ MANUAL_MIN_ODD_HINT.
     """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
@@ -2683,24 +2619,21 @@ def _format_manual_no_odds_text(
     interpretacao_parts: List[str] = []
 
     if pressure_score >= 7.5:
-        interpretacao_parts.append("pressão ofensiva alta (perfil de gol forte)")
+        interpretacao_parts.append("pressão forte dentro do teu padrão")
     elif pressure_score >= 5.0:
-        interpretacao_parts.append("pressão boa para busca de mais 1 gol")
+        interpretacao_parts.append("pressão boa pra buscar +1 gol")
     else:
-        interpretacao_parts.append("pressão ok, mas dentro do limite mínimo")
+        interpretacao_parts.append("pressão mínima aceitável")
 
     if context_boost_prob > 0.0:
-        interpretacao_parts.append("contexto/placar indicam necessidade real de gol")
+        interpretacao_parts.append("placar/necessidade jogam a favor do gol")
     elif context_boost_prob < 0.0:
-        interpretacao_parts.append("contexto não empurra tanto por mais gols (atenção)")
+        interpretacao_parts.append("contexto não empurra tanto por gol")
 
     if lucas_boost_prob > 0.0:
-        interpretacao_parts.append("cenário encaixado no teu padrão (Lucas boost)")
+        interpretacao_parts.append("cenário encaixado no teu faro")
 
-    interpretacao_parts.append(
-        "sem odd nas APIs; usar apenas como radar de padrão e conferir preço na casa"
-    )
-
+    interpretacao_parts.append("sem odd na API; usar só como radar e conferir preço na casa")
     interpretacao = " / ".join(interpretacao_parts)
 
     lines: List[str] = [
@@ -2717,16 +2650,16 @@ def _format_manual_no_odds_text(
         "🧩 Interpretação:",
         interpretacao,
         "",
-        "🎯 Plano de ação:",
+        "🎯 Plano:",
         "- Abrir o mercado de {linha} na {book} e só considerar entrada se a odd atual".format(
             linha=linha_str,
             book=BOOKMAKER_NAME,
         ),
-        "  estiver ≥ {mn:.2f} (e o ritmo/pressão continuarem fortes).".format(
+        "  estiver ≥ {mn:.2f} e o ritmo/pressão continuarem fortes.".format(
             mn=MANUAL_MIN_ODD_HINT,
         ),
         "",
-        "🔗 Referência de mercado: {book} → {url}".format(
+        "🔗 Mercado: {book} → {url}".format(
             book=BOOKMAKER_NAME,
             url=BOOKMAKER_URL,
         ),
@@ -2781,7 +2714,7 @@ def _format_pattern_only_text(
         "- Nenhuma odd ao vivo disponível nas fontes (API-FOOTBALL/The Odds API).",
         "- Usa este alerta como radar de padrão; confere a odd real na casa antes de entrar.",
         "",
-        "🔗 Referência de mercado: {book} → {url}".format(
+        "🔗 Mercado: {book} → {url}".format(
             book=BOOKMAKER_NAME,
             url=BOOKMAKER_URL,
         ),
@@ -3028,6 +2961,18 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         if under_draw_block:
                             continue
 
+                    # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
+                    diff_rating = rating_home - rating_away
+                    fav_home_clear = diff_rating >= 0.7
+                    if fav_home_clear and score_diff > 0 and minute_int >= 55:
+                        # se favorito está ganhando em casa e contexto não indica necessidade real,
+                        # e/ou pressão não é absurda, ignora alerta manual
+                        if (
+                            context_pp <= 0.5
+                            or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
+                        ):
+                            continue
+
                     # Bloqueio extra: linhas altas em jogos super under
                     linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
                     if match_super_under and linha_num >= 2.5:
@@ -3133,6 +3078,18 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             under_draw_block = False
 
                     if under_draw_block:
+                        continue
+
+                # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
+                diff_rating = rating_home - rating_away
+                fav_home_clear = diff_rating >= 0.7
+                if fav_home_clear and score_diff > 0 and minute_int >= 55:
+                    # se favorito está ganhando em casa e contexto não indica necessidade real
+                    # ou pressão não for bem acima do mínimo, ignora sinal
+                    if (
+                        context_pp <= 0.5
+                        or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
+                    ):
                         continue
 
                 # Bloqueio extra: linhas altas em jogos super under
