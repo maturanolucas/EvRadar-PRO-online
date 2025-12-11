@@ -25,6 +25,7 @@ Features:
     - Muito mais cautela em EMPATES (só libera favorito forte + pressão alta + defesa frágil)
     - Mandante claramente under vencendo → torneira quase sempre fechada
     - Linhas altas em jogos super under podem ser bloqueadas
+    - Malus específico para mata-mata ida/volta (1º jogo tende a ser mais travado)
 - Cálculo de EV e alertas Telegram quando EV >= EV_MIN_PCT
 
 Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-jogo manual).
@@ -408,6 +409,9 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
             if short not in ("1H", "2H"):
                 continue
 
+            league_type = league.get("type") or ""
+            league_round = league.get("round") or ""
+
             home_team_obj = (teams.get("home") or {})
             away_team_obj = (teams.get("away") or {})
 
@@ -442,6 +446,8 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
                     "fixture_id": int(fixture.get("id")),
                     "league_id": league_id,
                     "league_name": league.get("name") or "",
+                    "league_type": league_type,
+                    "league_round": league_round,
                     "season": season,
                     "minute": int(elapsed),
                     "status_short": short,
@@ -2032,6 +2038,77 @@ def _compute_score_context_boost(
     return boost
 
 
+def _compute_knockout_malus(
+    fixture: Dict[str, Any],
+    context_boost_prob: float,
+) -> float:
+    """
+    Malus extra para jogos de mata-mata ida/volta (1ª partida tende a ser mais fechada).
+
+    Heurística:
+    - Só aplica em competições tipo "Cup" ou com nome típico de copa/torneio continental.
+    - Janela ~45–80'.
+    - Placar apertado (0x0, 1x0, 1x1, 2x1) e poucos gols.
+    - Reduz um pouco o contexto positivo (favorito atrás/empatando).
+    """
+    league_type = (fixture.get("league_type") or "").lower()
+    league_name = (fixture.get("league_name") or "").lower()
+    league_round = (fixture.get("league_round") or "").lower()
+
+    # Detecta "clima de mata-mata"
+    is_cup = league_type == "cup" or any(
+        kw in league_name
+        for kw in (
+            "cup",
+            "copa",
+            "taça",
+            "champions",
+            "europa league",
+            "conference league",
+        )
+    )
+    if not is_cup:
+        return 0.0
+
+    minute = fixture.get("minute") or 0
+    try:
+        minute_int = int(minute)
+    except (TypeError, ValueError):
+        minute_int = 0
+
+    if minute_int < 45 or minute_int > 80:
+        return 0.0
+
+    home_goals = fixture.get("home_goals") or 0
+    away_goals = fixture.get("away_goals") or 0
+    total_goals = home_goals + away_goals
+    score_diff = home_goals - away_goals
+
+    # Jogo equilibrado / placar curto → tendência a "não se abrir" tanto
+    if total_goals > 3 or abs(score_diff) > 1:
+        return 0.0
+
+    malus = 0.0
+
+    # 0x0 em copa é bem travado na ida
+    if total_goals == 0:
+        malus -= 0.03
+    else:
+        malus -= 0.02
+
+    # Se o contexto já está puxando muito pra cima (favorito atrás/empatando),
+    # corta um pedaço desse boost.
+    if context_boost_prob > 0.0:
+        malus -= min(context_boost_prob * 0.5, 0.03)
+
+    # Em rodadas com cara de "ida" (round genérico, sem final/semifinal único),
+    # mantém esse malus; em finais únicas (round contém "final"), não pesa tanto.
+    if "final" in league_round:
+        malus *= 0.5
+
+    return malus
+
+
 async def _get_pregame_boost_auto(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
@@ -2194,6 +2271,16 @@ async def _get_pregame_boost_for_fixture(
             context_boost *= 0.9
     except Exception:
         pass
+
+    # Ajuste extra para mata-mata ida/volta (1º jogo tende a ser mais travado)
+    try:
+        ko_malus = _compute_knockout_malus(fixture, context_boost)
+        context_boost += ko_malus
+    except Exception:
+        logging.exception(
+            "Erro ao aplicar malus de mata-mata para fixture=%s",
+            fixture.get("fixture_id"),
+        )
 
     # Clamp de segurança para o contexto (±5 pp já é um empurrão forte)
     if context_boost > 0.05:
@@ -2437,7 +2524,17 @@ def _format_alert_text(
     fixture: Dict[str, Any],
     metrics: Dict[str, float],
 ) -> str:
-    """Formata texto do alerta no layout EvRadar (alerta normal de entrada)."""
+    """
+    Layout enxuto, padrão único pra você só bater o olho e decidir:
+
+    🏟️ Jogo
+    ⏱️ minuto | 🔢 placar
+    ⚙️ Linha: Over x,5 @ odd
+    📊 Probabilidade | Odd justa
+    💰 EV: x% → EV+ / EV-
+    🎯 Stake sugerida: x% da banca
+    🧩 Nota: frase curta (pressão / necessidade de gol)
+    """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
         away=fixture["away_team"],
@@ -2455,41 +2552,33 @@ def _format_alert_text(
     odd_current = metrics["odd_current"]
     ev_pct = metrics["ev_pct"]
     pressure_score = metrics["pressure_score"]
-    news_boost_prob = metrics.get("news_boost_prob", 0.0) * 100.0
-    pregame_boost_prob = metrics.get("pregame_boost_prob", 0.0) * 100.0
-    player_boost_prob = metrics.get("player_boost_prob", 0.0) * 100.0
     context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
     lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
 
     stake_pct = _suggest_stake_pct(ev_pct, odd_current)
-    stake_brl = BANKROLL_INITIAL * (stake_pct / 100.0)
 
-    # Interpretação curta e objetiva
-    interpretacao_parts: List[str] = []
+    # EV+ / EV-
+    ev_label = "EV+" if ev_pct >= 0.0 else "EV-"
+
+    # Nota rápida, 1 linha
+    nota_parts: List[str] = []
 
     if pressure_score >= 7.5:
-        interpretacao_parts.append("pressão forte, jogo bem vivo")
+        nota_parts.append("pressão forte")
     elif pressure_score >= 5.0:
-        interpretacao_parts.append("pressão boa pra buscar +1 gol")
+        nota_parts.append("pressão boa")
     else:
-        interpretacao_parts.append("pressão no limite, entrada mais delicada")
+        nota_parts.append("pressão no limite")
 
     if context_boost_prob > 0.5:
-        interpretacao_parts.append("favorito ainda precisa do gol")
+        nota_parts.append("favorito ainda precisa do gol")
     elif context_boost_prob < -0.5:
-        interpretacao_parts.append("favorito confortável, necessidade menor")
+        nota_parts.append("favorito confortável")
 
     if lucas_boost_prob > 0.0:
-        interpretacao_parts.append("padrão bem alinhado ao teu faro")
+        nota_parts.append("padrão bem alinhado ao teu faro")
 
-    if ev_pct >= EV_MIN_PCT + 2.0:
-        interpretacao_parts.append("EV+ forte")
-    elif ev_pct >= EV_MIN_PCT:
-        interpretacao_parts.append("EV+ dentro do padrão")
-    else:
-        interpretacao_parts.append("EV borderline")
-
-    interpretacao = " / ".join(interpretacao_parts)
+    nota = " / ".join(nota_parts)
 
     lines = [
         "🏟️ {jogo}".format(jogo=jogo),
@@ -2499,19 +2588,9 @@ def _format_alert_text(
             p=p_final,
             odd_j=odd_fair,
         ),
-        "💰 EV: {ev:.2f}%".format(ev=ev_pct),
-        "💵 Stake sugerida: {spct:.2f}% (~R$ {sbrl:.2f})".format(
-            spct=stake_pct,
-            sbrl=stake_brl,
-        ),
-        "",
-        "🧩 Interpretação:",
-        interpretacao,
-        "",
-        "🔗 Mercado: {book} → {url}".format(
-            book=BOOKMAKER_NAME,
-            url=BOOKMAKER_URL,
-        ),
+        "💰 EV: {ev:.2f}% → {lbl}".format(ev=ev_pct, lbl=ev_label),
+        "🎯 Stake sugerida: {spct:.2f}% da banca".format(spct=stake_pct),
+        "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
 
@@ -2522,8 +2601,9 @@ def _format_watch_text(
 ) -> str:
     """
     Alerta de OBSERVAÇÃO:
-    - cenário de gol está forte (pressão + EV),
-    - mas a odd ainda está abaixo da faixa mínima (ex.: < 1.47).
+    - cenário de gol está bom,
+    - mas a odd ainda está abaixo da mínima configurada.
+    Layout enxuto.
     """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
@@ -2542,51 +2622,34 @@ def _format_watch_text(
     odd_current = metrics["odd_current"]
     ev_pct = metrics["ev_pct"]
     pressure_score = metrics["pressure_score"]
-    context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
-    lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
 
-    interpretacao_parts: List[str] = []
-
+    # Nota curta
+    nota_parts: List[str] = []
     if pressure_score >= 7.5:
-        interpretacao_parts.append("pressão forte, cenário quente pra gol")
+        nota_parts.append("pressão forte")
     elif pressure_score >= 5.0:
-        interpretacao_parts.append("pressão boa pra gol")
+        nota_parts.append("pressão boa")
     else:
-        interpretacao_parts.append("pressão ok, mas nada absurdo")
+        nota_parts.append("pressão ok")
 
-    if context_boost_prob > 0.0:
-        interpretacao_parts.append("favorito ainda precisa marcar")
-    elif context_boost_prob < 0.0:
-        interpretacao_parts.append("contexto de favorito confortável")
-
-    if lucas_boost_prob > 0.0:
-        interpretacao_parts.append("padrão alinhado, mas preço ainda baixo")
-
-    interpretacao_parts.append("esperar a odd bater a mínima antes de entrar")
-    interpretacao = " / ".join(interpretacao_parts)
+    nota_parts.append("esperar odd bater a mínima antes de entrar")
+    nota = " / ".join(nota_parts)
 
     lines = [
-        "👀 Cenário de gol em observação",
+        "👀 Observação de gol",
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
-        "⚙️ Linha alvo: {linha}".format(linha=linha_str),
-        "📊 Probabilidade estimada: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
+        "⚙️ Linha: {linha}".format(linha=linha_str),
+        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
             p=p_final,
             odd_j=odd_fair,
         ),
-        "⚠️ Odd atual: {odd:.2f} (abaixo da mínima configurada {mn:.2f})".format(
+        "⚠️ Odd atual: {odd:.2f} (mínima configurada {mn:.2f})".format(
             odd=odd_current,
             mn=MIN_ODD,
         ),
         "💰 EV (na odd atual): {ev:.2f}%".format(ev=ev_pct),
-        "",
-        "🧩 Interpretação:",
-        interpretacao,
-        "",
-        "🔗 Mercado: {book} → {url}".format(
-            book=BOOKMAKER_NAME,
-            url=BOOKMAKER_URL,
-        ),
+        "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
 
@@ -2597,6 +2660,7 @@ def _format_manual_no_odds_text(
 ) -> str:
     """
     Alerta MANUAL quando não há odd em nenhuma API, mas o jogo está no teu padrão.
+    Layout enxuto, focado em probabilidade e plano de ação.
     """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
@@ -2616,25 +2680,28 @@ def _format_manual_no_odds_text(
     context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
     lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
 
-    interpretacao_parts: List[str] = []
+    # Nota curta
+    nota_parts: List[str] = []
 
     if pressure_score >= 7.5:
-        interpretacao_parts.append("pressão forte dentro do teu padrão")
+        nota_parts.append("pressão forte dentro do teu padrão")
     elif pressure_score >= 5.0:
-        interpretacao_parts.append("pressão boa pra buscar +1 gol")
+        nota_parts.append("pressão boa pra +1 gol")
     else:
-        interpretacao_parts.append("pressão mínima aceitável")
+        nota_parts.append("pressão mínima aceitável")
 
     if context_boost_prob > 0.0:
-        interpretacao_parts.append("placar/necessidade jogam a favor do gol")
+        nota_parts.append("placar/necessidade empurram pró gol")
     elif context_boost_prob < 0.0:
-        interpretacao_parts.append("contexto não empurra tanto por gol")
+        nota_parts.append("contexto não força tanto")
 
     if lucas_boost_prob > 0.0:
-        interpretacao_parts.append("cenário encaixado no teu faro")
+        nota_parts.append("cenário encaixado no teu faro")
 
-    interpretacao_parts.append("sem odd na API; usar só como radar e conferir preço na casa")
-    interpretacao = " / ".join(interpretacao_parts)
+    nota_parts.append(
+        "abrir mercado e só entrar se odd ≥ {mn:.2f}".format(mn=MANUAL_MIN_ODD_HINT)
+    )
+    nota = " / ".join(nota_parts)
 
     lines: List[str] = [
         "⚠️ Alerta manual (sem odd nas APIs)",
@@ -2645,24 +2712,7 @@ def _format_manual_no_odds_text(
             p=p_final,
             odd_j=odd_fair,
         ),
-        "ℹ️ Nenhuma odd ao vivo disponível (API-FOOTBALL / The Odds API / cache).",
-        "",
-        "🧩 Interpretação:",
-        interpretacao,
-        "",
-        "🎯 Plano:",
-        "- Abrir o mercado de {linha} na {book} e só considerar entrada se a odd atual".format(
-            linha=linha_str,
-            book=BOOKMAKER_NAME,
-        ),
-        "  estiver ≥ {mn:.2f} e o ritmo/pressão continuarem fortes.".format(
-            mn=MANUAL_MIN_ODD_HINT,
-        ),
-        "",
-        "🔗 Mercado: {book} → {url}".format(
-            book=BOOKMAKER_NAME,
-            url=BOOKMAKER_URL,
-        ),
+        "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
 
@@ -2713,11 +2763,6 @@ def _format_pattern_only_text(
         ),
         "- Nenhuma odd ao vivo disponível nas fontes (API-FOOTBALL/The Odds API).",
         "- Usa este alerta como radar de padrão; confere a odd real na casa antes de entrar.",
-        "",
-        "🔗 Mercado: {book} → {url}".format(
-            book=BOOKMAKER_NAME,
-            url=BOOKMAKER_URL,
-        ),
     ]
     return "\n".join(lines)
 
