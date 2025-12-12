@@ -3404,14 +3404,17 @@ def main() -> None:
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
 
-    # Autoscan via post_init (evita warning de create_task antes do start)
+    # Autoscan (inicia APÓS o start do PTB, evita PTBUserWarning)
     if AUTOSTART:
-        async def _post_init(app: Application) -> None:
+        async def _post_start(app: Application) -> None:
             app.create_task(autoscan_loop(app), name="autoscan_loop")
 
-        application.post_init = _post_init  # type: ignore[assignment]
-
-    # Polling
+        if hasattr(application, "post_start"):
+            application.post_start = _post_start  # type: ignore[attr-defined]
+        else:
+            # Fallback (PTB antigo): pode gerar warning, mas mantém AUTOSTART funcionando
+            application.post_init = _post_start  # type: ignore[assignment]
+# Polling
     application.run_polling()
 
 
