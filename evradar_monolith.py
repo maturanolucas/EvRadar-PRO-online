@@ -1899,6 +1899,49 @@ def _is_match_super_under(
     )
 
 
+
+
+def _goal_tier_gpm(gpm: Optional[float]) -> Optional[int]:
+    """Bucketiza gols/jogo na escala do Lucas.
+    0(<1.0), 1([1.0,1.3)), 2([1.3,1.5)), 3([1.5,1.8)), 4(>=1.8)
+    """
+    if gpm is None:
+        return None
+    try:
+        v = float(gpm)
+    except (TypeError, ValueError):
+        return None
+    if v < 1.0:
+        return 0
+    if v < 1.3:
+        return 1
+    if v < 1.5:
+        return 2
+    if v < 1.8:
+        return 3
+    return 4
+
+
+def _has_goal_ammo(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
+    """Munição p/ gol: ou faz >=1.5/jogo ou toma >=1.5/jogo."""
+    if attack_gpm is None or defense_gpm is None:
+        return True
+    return (attack_gpm >= 1.5) or (defense_gpm >= 1.5)
+
+
+def _is_team_no_ammo(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
+    """Sem munição: faz <1.5 E toma <1.5 (tende a ser cenário ruim p/ teus overs)."""
+    if attack_gpm is None or defense_gpm is None:
+        return False
+    return (attack_gpm < 1.5) and (defense_gpm < 1.5)
+
+
+def _is_super_over_team(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
+    """Super over: faz muito ou toma muito (>=1.8)."""
+    if attack_gpm is None or defense_gpm is None:
+        return False
+    return (attack_gpm >= 1.8) or (defense_gpm >= 1.8)
+
 def _compute_score_context_boost(
     fixture: Dict[str, Any],
     rating_home: float,
@@ -2974,37 +3017,51 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
                         continue
 
-                    # NOVO: filtro pesado para empates em jogos under/equilibrados
-                    is_draw = (score_diff == 0)
-                    if is_draw:
-                        under_draw_block = False
+                # NOVO: filtro de empate alinhado ao teu faro (favorito + munição under/over)
+                is_draw = (score_diff == 0)
+                if is_draw:
+                    # Dados de munição (cache pré-jogo já anexado no fx)
+                    home_attack_gpm = fx.get("home_attack_gpm")
+                    home_defense_gpm = fx.get("home_defense_gpm")
+                    away_attack_gpm = fx.get("away_attack_gpm")
+                    away_defense_gpm = fx.get("away_defense_gpm")
 
-                        # super under + tempo avançado
-                        if match_super_under and minute_int >= 50:
-                            under_draw_block = True
+                    # Bloqueio duro: empate em jogo “seco” (pouca munição)
+                    if _is_match_super_under(home_attack_gpm, home_defense_gpm, away_attack_gpm, away_defense_gpm):
+                        continue
 
-                        # dois times com rating ruim para gols, pressão fraca
-                        if not under_draw_block:
-                            if (
-                                rating_home <= 0.0
-                                and rating_away <= 0.0
-                                and minute_int >= 50
-                                and metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 1.0)
-                            ):
-                                under_draw_block = True
+                    # EXCEÇÃO A: amplo favorito pressionando (“amassando”) contra defesa frágil
+                    diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
+                    fav_side = "home" if diff_rating >= 0.25 else ("away" if diff_rating <= -0.25 else None)
+                    big_fav = abs(diff_rating) >= 0.65
 
-                        # jogo empatado, sem grande favorito pressionando
-                        if not under_draw_block:
-                            if context_pp < 1.0 and metrics["pressure_score"] < 7.0 and minute_int >= 55:
-                                under_draw_block = True
+                    if fav_side == "home":
+                        opp_def_weak = (away_defense_gpm is not None) and (away_defense_gpm >= 1.5)
+                    elif fav_side == "away":
+                        opp_def_weak = (home_defense_gpm is not None) and (home_defense_gpm >= 1.5)
+                    else:
+                        opp_def_weak = False
 
-                        # exceção: favorito pressionando muito + defesa frágil do outro lado
-                        if under_draw_block:
-                            if context_pp >= 2.0 and metrics["pressure_score"] >= 7.0:
-                                under_draw_block = False
+                    allow_big_fav_amass = (
+                        big_fav
+                        and opp_def_weak
+                        and (pressure_score >= 7.0)
+                        and (context_pp >= 1.3)
+                    )
 
-                        if under_draw_block:
-                            continue
+                    # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem “super over” e o jogo estiver MUITO aberto
+                    home_super_over = _is_super_over_team(home_attack_gpm, home_defense_gpm)
+                    away_super_over = _is_super_over_team(away_attack_gpm, away_defense_gpm)
+                    allow_both_super_over = (
+                        home_super_over and away_super_over
+                        and (pressure_score >= 7.5)
+                        and (context_pp >= 1.0)
+                        and (minute_int >= 50)
+                    )
+
+                    if not (allow_big_fav_amass or allow_both_super_over):
+                        continue
+
 
                     # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
                     diff_rating = rating_home - rating_away
