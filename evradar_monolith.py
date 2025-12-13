@@ -2236,7 +2236,7 @@ def _compute_score_context_boost(
     attack_away_gpm = fixture.get("attack_away_gpm")
     defense_away_gpm = fixture.get("defense_away_gpm")
 
-    home_under = _is_team_under_profile(float(fx.get("attack_home_gpm", 0.0)), float(fx.get("defense_home_gpm", 0.0)))
+    home_under = _is_team_under_profile(float(fixture.get("attack_home_gpm", 0.0)), float(fx.get("defense_home_gpm", 0.0)))
     away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
     # se o time "under" está na frente, penaliza mais
