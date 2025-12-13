@@ -34,6 +34,9 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 import asyncio
 import logging
 import os
+
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
+
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
 
@@ -3177,22 +3180,28 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     rating_away = 0.0
 
                 player_boost_prob = 0.0
-                if USE_PLAYER_IMPACT:
-                    try:
-                        player_boost_prob = await _compute_player_boost_for_fixture(
-                            client=client,
-                            fixture=fx,
-                        )
-                    except Exception:
-                        logging.exception(
-                            "Erro inesperado ao calcular impacto de jogadores para fixture=%s",
-                            fx["fixture_id"],
-                        )
-                        player_boost_prob = 0.0
+if USE_PLAYER_IMPACT:
+    try:
+        player_boost_prob = await _compute_player_boost_for_fixture(
+            client=client,
+            fixture=fx,
+        )
+    except Exception:
+        logging.exception(
+            "Erro inesperado ao calcular impacto de jogadores para fixture=%s",
+            fx["fixture_id"],
+        )
+        player_boost_prob = 0.0
 
-                # Flag de mandante claramente under (para filtros duros)
-                home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
+# Perfis de ataque/defesa e flag super under preenchidos no fixture
+attack_home_gpm = float(fx.get("attack_home_gpm", 0.0))
+defense_home_gpm = float(fx.get("defense_home_gpm", 0.0))
+attack_away_gpm = float(fx.get("attack_away_gpm", 0.0))
+defense_away_gpm = float(fx.get("defense_away_gpm", 0.0))
+match_super_under = bool(fx.get("match_super_under", False))
 
+# Flag de mandante claramente under (para filtros duros)
+home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
                 # Perfis de ataque/defesa e flag super under preenchidos no fixture
                 attack_home_gpm = float(fx.get("attack_home_gpm", 0.0))
                 defense_home_gpm = float(fx.get("defense_home_gpm", 0.0))
