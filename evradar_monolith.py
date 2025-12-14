@@ -125,6 +125,9 @@ if _chat_raw:
 AUTOSTART: int = _get_env_int("AUTOSTART", 0)
 CHECK_INTERVAL: int = _get_env_int("CHECK_INTERVAL", 60)
 
+
+# Timeout padrão para chamadas HTTP (segundos)
+HTTP_TIMEOUT: float = _get_env_float("HTTP_TIMEOUT", 10.0)
 WINDOW_START: int = _get_env_int("WINDOW_START", 47)
 WINDOW_END: int = _get_env_int("WINDOW_END", 75)
 
@@ -3089,6 +3092,14 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 total_goals = fx["home_goals"] + fx["away_goals"]
 
+
+                # Base do placar (sempre definido p/ evitar UnboundLocalError)
+                score_diff = (fx.get("home_goals") or 0) - (fx.get("away_goals") or 0)
+                minute_int = fx.get("minute") or 0
+                try:
+                    minute_int = int(minute_int)
+                except (TypeError, ValueError):
+                    minute_int = 0
                 api_odd: Optional[float] = None
                 got_live_odd = False
                 used_cache_odd = False
@@ -3189,10 +3200,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             fx["fixture_id"],
                         )
                         player_boost_prob = 0.0
-
-                # Flag de mandante claramente under (para filtros duros)
-                home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
-
+                # Flag de mandante claramente under (para filtros duros) — calculado após extrair perfis GPM
                                 # Perfis de ataque/defesa (gols por jogo) — sempre definidos (anti-crash)
                 def _to_float(_v, _default=0.0):
                     try:
@@ -3208,6 +3216,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 defense_away_gpm = _to_float(fx.get("defense_away_gpm", fx.get("away_defense_gpm", 0.0)), 0.0)
                 match_super_under = bool(fx.get("match_super_under", False))
 
+
+                home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
                 # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
                 fx["attack_home_gpm"] = attack_home_gpm
                 fx["defense_home_gpm"] = defense_home_gpm
