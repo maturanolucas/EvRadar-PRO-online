@@ -141,6 +141,14 @@ ALLOW_WATCH_ALERTS: int = _get_env_int("ALLOW_WATCH_ALERTS", 0)
 # Bloqueio do teu perfil: evitar jogos com o FAVORITO na frente (ex.: Twente/City/Brugge). Defina 0 para desativar.
 BLOCK_FAVORITE_LEADING: int = _get_env_int("BLOCK_FAVORITE_LEADING", 1)
 
+# Bloqueio adicional (teu perfil): evita jogos "muito encaminhados" no 2º tempo (qualquer lado abrindo 2+ gols).
+BLOCK_LEAD_BY_2: int = _get_env_int("BLOCK_LEAD_BY_2", 1)
+LEAD_BY_2_MINUTE: int = _get_env_int("LEAD_BY_2_MINUTE", 55)
+
+# Se o jogo é "super under" e já tem alguém na frente, normalmente trava — bloqueia por padrão.
+BLOCK_SUPER_UNDER_LEADING: int = _get_env_int("BLOCK_SUPER_UNDER_LEADING", 1)
+
+
 # Cooldown e pressão mínima
 COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
 MIN_PRESSURE_SCORE: float = _get_env_float("MIN_PRESSURE_SCORE", 5.0)
@@ -3220,13 +3228,21 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         if trailing_no_ammo:
                             continue
 
+                    # 1b) Bloqueio: jogo já muito encaminhado (2+ gols de diferença) no 2º tempo.
+                    if BLOCK_LEAD_BY_2 and (minute_int >= LEAD_BY_2_MINUTE) and (abs(score_diff) >= 2):
+                        continue
+
+                    # 1c) Bloqueio: match super under com alguém já na frente (tende a travar/administrar).
+                    if BLOCK_SUPER_UNDER_LEADING and match_super_under and (minute_int >= 55) and (score_diff != 0):
+                        continue
+
                     # 2) Bloqueio: favorito pré-live já na frente (principalmente em casa) — raro ser teu perfil.
                     if BLOCK_FAVORITE_LEADING and (score_diff != 0) and (minute_int >= 55):
                         is_fav_ahead = (
                             (fav_side == "home" and score_diff > 0)
                             or (fav_side == "away" and score_diff < 0)
                         )
-                        if is_fav_ahead and (fav_strength >= 1):
+                        if is_fav_ahead:
                             continue
                 except Exception:
                     # nunca quebrar scan por causa de filtro
