@@ -3108,27 +3108,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     minute_int = int(minute_int)
                 except (TypeError, ValueError):
                     minute_int = 0
-
-                # Bloqueio do teu perfil: FAVORITO na frente (você quase nunca quer esses jogos)
-                if BLOCK_FAVORITE_LEADING and (score_diff != 0) and (minute_int >= 55):
-                    fav_side2 = fx.get("favorite_side")
-                    if fav_side2 not in ("home", "away"):
-                        # fallback por rating (diferença precisa ser bem clara)
-                        try:
-                            diff_rating2 = float(rating_home or 0.0) - float(rating_away or 0.0)
-                        except Exception:
-                            diff_rating2 = 0.0
-                        if diff_rating2 >= 0.55:
-                            fav_side2 = "home"
-                        elif diff_rating2 <= -0.55:
-                            fav_side2 = "away"
-                        else:
-                            fav_side2 = None
-
-                    if fav_side2 in ("home", "away"):
-                        lead = score_diff if fav_side2 == "home" else (-score_diff)
-                        if lead > 0:
-                            continue
                 api_odd: Optional[float] = None
                 got_live_odd = False
                 used_cache_odd = False
@@ -3215,6 +3194,43 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     context_boost_prob = 0.0
                     rating_home = 0.0
                     rating_away = 0.0
+
+                # -------------------------------
+                # Filtros do teu perfil (PÓS pré-jogo, com favorito pré-live já definido)
+                # -------------------------------
+                try:
+                    fav_side = fx.get("favorite_side")
+                    try:
+                        fav_strength = int(fx.get("favorite_strength") or 0)
+                    except (TypeError, ValueError):
+                        fav_strength = 0
+
+                    attack_home_gpm = _to_float(fx.get("attack_home_gpm", fx.get("home_attack_gpm", 0.0)), 0.0)
+                    defense_home_gpm = _to_float(fx.get("defense_home_gpm", fx.get("home_defense_gpm", 0.0)), 0.0)
+                    attack_away_gpm = _to_float(fx.get("attack_away_gpm", fx.get("away_attack_gpm", 0.0)), 0.0)
+                    defense_away_gpm = _to_float(fx.get("defense_away_gpm", fx.get("away_defense_gpm", 0.0)), 0.0)
+
+                    home_no_ammo = _is_team_no_ammo(attack_home_gpm, defense_home_gpm)
+                    away_no_ammo = _is_team_no_ammo(attack_away_gpm, defense_away_gpm)
+
+                    # 1) Se quem está perdendo tem "pouca munição" (time under/sem gol), você quase nunca quer.
+                    if (score_diff != 0) and (minute_int >= 55):
+                        trailing_side = "away" if score_diff > 0 else "home"
+                        trailing_no_ammo = away_no_ammo if trailing_side == "away" else home_no_ammo
+                        if trailing_no_ammo:
+                            continue
+
+                    # 2) Bloqueio: favorito pré-live já na frente (principalmente em casa) — raro ser teu perfil.
+                    if BLOCK_FAVORITE_LEADING and (score_diff != 0) and (minute_int >= 55):
+                        is_fav_ahead = (
+                            (fav_side == "home" and score_diff > 0)
+                            or (fav_side == "away" and score_diff < 0)
+                        )
+                        if is_fav_ahead and (fav_strength >= 1):
+                            continue
+                except Exception:
+                    # nunca quebrar scan por causa de filtro
+                    pass
 
                 player_boost_prob = 0.0
                 if USE_PLAYER_IMPACT:
