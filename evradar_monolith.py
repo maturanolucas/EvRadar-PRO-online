@@ -148,9 +148,6 @@ API_FOOTBALL_BASE_URL: str = _get_env_str(
     "https://v3.football.api-sports.io",
 )
 
-# HTTP timeout padrão para chamadas HTTP (segundos)
-HTTP_TIMEOUT: float = _get_env_float("HTTP_TIMEOUT", 10.0)
-
 LEAGUE_IDS_RAW: str = _get_env_str("LEAGUE_IDS")
 LEAGUE_IDS: List[int] = _parse_league_ids(LEAGUE_IDS_RAW)
 
@@ -2234,12 +2231,18 @@ def _compute_score_context_boost(
         boost += 0.0
 
     # 3) Perfil under/over real via gols por jogo (munição)
-    attack_home_gpm = fixture.get("attack_home_gpm")
-    defense_home_gpm = fixture.get("defense_home_gpm")
-    attack_away_gpm = fixture.get("attack_away_gpm")
-    defense_away_gpm = fixture.get("defense_away_gpm")
+    def _to_float_or_none(v: Any) -> Optional[float]:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
 
-    home_under = _is_team_under_profile(float(fx.get("attack_home_gpm", 0.0)), float(fx.get("defense_home_gpm", 0.0)))
+    attack_home_gpm = _to_float_or_none(fixture.get("attack_home_gpm"))
+    defense_home_gpm = _to_float_or_none(fixture.get("defense_home_gpm"))
+    attack_away_gpm = _to_float_or_none(fixture.get("attack_away_gpm"))
+    defense_away_gpm = _to_float_or_none(fixture.get("defense_away_gpm"))
+
+    home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
     away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
     # se o time "under" está na frente, penaliza mais
@@ -2462,6 +2465,18 @@ async def _get_pregame_boost_for_fixture(
 
     auto_boost = 0.0
 
+    # Defaults neutros para evitar UnboundLocalError quando algum cálculo falhar
+    def _coerce_gpm(v: Any, default: float = 1.4) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float(default)
+
+    attack_home_gpm = _coerce_gpm(fixture.get("attack_home_gpm"), 1.4)
+    defense_home_gpm = _coerce_gpm(fixture.get("defense_home_gpm"), 1.4)
+    attack_away_gpm = _coerce_gpm(fixture.get("attack_away_gpm"), 1.4)
+    defense_away_gpm = _coerce_gpm(fixture.get("defense_away_gpm"), 1.4)
+
     if USE_API_PREGAME:
         try:
             auto_data = await _get_pregame_boost_auto(client, fixture)
@@ -2476,12 +2491,24 @@ async def _get_pregame_boost_for_fixture(
             auto_boost = 0.0
 
     # Pega perfis de ataque/defesa (gols por jogo) do cache
-    attack_home_gpm, defense_home_gpm = _get_team_attack_defense_from_cache(
-        home_team_id, league_id, season
-    )
-    attack_away_gpm, defense_away_gpm = _get_team_attack_defense_from_cache(
-        away_team_id, league_id, season
-    )
+    try:
+        attack_home_gpm, defense_home_gpm = _get_team_attack_defense_from_cache(
+            home_team_id, league_id, season
+        )
+        attack_away_gpm, defense_away_gpm = _get_team_attack_defense_from_cache(
+            away_team_id, league_id, season
+        )
+    except Exception:
+        logging.exception(
+            "Erro ao obter perfis ataque/defesa do cache para fixture=%s",
+            fixture.get("fixture_id"),
+        )
+
+    # Garante floats (ou defaults neutros) para evitar crashes em comparações
+    attack_home_gpm = _coerce_gpm(attack_home_gpm, 1.4)
+    defense_home_gpm = _coerce_gpm(defense_home_gpm, 1.4)
+    attack_away_gpm = _coerce_gpm(attack_away_gpm, 1.4)
+    defense_away_gpm = _coerce_gpm(defense_away_gpm, 1.4)
 
     fixture["attack_home_gpm"] = attack_home_gpm
     fixture["defense_home_gpm"] = defense_home_gpm
@@ -3193,15 +3220,15 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         )
                         player_boost_prob = 0.0
 
+                # Perfis de ataque/defesa e flag super under preenchidos no fixture
+                attack_home_gpm = float(fx.get("attack_home_gpm") or 1.4)
+                defense_home_gpm = float(fx.get("defense_home_gpm") or 1.4)
+                attack_away_gpm = float(fx.get("attack_away_gpm") or 1.4)
+                defense_away_gpm = float(fx.get("defense_away_gpm") or 1.4)
+                match_super_under = bool(fx.get("match_super_under", False))
+
                 # Flag de mandante claramente under (para filtros duros)
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
-
-                # Perfis de ataque/defesa e flag super under preenchidos no fixture
-                attack_home_gpm = float(fx.get("attack_home_gpm", 0.0))
-                defense_home_gpm = float(fx.get("defense_home_gpm", 0.0))
-                attack_away_gpm = float(fx.get("attack_away_gpm", 0.0))
-                defense_away_gpm = float(fx.get("defense_away_gpm", 0.0))
-                match_super_under = bool(fx.get("match_super_under", False))
 
                 # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
                 if api_odd is None:
