@@ -135,6 +135,12 @@ EV_MIN_PCT: float = _get_env_float("EV_MIN_PCT", 4.0)
 MIN_ODD: float = _get_env_float("MIN_ODD", 1.47)
 MAX_ODD: float = _get_env_float("MAX_ODD", 3.50)
 
+# Watch/observação: por padrão NÃO envia (apenas sinais). Defina ALLOW_WATCH_ALERTS=1 para reativar.
+ALLOW_WATCH_ALERTS: int = _get_env_int("ALLOW_WATCH_ALERTS", 0)
+
+# Bloqueio do teu perfil: evitar jogos com o FAVORITO na frente (ex.: Twente/City/Brugge). Defina 0 para desativar.
+BLOCK_FAVORITE_LEADING: int = _get_env_int("BLOCK_FAVORITE_LEADING", 1)
+
 # Cooldown e pressão mínima
 COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
 MIN_PRESSURE_SCORE: float = _get_env_float("MIN_PRESSURE_SCORE", 5.0)
@@ -3275,9 +3281,17 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
 
                     # Filtro forte para jogos com contexto negativo (favorito confortável etc.)
-                    if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
+                    if context_pp <= -1.5 and score_diff != 0 and minute_int >= 55:
                         continue
 
+
+                # Bloqueio do teu perfil: favorito na frente (você geralmente NÃO quer esses jogos)
+                if BLOCK_FAVORITE_LEADING and (score_diff != 0) and (minute_int >= 55):
+                    fav_side = fx.get("favorite_side")
+                    if fav_side in ("home", "away"):
+                        lead = score_diff if fav_side == "home" else (-score_diff)
+                        if lead > 0:
+                            continue
                 # NOVO: filtro de empate alinhado ao teu faro (favorito + munição under/over)
                 is_draw = (score_diff == 0)
                 if is_draw:
@@ -3428,9 +3442,17 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
 
                 # Filtro forte para contexto muito negativo (favorito confortável) com tempo avançado
-                if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
+                if context_pp <= -1.5 and score_diff != 0 and minute_int >= 55:
                     continue
 
+
+                # Bloqueio do teu perfil: favorito na frente (você geralmente NÃO quer esses jogos)
+                if BLOCK_FAVORITE_LEADING and (score_diff != 0) and (minute_int >= 55):
+                    fav_side = fx.get("favorite_side")
+                    if fav_side in ("home", "away"):
+                        lead = score_diff if fav_side == "home" else (-score_diff)
+                        if lead > 0:
+                            continue
                 # NOVO: filtro pesado para empates em jogos under/equilibrados
                 is_draw = (score_diff == 0)
                 if is_draw:
@@ -3504,15 +3526,17 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # Aqui odd vem das APIs (ou cache real) → aplica faixa de odds
                 if odd_cur > MAX_ODD:
                     continue
-
                 if odd_cur < MIN_ODD:
-                    alert_text = _format_watch_text(fx, metrics)
+                    if ALLOW_WATCH_ALERTS:
+                        alert_text = _format_watch_text(fx, metrics)
+                    else:
+                        # sem "observação" por padrão: só envia sinais quando a odd já está >= MIN_ODD
+                        continue
                 else:
                     alert_text = _format_alert_text(fx, metrics)
 
                 alerts.append(alert_text)
                 fixture_last_alert_at[fixture_id] = now
-
             except Exception:
                 logging.exception(
                     "Erro ao processar fixture_id=%s",
