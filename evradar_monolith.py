@@ -2437,23 +2437,6 @@ async def _get_pregame_boost_for_fixture(
     rating_home = PREMATCH_TEAM_RATINGS.get(home_name, 0.0)
     rating_away = PREMATCH_TEAM_RATINGS.get(away_name, 0.0)
 
-    # Se não conseguimos odds pré-live, define um favorito por rating (fallback leve)
-    if fixture.get("favorite_side") is None:
-        diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
-        if diff_rating >= 0.25:
-            fixture["favorite_side"] = "home"
-        elif diff_rating <= -0.25:
-            fixture["favorite_side"] = "away"
-        else:
-            fixture["favorite_side"] = None
-
-        # força aproximada (2=forte, 1=leve)
-        if abs(diff_rating) >= 0.70:
-            fixture["favorite_strength"] = 2
-        elif abs(diff_rating) >= 0.40:
-            fixture["favorite_strength"] = 1
-        else:
-            fixture["favorite_strength"] = 0
 
     league_id = fixture.get("league_id")
     season = fixture.get("season")
@@ -2474,6 +2457,25 @@ async def _get_pregame_boost_for_fixture(
                 fixture.get("fixture_id"),
             )
             auto_boost = 0.0
+
+
+    # Se não conseguimos odds pré-live, define um favorito por rating (fallback leve).
+    # IMPORTANTe: este fallback precisa rodar DEPOIS do pré-jogo automático, senão o favorito pode ficar "None"
+    # mesmo quando o auto_data já trouxe rating_home/rating_away.
+    if fixture.get("favorite_side") is None:
+        diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
+        if abs(diff_rating) >= 0.35:
+            fixture["favorite_side"] = "home" if diff_rating > 0 else "away"
+        else:
+            fixture["favorite_side"] = None
+
+        # força aproximada (2=forte, 1=leve)
+        if abs(diff_rating) >= 0.70:
+            fixture["favorite_strength"] = 2
+        elif abs(diff_rating) >= 0.45:
+            fixture["favorite_strength"] = 1
+        else:
+            fixture["favorite_strength"] = 0
 
     # Pega perfis de ataque/defesa (gols por jogo) do cache
     attack_home_gpm, defense_home_gpm = _get_team_attack_defense_from_cache(
