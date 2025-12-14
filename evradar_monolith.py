@@ -135,12 +135,6 @@ EV_MIN_PCT: float = _get_env_float("EV_MIN_PCT", 4.0)
 MIN_ODD: float = _get_env_float("MIN_ODD", 1.47)
 MAX_ODD: float = _get_env_float("MAX_ODD", 3.50)
 
-# Watch/observação: por padrão NÃO envia (apenas sinais). Defina ALLOW_WATCH_ALERTS=1 para reativar.
-ALLOW_WATCH_ALERTS: int = _get_env_int("ALLOW_WATCH_ALERTS", 0)
-
-# Bloqueio do teu perfil: evitar jogos com o FAVORITO na frente (ex.: Twente/City/Brugge). Defina 0 para desativar.
-BLOCK_FAVORITE_LEADING: int = _get_env_int("BLOCK_FAVORITE_LEADING", 1)
-
 # Cooldown e pressão mínima
 COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
 MIN_PRESSURE_SCORE: float = _get_env_float("MIN_PRESSURE_SCORE", 5.0)
@@ -208,9 +202,20 @@ ODDS_API_BOOKMAKERS: List[str] = [
 # Limite diário de chamadas à The Odds API (para proteger o plano grátis)
 ODDS_API_DAILY_LIMIT: int = _get_env_int("ODDS_API_DAILY_LIMIT", 15)
 
+# Cache curto por sport_key para reduzir chamadas (principalmente quando API-FOOTBALL retorna "sem bookmakers")
+ODDS_API_CACHE_SECONDS: int = _get_env_int("ODDS_API_CACHE_SECONDS", 75)
+
+# {cache_key: {"ts": datetime, "data": list}}
+oddsapi_sport_cache: Dict[str, Dict[str, Any]] = {}
+
+
 # NOVO: modo de alerta manual quando não houver odd nas APIs
 ALLOW_ALERTS_WITHOUT_ODDS: int = _get_env_int("ALLOW_ALERTS_WITHOUT_ODDS", 1)
 MANUAL_MIN_ODD_HINT: float = _get_env_float("MANUAL_MIN_ODD_HINT", 1.47)
+
+# NOVO: enviar "observações" quando odd < MIN_ODD (0=apenas sinais, 1=permite observação)
+ALLOW_WATCH_ALERTS: int = _get_env_int("ALLOW_WATCH_ALERTS", 0)
+
 
 # NOVO: detecção de favorito via odds pré-live (API-FOOTBALL /odds)
 USE_PRELIVE_FAVORITE: int = _get_env_int("USE_PRELIVE_FAVORITE", 1)
@@ -1123,36 +1128,59 @@ async def _fetch_live_odds_for_fixture_odds_api(
         sport_key=sport_key,
     )
 
-    try:
-        resp = await client.get(
-            url,
-            params=params,
-            timeout=10.0,
-        )
+    # Cache por sport_key (reduz chamadas repetidas a cada ciclo)
+    cache_key = "{sk}|{reg}|{mkt}|{bks}".format(
+        sk=sport_key,
+        reg=ODDS_API_REGIONS,
+        mkt=ODDS_API_MARKETS,
+        bks=",".join(ODDS_API_BOOKMAKERS) if ODDS_API_BOOKMAKERS else "*",
+    )
+    now = _now_utc()
+    cached = oddsapi_sport_cache.get(cache_key)
+    data = None
 
-        # contamos essa chamada no limite diário
-        oddsapi_calls_today += 1
-
-        # (opcional) loga o header de créditos restantes se a API informar
-        remaining = (
-            resp.headers.get("x-requests-remaining")
-            or resp.headers.get("X-Requests-Remaining")
-        )
-        if remaining is not None:
-            logging.info(
-                "The Odds API: chamadas restantes reportadas pelo provedor: %s",
-                remaining,
+    if (
+        cached is not None
+        and isinstance(cached.get("ts"), datetime)
+        and isinstance(cached.get("data"), list)
+        and ODDS_API_CACHE_SECONDS > 0
+        and (now - cached["ts"]).total_seconds() <= float(ODDS_API_CACHE_SECONDS)
+    ):
+        data = cached["data"]
+    else:
+        try:
+            resp = await client.get(
+                url,
+                params=params,
+                timeout=10.0,
             )
 
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        logging.exception(
-            "Erro ao buscar odds na The Odds API para sport_key=%s (fixture=%s)",
-            sport_key,
-            fixture.get("fixture_id"),
-        )
-        return None
+            # contamos essa chamada no limite diário
+            oddsapi_calls_today += 1
+
+            # (opcional) loga o header de créditos restantes se a API informar
+            remaining = (
+                resp.headers.get("x-requests-remaining")
+                or resp.headers.get("X-Requests-Remaining")
+            )
+            if remaining is not None:
+                logging.info(
+                    "The Odds API: chamadas restantes reportadas pelo provedor: %s",
+                    remaining,
+                )
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            # atualiza cache
+            oddsapi_sport_cache[cache_key] = {"ts": now, "data": data}
+        except Exception:
+            logging.exception(
+                "Erro ao buscar odds na The Odds API para sport_key=%s (fixture=%s)",
+                sport_key,
+                fixture.get("fixture_id"),
+            )
+            return None
 
     events = data or []
     if not isinstance(events, list) or not events:
@@ -3281,17 +3309,9 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
 
                     # Filtro forte para jogos com contexto negativo (favorito confortável etc.)
-                    if context_pp <= -1.5 and score_diff != 0 and minute_int >= 55:
+                    if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
                         continue
 
-
-                # Bloqueio do teu perfil: favorito na frente (você geralmente NÃO quer esses jogos)
-                if BLOCK_FAVORITE_LEADING and (score_diff != 0) and (minute_int >= 55):
-                    fav_side = fx.get("favorite_side")
-                    if fav_side in ("home", "away"):
-                        lead = score_diff if fav_side == "home" else (-score_diff)
-                        if lead > 0:
-                            continue
                 # NOVO: filtro de empate alinhado ao teu faro (favorito + munição under/over)
                 is_draw = (score_diff == 0)
                 if is_draw:
@@ -3346,20 +3366,34 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         continue
 
 
-                    # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
+                    # Filtro: favorito na frente (alinhado ao teu faro)
                     fav_side2 = fx.get("favorite_side")
                     try:
                         fav_strength2 = int(fx.get("favorite_strength") or 0)
                     except (TypeError, ValueError):
                         fav_strength2 = 0
-                    diff_rating = rating_home - rating_away
-                    fav_home_clear = ((fav_side2 == "home") and (fav_strength2 >= 2)) or (diff_rating >= 0.7)
-                    if fav_home_clear and score_diff > 0 and minute_int >= 55:
-                        # se favorito está ganhando em casa e contexto não indica necessidade real,
-                        # e/ou pressão não é absurda, ignora alerta manual
+
+                    # lead do favorito em gols (positivo = favorito vencendo)
+                    fav_lead = 0
+                    if fav_side2 == "home":
+                        fav_lead = score_diff
+                    elif fav_side2 == "away":
+                        fav_lead = -score_diff
+
+                    # Se favorito claro já está na frente, isso normalmente NÃO é teu perfil:
+                    if fav_strength2 >= 2 and fav_lead > 0 and minute_int >= 55:
+                        # 2+ gols de vantagem -> bloqueia (ex.: 2–0 / 3–1 etc.)
+                        if fav_lead >= 2:
+                            continue
+
+                        # Vantagem mínima (1 gol): só deixa passar se estiver MUITO acima do normal,
+                        # e sem linha alta (senão vira "gol de consolidação" que você não busca).
+                        linha_num_tmp = (fx["home_goals"] + fx["away_goals"]) + 0.5
+                        if linha_num_tmp >= 3.5:
+                            continue
                         if (
-                            context_pp <= 0.5
-                            or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
+                            context_pp < 1.2
+                            or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 3.0)
                         ):
                             continue
 
@@ -3442,17 +3476,9 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
 
                 # Filtro forte para contexto muito negativo (favorito confortável) com tempo avançado
-                if context_pp <= -1.5 and score_diff != 0 and minute_int >= 55:
+                if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
                     continue
 
-
-                # Bloqueio do teu perfil: favorito na frente (você geralmente NÃO quer esses jogos)
-                if BLOCK_FAVORITE_LEADING and (score_diff != 0) and (minute_int >= 55):
-                    fav_side = fx.get("favorite_side")
-                    if fav_side in ("home", "away"):
-                        lead = score_diff if fav_side == "home" else (-score_diff)
-                        if lead > 0:
-                            continue
                 # NOVO: filtro pesado para empates em jogos under/equilibrados
                 is_draw = (score_diff == 0)
                 if is_draw:
@@ -3485,15 +3511,34 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if under_draw_block:
                         continue
 
-                # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
-                diff_rating = rating_home - rating_away
-                fav_home_clear = diff_rating >= 0.7
-                if fav_home_clear and score_diff > 0 and minute_int >= 55:
-                    # se favorito está ganhando em casa e contexto não indica necessidade real
-                    # ou pressão não for bem acima do mínimo, ignora sinal
+                # Filtro: favorito na frente (alinhado ao teu faro)
+                fav_side2 = fx.get("favorite_side")
+                try:
+                    fav_strength2 = int(fx.get("favorite_strength") or 0)
+                except (TypeError, ValueError):
+                    fav_strength2 = 0
+
+                # lead do favorito em gols (positivo = favorito vencendo)
+                fav_lead = 0
+                if fav_side2 == "home":
+                    fav_lead = score_diff
+                elif fav_side2 == "away":
+                    fav_lead = -score_diff
+
+                # Se favorito claro já está na frente, isso normalmente NÃO é teu perfil:
+                if fav_strength2 >= 2 and fav_lead > 0 and minute_int >= 55:
+                    # 2+ gols de vantagem -> bloqueia (ex.: 2–0 / 3–1 etc.)
+                    if fav_lead >= 2:
+                        continue
+
+                    # Vantagem mínima (1 gol): só deixa passar se estiver MUITO acima do normal,
+                    # e sem linha alta (senão vira "gol de consolidação" que você não busca).
+                    linha_num_tmp = (fx["home_goals"] + fx["away_goals"]) + 0.5
+                    if linha_num_tmp >= 3.5:
+                        continue
                     if (
-                        context_pp <= 0.5
-                        or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
+                        context_pp < 1.2
+                        or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 3.0)
                     ):
                         continue
 
@@ -3526,17 +3571,17 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # Aqui odd vem das APIs (ou cache real) → aplica faixa de odds
                 if odd_cur > MAX_ODD:
                     continue
+
                 if odd_cur < MIN_ODD:
-                    if ALLOW_WATCH_ALERTS:
-                        alert_text = _format_watch_text(fx, metrics)
-                    else:
-                        # sem "observação" por padrão: só envia sinais quando a odd já está >= MIN_ODD
+                    if not ALLOW_WATCH_ALERTS:
                         continue
+                    alert_text = _format_watch_text(fx, metrics)
                 else:
                     alert_text = _format_alert_text(fx, metrics)
 
                 alerts.append(alert_text)
                 fixture_last_alert_at[fixture_id] = now
+
             except Exception:
                 logging.exception(
                     "Erro ao processar fixture_id=%s",
@@ -3764,26 +3809,42 @@ def main() -> None:
         logging.error("TELEGRAM_BOT_TOKEN não definido; encerrando.")
         return
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Handlers
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("scan", cmd_scan))
-    application.add_handler(CommandHandler("debug", cmd_debug))
-    application.add_handler(CommandHandler("links", cmd_links))
+builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+builder_has_post_init = hasattr(builder, "post_init")
 
-    # Autoscan (inicia APÓS o start do PTB, evita PTBUserWarning)
-    if AUTOSTART:
-        async def _post_start(app: Application) -> None:
-            app.create_task(autoscan_loop(app), name="autoscan_loop")
+# Autoscan (AUTOSTART=1): agenda de forma que NÃO gere PTBUserWarning
+# - Preferência (PTB v20+): builder.post_init(async_cb)
+# - Fallback: application.post_init = async_cb (usando asyncio.create_task)
+_post_init_cb = None
+if AUTOSTART:
+    async def _post_init(app: Application) -> None:
+        # Não use app.create_task aqui (pode gerar warning antes do "running")
+        asyncio.create_task(autoscan_loop(app), name="autoscan_loop")
 
-        if hasattr(application, "post_start"):
-            application.post_start = _post_start  # type: ignore[attr-defined]
-        else:
-            # Fallback (PTB antigo): pode gerar warning, mas mantém AUTOSTART funcionando
-            application.post_init = _post_start  # type: ignore[assignment]
-# Polling
+    _post_init_cb = _post_init
+    if builder_has_post_init:
+        try:
+            builder = builder.post_init(_post_init)  # type: ignore[attr-defined]
+        except Exception:
+            # segue para fallback abaixo
+            builder_has_post_init = False
+
+application = builder.build()
+
+# Handlers
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("status", cmd_status))
+application.add_handler(CommandHandler("scan", cmd_scan))
+application.add_handler(CommandHandler("debug", cmd_debug))
+application.add_handler(CommandHandler("links", cmd_links))
+
+if AUTOSTART and (not builder_has_post_init) and (_post_init_cb is not None):
+    try:
+        application.post_init = _post_init_cb  # type: ignore[assignment]
+    except Exception:
+        logging.warning("AUTOSTART=1, mas não consegui agendar autoscan automaticamente; use /scan.")
+
     application.run_polling()
 
 
