@@ -34,9 +34,6 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 import asyncio
 import logging
 import os
-
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
-
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
 
@@ -150,6 +147,9 @@ API_FOOTBALL_BASE_URL: str = _get_env_str(
     "API_FOOTBALL_BASE_URL",
     "https://v3.football.api-sports.io",
 )
+
+# HTTP timeout padrão para chamadas HTTP (segundos)
+HTTP_TIMEOUT: float = _get_env_float("HTTP_TIMEOUT", 10.0)
 
 LEAGUE_IDS_RAW: str = _get_env_str("LEAGUE_IDS")
 LEAGUE_IDS: List[int] = _parse_league_ids(LEAGUE_IDS_RAW)
@@ -2239,7 +2239,7 @@ def _compute_score_context_boost(
     attack_away_gpm = fixture.get("attack_away_gpm")
     defense_away_gpm = fixture.get("defense_away_gpm")
 
-    home_under = _is_team_under_profile(float(fixture.get("attack_home_gpm", 0.0)), float(fx.get("defense_home_gpm", 0.0)))
+    home_under = _is_team_under_profile(float(fx.get("attack_home_gpm", 0.0)), float(fx.get("defense_home_gpm", 0.0)))
     away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
     # se o time "under" está na frente, penaliza mais
@@ -3180,28 +3180,22 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     rating_away = 0.0
 
                 player_boost_prob = 0.0
-if USE_PLAYER_IMPACT:
-    try:
-        player_boost_prob = await _compute_player_boost_for_fixture(
-            client=client,
-            fixture=fx,
-        )
-    except Exception:
-        logging.exception(
-            "Erro inesperado ao calcular impacto de jogadores para fixture=%s",
-            fx["fixture_id"],
-        )
-        player_boost_prob = 0.0
+                if USE_PLAYER_IMPACT:
+                    try:
+                        player_boost_prob = await _compute_player_boost_for_fixture(
+                            client=client,
+                            fixture=fx,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Erro inesperado ao calcular impacto de jogadores para fixture=%s",
+                            fx["fixture_id"],
+                        )
+                        player_boost_prob = 0.0
 
-# Perfis de ataque/defesa e flag super under preenchidos no fixture
-attack_home_gpm = float(fx.get("attack_home_gpm", 0.0))
-defense_home_gpm = float(fx.get("defense_home_gpm", 0.0))
-attack_away_gpm = float(fx.get("attack_away_gpm", 0.0))
-defense_away_gpm = float(fx.get("defense_away_gpm", 0.0))
-match_super_under = bool(fx.get("match_super_under", False))
+                # Flag de mandante claramente under (para filtros duros)
+                home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
 
-# Flag de mandante claramente under (para filtros duros)
-home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
                 # Perfis de ataque/defesa e flag super under preenchidos no fixture
                 attack_home_gpm = float(fx.get("attack_home_gpm", 0.0))
                 defense_home_gpm = float(fx.get("defense_home_gpm", 0.0))
