@@ -159,9 +159,6 @@ BOOKMAKER_FALLBACK_IDS: List[int] = _parse_league_ids(BOOKMAKER_FALLBACK_IDS_RAW
 # Bet de Over/Under na API-FOOTBALL. Se 0, não filtra por bet.
 ODDS_BET_ID: int = _get_env_int("ODDS_BET_ID", 0)
 
-HTTP_TIMEOUT: float = _get_env_float("HTTP_TIMEOUT", 10.0)  # timeout HTTP (segundos)
-
-
 # NewsAPI (opcional)
 NEWS_API_KEY: str = _get_env_str("NEWS_API_KEY")
 USE_NEWS_API: int = _get_env_int("USE_NEWS_API", 0)
@@ -2078,22 +2075,15 @@ def _get_team_attack_defense_from_cache(
     return atk, dfn
 
 
-def _is_team_under_profile(attack_gpm: Any, defense_gpm: Any) -> bool:
+def _is_team_under_profile(attack_gpm: float, defense_gpm: float) -> bool:
     """
     Time claramente under:
     - Ataque fraco (< 1.3 gol/jogo)
     - Defesa sólida (< 1.3 gol sofrido/jogo)
-
-    *Robusto a None/strings*: retorna False se não conseguir converter.
     """
-    try:
-        a = float(attack_gpm or 0.0)
-        d = float(defense_gpm or 0.0)
-    except (TypeError, ValueError):
+    if attack_gpm <= 0.0 or defense_gpm < 0.0:
         return False
-    if a <= 0.0 or d < 0.0:
-        return False
-    return a < 1.3 and d < 1.3
+    return attack_gpm < 1.3 and defense_gpm < 1.3
 
 
 def _is_match_super_under(
@@ -3097,24 +3087,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 if not stats:
                     continue
 
-                # Safe placar/minuto (evita None/UnboundLocalError)
-                home_goals = fx.get("home_goals")
-                away_goals = fx.get("away_goals")
-                try:
-                    home_goals = int(home_goals or 0)
-                except (TypeError, ValueError):
-                    home_goals = 0
-                try:
-                    away_goals = int(away_goals or 0)
-                except (TypeError, ValueError):
-                    away_goals = 0
-                total_goals = home_goals + away_goals
-                score_diff = home_goals - away_goals
-                minute_int = fx.get("minute") or 0
-                try:
-                    minute_int = int(minute_int)
-                except (TypeError, ValueError):
-                    minute_int = 0
+                total_goals = fx["home_goals"] + fx["away_goals"]
 
                 api_odd: Optional[float] = None
                 got_live_odd = False
@@ -3220,13 +3193,30 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # Flag de mandante claramente under (para filtros duros)
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
 
-                # Perfis de ataque/defesa e flag super under preenchidos no fixture
-                attack_home_gpm = float(fx.get("attack_home_gpm", 0.0))
-                defense_home_gpm = float(fx.get("defense_home_gpm", 0.0))
-                attack_away_gpm = float(fx.get("attack_away_gpm", 0.0))
-                defense_away_gpm = float(fx.get("defense_away_gpm", 0.0))
+                                # Perfis de ataque/defesa (gols por jogo) — sempre definidos (anti-crash)
+                def _to_float(_v, _default=0.0):
+                    try:
+                        if _v is None:
+                            return float(_default)
+                        return float(_v)
+                    except (TypeError, ValueError):
+                        return float(_default)
+
+                attack_home_gpm = _to_float(fx.get("attack_home_gpm", fx.get("home_attack_gpm", 0.0)), 0.0)
+                defense_home_gpm = _to_float(fx.get("defense_home_gpm", fx.get("home_defense_gpm", 0.0)), 0.0)
+                attack_away_gpm = _to_float(fx.get("attack_away_gpm", fx.get("away_attack_gpm", 0.0)), 0.0)
+                defense_away_gpm = _to_float(fx.get("defense_away_gpm", fx.get("away_defense_gpm", 0.0)), 0.0)
                 match_super_under = bool(fx.get("match_super_under", False))
 
+                # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
+                fx["attack_home_gpm"] = attack_home_gpm
+                fx["defense_home_gpm"] = defense_home_gpm
+                fx["attack_away_gpm"] = attack_away_gpm
+                fx["defense_away_gpm"] = defense_away_gpm
+                fx["home_attack_gpm"] = attack_home_gpm
+                fx["home_defense_gpm"] = defense_home_gpm
+                fx["away_attack_gpm"] = attack_away_gpm
+                fx["away_defense_gpm"] = defense_away_gpm
                 # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
                 if api_odd is None:
                     logging.info(
@@ -3243,10 +3233,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                     # Calcula probabilidade e pressão, sem EV baseado em odd real
                     metrics = _estimate_prob_and_odd(
-                        minute=minute_int,
+                        minute=fx["minute"],
                         stats=stats,
-                        home_goals=home_goals,
-                        away_goals=away_goals,
+                        home_goals=fx["home_goals"],
+                        away_goals=fx["away_goals"],
                         forced_odd_current=None,
                         news_boost_prob=news_boost_prob,
                         pregame_boost_prob=pregame_boost_prob,
@@ -3394,10 +3384,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     )
 
                 metrics = _estimate_prob_and_odd(
-                    minute=minute_int,
+                    minute=fx["minute"],
                     stats=stats,
-                    home_goals=home_goals,
-                    away_goals=away_goals,
+                    home_goals=fx["home_goals"],
+                    away_goals=fx["away_goals"],
                     forced_odd_current=api_odd,
                     news_boost_prob=news_boost_prob,
                     pregame_boost_prob=pregame_boost_prob,
