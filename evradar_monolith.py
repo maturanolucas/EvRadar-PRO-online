@@ -3436,6 +3436,9 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
 
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
+                away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
+                fx['home_under'] = home_under
+                fx['away_under'] = away_under
                 # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
                 fx["attack_home_gpm"] = attack_home_gpm
                 fx["defense_home_gpm"] = defense_home_gpm
