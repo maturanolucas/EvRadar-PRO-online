@@ -3984,7 +3984,10 @@ def main() -> None:
     async def _post_init(app: Application) -> None:
         if AUTOSTART:
             try:
-                app.create_task(autoscan_loop(app), name="autoscan_loop")
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(autoscan_loop(app), name="autoscan_loop")
+                # guarda referência para debug/cancelamento futuro
+                app.bot_data["autoscan_task"] = task
                 logging.info("Autoscan agendado (post_init).")
             except Exception:
                 logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
