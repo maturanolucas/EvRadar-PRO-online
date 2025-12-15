@@ -32,6 +32,7 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 """
 
 import asyncio
+import signal
 import logging
 import os
 from typing import Optional, List, Dict, Any, Tuple
@@ -3972,34 +3973,66 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.INFO,
-    )
     logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
 
-    if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN não definido; encerrando.")
-        return
+    token = TELEGRAM_BOT_TOKEN.strip() if TELEGRAM_BOT_TOKEN else ""
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    async def _run() -> None:
+        application = Application.builder().token(token).build()
 
-    # Handlers
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("scan", cmd_scan))
-    application.add_handler(CommandHandler("debug", cmd_debug))
-    application.add_handler(CommandHandler("links", cmd_links))
+        # Handlers
+        application.add_handler(CommandHandler("start", cmd_start))
+        application.add_handler(CommandHandler("status", cmd_status))
+        application.add_handler(CommandHandler("scan", cmd_scan))
+        application.add_handler(CommandHandler("debug", cmd_debug))
+        application.add_handler(CommandHandler("links", cmd_links))
 
-    # Autoscan (AUTOSTART=1)
-    if AUTOSTART:
-        try:
+        # Inicializa e inicia o app + polling
+        await application.initialize()
+        await application.start()
+
+        if application.updater is None:
+            raise RuntimeError("Updater não disponível (polling). Verifique a versão do python-telegram-bot.")
+
+        await application.updater.start_polling(drop_pending_updates=True)
+
+        # Autoscan: só cria task DEPOIS do loop estar rodando
+        if AUTOSTART:
             application.create_task(autoscan_loop(application), name="autoscan_loop")
-        except Exception:
-            logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
+            logging.info("Autoscan iniciado (intervalo=%ss)", CHECK_INTERVAL)
 
-# Polling
-    application.run_polling()
+        # Espera sinal de encerramento
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+            if sig is None:
+                continue
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                # Em alguns ambientes (ou no Windows local) pode não suportar.
+                pass
+
+        await stop_event.wait()
+
+        # Shutdown limpo
+        try:
+            await application.updater.stop()
+        except Exception:
+            logging.exception("Falha ao parar updater; continuando shutdown.")
+
+        try:
+            await application.stop()
+        finally:
+            await application.shutdown()
+
+    # Runner
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
