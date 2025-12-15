@@ -33,7 +33,6 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 
 import asyncio
 import logging
-import time
 import os
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
@@ -122,8 +121,6 @@ if _chat_raw:
         TELEGRAM_CHAT_ID = int(_chat_raw)
     except ValueError:
         TELEGRAM_CHAT_ID = None
-
-LAST_CHAT_ID = None  # último chat que interagiu (fallback para autoscan)
 
 AUTOSTART: int = _get_env_int("AUTOSTART", 0)
 CHECK_INTERVAL: int = _get_env_int("CHECK_INTERVAL", 60)
@@ -2102,12 +2099,14 @@ def _get_team_attack_defense_from_cache(
     return atk, dfn
 
 
-def _is_team_under_profile(attack_gpm: float, defense_gpm: float) -> bool:
+def _is_team_under_profile(attack_gpm: float | None, defense_gpm: float | None) -> bool:
     """
     Time claramente under:
     - Ataque fraco (< 1.3 gol/jogo)
     - Defesa sólida (< 1.3 gol sofrido/jogo)
     """
+    if attack_gpm is None or defense_gpm is None:
+        return False
     if attack_gpm <= 0.0 or defense_gpm < 0.0:
         return False
     return attack_gpm < 1.3 and defense_gpm < 1.3
@@ -2347,6 +2346,7 @@ def _compute_score_context_boost(
     defense_away_gpm = fixture.get("defense_away_gpm")
 
     home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
+
     away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
     # se o time "under" está na frente, penaliza mais
@@ -2379,24 +2379,6 @@ def _compute_score_context_boost(
 
     boost *= scale
 
-
-    # Extra (Lucas): favorito na frente + defesa forte + adversário under (cenário “controlado”) → reduz muito.
-    # Ex.: 1–0 aos 60–75', favorito tende a administrar; gol “extra” fica mais raro.
-    try:
-        if minute_int >= 60 and fav_side in ("home", "away"):
-            fav_is_home = (fav_side == "home")
-            fav_leading = (score_diff > 0) if fav_is_home else (score_diff < 0)
-            if fav_leading:
-                fav_def = defense_home_gpm if fav_is_home else defense_away_gpm
-                opp_att = attack_away_gpm if fav_is_home else attack_home_gpm
-                opp_def = defense_away_gpm if fav_is_home else defense_home_gpm
-                opp_is_under = _is_team_under_profile(opp_att, opp_def)
-                fav_def_strong = (fav_def is not None and fav_def <= 1.10)
-                if opp_is_under and fav_def_strong:
-                    # malus adicional (fica bem mais exigente pra liberar sinal)
-                    boost -= 0.020
-    except Exception:
-        pass
     # Clamp final (±6 pp é MUITO)
     if boost > 0.06:
         boost = 0.06
@@ -3457,6 +3439,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
 
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
+
+
                 away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
                 # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
                 fx["attack_home_gpm"] = attack_home_gpm
@@ -3466,8 +3450,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 fx["home_attack_gpm"] = attack_home_gpm
                 fx["home_defense_gpm"] = defense_home_gpm
                 fx["away_attack_gpm"] = attack_away_gpm
-                fx["home_under"] = bool(home_under)
-                fx["away_under"] = bool(away_under)
                 fx["away_defense_gpm"] = defense_away_gpm
                 # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
                 if api_odd is None:
@@ -3607,6 +3589,15 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
                         ):
                             continue
+                    # Bloqueio de perfil: líder sólido (defesa forte) + adversário pouco ofensivo (evita 1–0 'confortável')
+                    if minute_int >= 55 and score_diff != 0 and abs(score_diff) == 1:
+                        leader_side2 = 'home' if score_diff > 0 else 'away'
+                        leader_def_gpm = fx.get('defense_home_gpm') if leader_side2 == 'home' else fx.get('defense_away_gpm')
+                        trailer_att_gpm = fx.get('attack_away_gpm') if leader_side2 == 'home' else fx.get('attack_home_gpm')
+                        if (leader_def_gpm is not None) and (trailer_att_gpm is not None):
+                            if leader_def_gpm <= 1.05 and trailer_att_gpm <= 1.25:
+                                continue
+
 
                     # Bloqueio extra: linhas altas em jogos super under
                     linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
@@ -3822,11 +3813,6 @@ async def autoscan_loop(application: Application) -> None:
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_CHAT_ID
-    try:
-        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
-    except Exception:
-        pass
     autoscan_status = "ativado" if AUTOSTART else "desativado"
     player_layer_status = "ligada" if USE_PLAYER_IMPACT else "desligada"
     manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
@@ -3864,11 +3850,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_CHAT_ID
-    try:
-        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
-    except Exception:
-        pass
     lines = [
         "📊 Último status do EvRadar PRO:",
         "",
@@ -3893,11 +3874,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_CHAT_ID
-    try:
-        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
-    except Exception:
-        pass
     try:
         if update.effective_chat:
             await update.effective_chat.send_message(
@@ -3932,11 +3908,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_CHAT_ID
-    try:
-        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
-    except Exception:
-        pass
     def _mask(key: str) -> str:
         if not key:
             return "(vazio)"
@@ -3984,11 +3955,6 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global LAST_CHAT_ID
-    try:
-        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
-    except Exception:
-        pass
     lines = [
         "🔗 Links úteis EvRadar PRO",
         "",
@@ -4017,39 +3983,35 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        level=logging.INFO,
+    )
     logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
 
     if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN não definido.")
+        logging.error("TELEGRAM_BOT_TOKEN não definido; encerrando.")
         return
 
-    # AUTOSTART (opcional): agenda o loop somente quando já existe event loop rodando
-    async def _post_init(app: Application) -> None:
-        if not AUTOSTART:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(autoscan_loop(app), name="autoscan_loop")
-            logging.info("Autoscan loop agendado (AUTOSTART=1).")
-        except Exception:
-            logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
+    async def _post_init(app):
+        # Inicia o autoscan somente depois que o loop do PTB estiver rodando
+        if AUTOSTART:
+            app.create_task(autoscan_loop(app), name="autoscan_loop")
 
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
     # Handlers
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("scan", cmd_scan))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("scan", cmd_scan))
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
 
-    # Polling
+    # Autoscan (AUTOSTART=1)
+
+# Polling
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
