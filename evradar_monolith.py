@@ -3981,7 +3981,22 @@ def main() -> None:
         logging.error("TELEGRAM_BOT_TOKEN não definido; encerrando.")
         return
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    async def _post_init(app: Application) -> None:
+        if AUTOSTART:
+            try:
+                app.create_task(autoscan_loop(app), name="autoscan_loop")
+                logging.info("Autoscan agendado (post_init).")
+            except Exception:
+                logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
+
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    try:
+        builder = builder.post_init(_post_init)
+    except Exception:
+        if AUTOSTART:
+            logging.warning("post_init indisponível; AUTOSTART será ignorado (use /scan).")
+
+    application = builder.build()
 
     # Handlers
     application.add_handler(CommandHandler("start", cmd_start))
@@ -3990,14 +4005,7 @@ def main() -> None:
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
 
-    # Autoscan (AUTOSTART=1)
-    if AUTOSTART:
-        try:
-            application.create_task(autoscan_loop(application), name="autoscan_loop")
-        except Exception:
-            logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
-
-# Polling
+    # Polling
     application.run_polling()
 
 
