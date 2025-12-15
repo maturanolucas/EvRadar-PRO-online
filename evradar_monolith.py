@@ -32,7 +32,6 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 """
 
 import asyncio
-import time
 import logging
 import os
 from typing import Optional, List, Dict, Any, Tuple
@@ -122,6 +121,8 @@ if _chat_raw:
         TELEGRAM_CHAT_ID = int(_chat_raw)
     except ValueError:
         TELEGRAM_CHAT_ID = None
+
+LAST_CHAT_ID = None  # último chat que interagiu (fallback para autoscan)
 
 AUTOSTART: int = _get_env_int("AUTOSTART", 0)
 CHECK_INTERVAL: int = _get_env_int("CHECK_INTERVAL", 60)
@@ -2377,6 +2378,24 @@ def _compute_score_context_boost(
 
     boost *= scale
 
+
+    # Extra (Lucas): favorito na frente + defesa forte + adversário under (cenário “controlado”) → reduz muito.
+    # Ex.: 1–0 aos 60–75', favorito tende a administrar; gol “extra” fica mais raro.
+    try:
+        if minute_int >= 60 and fav_side in ("home", "away"):
+            fav_is_home = (fav_side == "home")
+            fav_leading = (score_diff > 0) if fav_is_home else (score_diff < 0)
+            if fav_leading:
+                fav_def = defense_home_gpm if fav_is_home else defense_away_gpm
+                opp_att = attack_away_gpm if fav_is_home else attack_home_gpm
+                opp_def = defense_away_gpm if fav_is_home else defense_home_gpm
+                opp_is_under = _is_team_under_profile(opp_att, opp_def)
+                fav_def_strong = (fav_def is not None and fav_def <= 1.10)
+                if opp_is_under and fav_def_strong:
+                    # malus adicional (fica bem mais exigente pra liberar sinal)
+                    boost -= 0.020
+    except Exception:
+        pass
     # Clamp final (±6 pp é MUITO)
     if boost > 0.06:
         boost = 0.06
@@ -3799,6 +3818,11 @@ async def autoscan_loop(application: Application) -> None:
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LAST_CHAT_ID
+    try:
+        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
+    except Exception:
+        pass
     autoscan_status = "ativado" if AUTOSTART else "desativado"
     player_layer_status = "ligada" if USE_PLAYER_IMPACT else "desligada"
     manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
@@ -3836,6 +3860,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LAST_CHAT_ID
+    try:
+        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
+    except Exception:
+        pass
     lines = [
         "📊 Último status do EvRadar PRO:",
         "",
@@ -3860,6 +3889,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LAST_CHAT_ID
+    try:
+        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
+    except Exception:
+        pass
     try:
         if update.effective_chat:
             await update.effective_chat.send_message(
@@ -3894,6 +3928,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LAST_CHAT_ID
+    try:
+        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
+    except Exception:
+        pass
     def _mask(key: str) -> str:
         if not key:
             return "(vazio)"
@@ -3941,6 +3980,11 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LAST_CHAT_ID
+    try:
+        LAST_CHAT_ID = int(getattr(update.effective_chat, 'id', 0) or 0) or LAST_CHAT_ID
+    except Exception:
+        pass
     lines = [
         "🔗 Links úteis EvRadar PRO",
         "",
