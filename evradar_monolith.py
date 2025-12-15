@@ -2099,14 +2099,12 @@ def _get_team_attack_defense_from_cache(
     return atk, dfn
 
 
-def _is_team_under_profile(attack_gpm: float | None, defense_gpm: float | None) -> bool:
+def _is_team_under_profile(attack_gpm: float, defense_gpm: float) -> bool:
     """
     Time claramente under:
     - Ataque fraco (< 1.3 gol/jogo)
     - Defesa sólida (< 1.3 gol sofrido/jogo)
     """
-    if attack_gpm is None or defense_gpm is None:
-        return False
     if attack_gpm <= 0.0 or defense_gpm < 0.0:
         return False
     return attack_gpm < 1.3 and defense_gpm < 1.3
@@ -2275,6 +2273,10 @@ def _compute_score_context_boost(
 
     score_diff = home_goals - away_goals  # >0 home vence
 
+
+    # Safe defaults (avoid NameError if prematch/under flags not computed)
+    home_under = False
+    away_under = False
     # 1) Favorito (prioridade: odds pré-live; fallback: rating)
     fav_side = fixture.get("favorite_side")  # "home" | "away" | None
     try:
@@ -2346,7 +2348,6 @@ def _compute_score_context_boost(
     defense_away_gpm = fixture.get("defense_away_gpm")
 
     home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
-
     away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
     # se o time "under" está na frente, penaliza mais
@@ -3439,9 +3440,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
 
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
-
-
-                away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
                 # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
                 fx["attack_home_gpm"] = attack_home_gpm
                 fx["defense_home_gpm"] = defense_home_gpm
@@ -3589,15 +3587,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
                         ):
                             continue
-                    # Bloqueio de perfil: líder sólido (defesa forte) + adversário pouco ofensivo (evita 1–0 'confortável')
-                    if minute_int >= 55 and score_diff != 0 and abs(score_diff) == 1:
-                        leader_side2 = 'home' if score_diff > 0 else 'away'
-                        leader_def_gpm = fx.get('defense_home_gpm') if leader_side2 == 'home' else fx.get('defense_away_gpm')
-                        trailer_att_gpm = fx.get('attack_away_gpm') if leader_side2 == 'home' else fx.get('attack_home_gpm')
-                        if (leader_def_gpm is not None) and (trailer_att_gpm is not None):
-                            if leader_def_gpm <= 1.05 and trailer_att_gpm <= 1.25:
-                                continue
-
 
                     # Bloqueio extra: linhas altas em jogos super under
                     linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
@@ -3993,12 +3982,7 @@ def main() -> None:
         logging.error("TELEGRAM_BOT_TOKEN não definido; encerrando.")
         return
 
-    async def _post_init(app):
-        # Inicia o autoscan somente depois que o loop do PTB estiver rodando
-        if AUTOSTART:
-            app.create_task(autoscan_loop(app), name="autoscan_loop")
-
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Handlers
     application.add_handler(CommandHandler("start", cmd_start))
@@ -4008,6 +3992,11 @@ def main() -> None:
     application.add_handler(CommandHandler("links", cmd_links))
 
     # Autoscan (AUTOSTART=1)
+    if AUTOSTART:
+        try:
+            application.create_task(autoscan_loop(application), name="autoscan_loop")
+        except Exception:
+            logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
 
 # Polling
     application.run_polling()
