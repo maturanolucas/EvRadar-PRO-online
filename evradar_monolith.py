@@ -33,6 +33,7 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 
 import asyncio
 import logging
+import time
 import os
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
@@ -3456,6 +3457,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
 
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
+                away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
                 # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
                 fx["attack_home_gpm"] = attack_home_gpm
                 fx["defense_home_gpm"] = defense_home_gpm
@@ -3464,6 +3466,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 fx["home_attack_gpm"] = attack_home_gpm
                 fx["home_defense_gpm"] = defense_home_gpm
                 fx["away_attack_gpm"] = attack_away_gpm
+                fx["home_under"] = bool(home_under)
+                fx["away_under"] = bool(away_under)
                 fx["away_defense_gpm"] = defense_away_gpm
                 # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
                 if api_odd is None:
@@ -4013,35 +4017,39 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.INFO,
-    )
     logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
 
     if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN não definido; encerrando.")
+        logging.error("TELEGRAM_BOT_TOKEN não definido.")
         return
 
-        async def _post_init(app: Application) -> None:
-            if AUTOSTART:
-                try:
-                    app.create_task(autoscan_loop(app), name="autoscan_loop")
-                except Exception:
-                    logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
+    # AUTOSTART (opcional): agenda o loop somente quando já existe event loop rodando
+    async def _post_init(app: Application) -> None:
+        if not AUTOSTART:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(autoscan_loop(app), name="autoscan_loop")
+            logging.info("Autoscan loop agendado (AUTOSTART=1).")
+        except Exception:
+            logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
 
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
     # Handlers
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("scan", cmd_scan))
+    application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
 
-# Polling
+    # Polling
     application.run_polling()
-
 
 if __name__ == "__main__":
     main()
