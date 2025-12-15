@@ -32,6 +32,7 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 """
 
 import asyncio
+import time
 import logging
 import os
 from typing import Optional, List, Dict, Any, Tuple
@@ -200,17 +201,13 @@ ODDS_API_BASE_URL: str = _get_env_str(
     "https://api.the-odds-api.com/v4",
 )
 ODDS_API_REGIONS: str = _get_env_str("ODDS_API_REGIONS", "eu")
-ODDS_API_MARKETS: str = _get_env_str("ODDS_API_MARKETS", "alternate_totals,totals,h2h")
+ODDS_API_MARKETS: str = _get_env_str("ODDS_API_MARKETS", "totals")
 ODDS_API_DEFAULT_SPORT_KEY: str = _get_env_str("ODDS_API_DEFAULT_SPORT_KEY")
 ODDS_API_LEAGUE_MAP_RAW: str = _get_env_str("ODDS_API_LEAGUE_MAP", "")
 ODDS_API_LEAGUE_MAP: Dict[int, str] = _parse_odds_api_league_map(
     ODDS_API_LEAGUE_MAP_RAW
 )
 ODDS_API_BOOKMAKERS_RAW: str = _get_env_str("ODDS_API_BOOKMAKERS", "")
-ODDS_API_SPORT_CACHE_TTL_SEC: int = _get_env_int("ODDS_API_SPORT_CACHE_TTL_SEC", 25)
-# Cache por sport_key para reduzir chamadas repetidas (ex.: 2+ jogos da mesma liga no mesmo scan)
-_ODDS_API_SPORT_CACHE: Dict[str, Tuple[float, Any, Optional[int]]] = {}
-
 ODDS_API_BOOKMAKERS: List[str] = [
     s.strip()
     for s in ODDS_API_BOOKMAKERS_RAW.split(",")
@@ -1130,82 +1127,48 @@ async def _fetch_live_odds_for_fixture_odds_api(
     target_line = float(total_goals) + 0.5
     target_line_str = "{:.1f}".format(target_line)
 
-    # Normaliza markets (garante alternate_totals para achar Over 0.5/1.5/2.5 etc.)
-    raw_markets = (ODDS_API_MARKETS or '').strip()
-    mk_list = [m.strip() for m in raw_markets.split(',') if m.strip()]
-    if 'alternate_totals' not in mk_list:
-        mk_list.insert(0, 'alternate_totals')
-    if 'totals' not in mk_list:
-        mk_list.append('totals')
-
-    # dedupe preservando ordem
-    seen = set()
-    mk_norm_list = []
-    for m in mk_list:
-        if m not in seen:
-            seen.add(m)
-            mk_norm_list.append(m)
-    mk_norm = ','.join(mk_norm_list)
-
     params = {
-        'apiKey': ODDS_API_KEY,
-        'regions': ODDS_API_REGIONS,
-        'markets': mk_norm,
-        'oddsFormat': 'decimal',
+        "apiKey": ODDS_API_KEY,
+        "regions": ODDS_API_REGIONS,
+        "markets": ODDS_API_MARKETS or "totals",
+        "oddsFormat": "decimal",
     }
-
-    cache_key = f"{sport_key}|{ODDS_API_REGIONS}|{mk_norm}|decimal"
-    now_ts = time.time()
-    cached = _ODDS_API_SPORT_CACHE.get(cache_key)
-    data = None
-    remaining_calls: Optional[int] = None
-    if cached and (now_ts - cached[0]) <= float(ODDS_API_SPORT_CACHE_TTL_SEC):
-        data = cached[1]
-        remaining_calls = cached[2]
-        logger.debug(f"The Odds API: usando cache p/ sport_key={sport_key} (TTL={ODDS_API_SPORT_CACHE_TTL_SEC}s).")
 
     url = "{base}/sports/{sport_key}/odds".format(
         base=ODDS_API_BASE_URL.rstrip("/"),
         sport_key=sport_key,
     )
 
-    if data is None:
-        try:
-            resp = await client.get(
-                url,
-                params=params,
-                timeout=10.0,
+    try:
+        resp = await client.get(
+            url,
+            params=params,
+            timeout=10.0,
+        )
+
+        # contamos essa chamada no limite diário
+        oddsapi_calls_today += 1
+
+        # (opcional) loga o header de créditos restantes se a API informar
+        remaining = (
+            resp.headers.get("x-requests-remaining")
+            or resp.headers.get("X-Requests-Remaining")
+        )
+        if remaining is not None:
+            logging.info(
+                "The Odds API: chamadas restantes reportadas pelo provedor: %s",
+                remaining,
             )
 
-            # contamos essa chamada no limite diário
-            oddsapi_calls_today += 1
-
-            # (opcional) loga o header de créditos restantes se a API informar
-            remaining = (
-                resp.headers.get("x-requests-remaining")
-                or resp.headers.get("X-Requests-Remaining")
-            )
-            if remaining is not None:
-                try:
-                    remaining_calls = int(str(remaining).strip())
-                except Exception:
-                    remaining_calls = None
-                logging.info(
-                    "The Odds API: chamadas restantes reportadas pelo provedor: %s",
-                    remaining,
-                )
-
-            resp.raise_for_status()
-            data = resp.json()
-            # salva cache por sport_key para evitar chamadas repetidas no mesmo scan
-            _ODDS_API_SPORT_CACHE[cache_key] = (now_ts, data, remaining_calls)
-        except Exception:
-            logging.exception(
-                "Erro ao buscar odds na The Odds API para sport_key=%s (fixture=%s)",
-                sport_key,
-                fixture.get("fixture_id"),
-            )
-            return None
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception(
+            "Erro ao buscar odds na The Odds API para sport_key=%s (fixture=%s)",
+            sport_key,
+            fixture.get("fixture_id"),
+        )
+        return None
 
     events = data or []
     if not isinstance(events, list) or not events:
