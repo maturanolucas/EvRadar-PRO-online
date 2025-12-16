@@ -283,8 +283,9 @@ last_news_boost_cache: Dict[int, float] = {}
 # Agora também guarda attack_gpm / defense_gpm (gols feitos/sofridos por jogo).
 pregame_auto_cache: Dict[str, Dict[str, Any]] = {}
 
-# Cooldown por jogo (fixture_id -> datetime do último alerta)
-fixture_last_alert_at: Dict[int, datetime] = {}
+# Cooldown por jogo (chave = fixture_id + placar + linha SUM_PLUS_HALF)
+# Isso faz o cooldown "pular" quando sai gol (placar muda → linha muda).
+fixture_last_alert_at: Dict[str, datetime] = {}
 
 # Caches da camada de jogadores
 # fixture_id -> lista de lineups (API /fixtures/lineups)
@@ -375,6 +376,21 @@ def _get_cached_odd_for_line(fixture_id: int, total_goals: int) -> Optional[floa
     if cached_goals == total_goals:
         return cached_odd
     return None
+
+def _cooldown_key(fixture_id: int, home_goals: int, away_goals: int) -> str:
+    """Gera chave de cooldown que muda quando o placar muda (logo, muda a linha)."""
+    try:
+        hg = int(home_goals)
+    except Exception:
+        hg = 0
+    try:
+        ag = int(away_goals)
+    except Exception:
+        ag = 0
+    total_goals = hg + ag
+    line = float(total_goals) + 0.5
+    return f"{int(fixture_id)}:{hg}-{ag}:over{line:.1f}"
+
 
 
 # ---------------------------------------------------------------------------
@@ -3619,14 +3635,15 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     # Cooldown por jogo
                     now = _now_utc()
                     fixture_id = fx["fixture_id"]
-                    last_ts = fixture_last_alert_at.get(fixture_id)
+                    cd_key = _cooldown_key(fixture_id, fx.get("home_goals", 0), fx.get("away_goals", 0))
+                    last_ts = fixture_last_alert_at.get(cd_key)
                     if last_ts is not None:
                         if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
                             continue
 
                     alert_text = _format_manual_no_odds_text(fx, metrics)
                     alerts.append(alert_text)
-                    fixture_last_alert_at[fixture_id] = now
+                    fixture_last_alert_at[cd_key] = now
                     continue  # pula restante da lógica (sem odd real)
 
                 # 5) Fluxo normal com odd real
@@ -3737,7 +3754,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 now = _now_utc()
                 fixture_id = fx["fixture_id"]
-                last_ts = fixture_last_alert_at.get(fixture_id)
+                cd_key = _cooldown_key(fixture_id, fx.get("home_goals", 0), fx.get("away_goals", 0))
+                last_ts = fixture_last_alert_at.get(cd_key)
                 if last_ts is not None:
                     if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
                         continue
@@ -3755,7 +3773,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     alert_text = _format_alert_text(fx, metrics)
 
                 alerts.append(alert_text)
-                fixture_last_alert_at[fixture_id] = now
+                fixture_last_alert_at[cd_key] = now
 
             except Exception:
                 logging.exception(
