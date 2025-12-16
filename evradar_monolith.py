@@ -32,6 +32,7 @@ Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-j
 """
 
 import asyncio
+import contextlib
 import signal
 import logging
 import os
@@ -3780,19 +3781,23 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
 async def autoscan_loop(application: Application) -> None:
     """Loop de autoscan em background (usa create_task; não bloqueia polling)."""
-    logging.info("Autoscan iniciado (intervalo=%ss)", CHECK_INTERVAL)
+    logging.info("Autoscan loop iniciado (intervalo=%ss)", CHECK_INTERVAL)
     while True:
         try:
             alerts = await run_scan_cycle(origin="auto", application=application)
             if TELEGRAM_CHAT_ID and alerts:
-                for text in alerts:
+                for msg in alerts:
                     try:
                         await application.bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
-                            text=text,
+                            text=msg,
                         )
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
                         logging.exception("Erro ao enviar alerta de autoscan")
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logging.exception("Erro no autoscan")
         await asyncio.sleep(CHECK_INTERVAL)
@@ -3998,10 +4003,22 @@ def main() -> None:
 
         await application.updater.start_polling(drop_pending_updates=True)
 
-        # Autoscan: só cria task DEPOIS do loop estar rodando
+        # Autoscan: só cria task DEPOIS de ter um loop rodando
+        autoscan_task: Optional[asyncio.Task] = None
         if AUTOSTART:
-            application.create_task(autoscan_loop(application), name="autoscan_loop")
-            logging.info("Autoscan iniciado (intervalo=%ss)", CHECK_INTERVAL)
+            coro = autoscan_loop(application)
+            try:
+                loop_running = asyncio.get_running_loop()
+                autoscan_task = loop_running.create_task(coro, name="autoscan_loop")
+                application.bot_data["autoscan_task"] = autoscan_task
+                logging.info("Autoscan task agendada (intervalo=%ss)", CHECK_INTERVAL)
+            except Exception:
+                # Evita warning "coroutine was never awaited"
+                try:
+                    coro.close()
+                except Exception:
+                    pass
+                logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
 
         # Espera sinal de encerramento
         stop_event = asyncio.Event()
@@ -4016,6 +4033,16 @@ def main() -> None:
                 pass
 
         await stop_event.wait()
+
+        # Cancela o autoscan para evitar "Task was destroyed but it is pending!"
+        task = application.bot_data.get("autoscan_task") if hasattr(application, "bot_data") else None
+        if task is not None:
+            try:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            except Exception:
+                logging.exception("Falha ao cancelar task do autoscan; continuando shutdown.")
 
         # Shutdown limpo
         try:
