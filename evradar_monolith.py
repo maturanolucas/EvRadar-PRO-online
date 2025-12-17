@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 # ---------------------------------------------------------------------------
 # Helpers de env
@@ -604,17 +605,42 @@ async def _fetch_live_odds_for_fixture(
     if ODDS_BET_ID > 0:
         params["bet"] = ODDS_BET_ID
 
-    try:
-        resp = await client.get(
-            API_FOOTBALL_BASE_URL.rstrip("/") + "/odds/live",
-            headers=headers,
-            params=params,
-            timeout=10.0,
+    url = API_FOOTBALL_BASE_URL.rstrip("/") + "/odds/live"
+    last_exc: Optional[BaseException] = None
+    data: Dict[str, Any] = {}
+
+    # Retry curto para instabilidade de rede (Railway / API-FOOTBALL)
+    for attempt in range(2):
+        try:
+            resp = await client.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=HTTP_TIMEOUT + (2.5 * attempt),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            last_exc = None
+            break
+        except httpx.ReadTimeout as exc:
+            last_exc = exc
+            if attempt == 0:
+                logging.warning(
+                    "Timeout ao buscar odds LIVE (fixture=%s). Tentando 1 retry curto...",
+                    fixture_id,
+                )
+                continue
+        except httpx.HTTPError as exc:
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+
+    if last_exc is not None:
+        logging.warning(
+            "Falha ao buscar odds LIVE para fixture=%s (%s). Seguindo sem odd.",
+            fixture_id,
+            type(last_exc).__name__,
         )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        logging.exception("Erro ao buscar odds LIVE para fixture=%s", fixture_id)
         return None
 
     response = data.get("response") or []
@@ -3228,7 +3254,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         logging.warning(last_status_text)
         return []
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT), follow_redirects=True) as client:
         fixtures = await _fetch_live_fixtures(client)
 
         last_scan_live_events = len(fixtures)
@@ -4003,7 +4029,13 @@ def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
 
     async def _run() -> None:
-        application = Application.builder().token(token).build()
+        tg_request = HTTPXRequest(
+            connect_timeout=HTTP_TIMEOUT,
+            read_timeout=max(HTTP_TIMEOUT * 3.0, 30.0),
+            write_timeout=max(HTTP_TIMEOUT * 3.0, 30.0),
+            pool_timeout=HTTP_TIMEOUT,
+        )
+        application = Application.builder().token(token).request(tg_request).build()
 
         # Handlers
         application.add_handler(CommandHandler("start", cmd_start))
