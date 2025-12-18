@@ -3996,6 +3996,17 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Função main / bootstrap do bot
 # ---------------------------------------------------------------------------
 
+def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
+    """Filtra kwargs para não quebrar caso a assinatura do PTB mude."""
+    try:
+        import inspect
+        sig = inspect.signature(fn)
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        return kwargs
+
+
 def main() -> None:
     logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
 
@@ -4003,82 +4014,73 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
 
-    async def _run() -> None:
-        application = Application.builder().token(token).build()
+    # Request HTTPX com timeouts mais robustos para Railway/Cloud
+    request_obj = None
+    try:
+        from telegram.request import HTTPXRequest  # type: ignore
+        request_obj = HTTPXRequest(
+            connect_timeout=10.0,
+            read_timeout=30.0,
+            write_timeout=10.0,
+            pool_timeout=10.0,
+            connection_pool_size=8,
+        )
+    except Exception:
+        request_obj = None
 
-        # Handlers
-        application.add_handler(CommandHandler("start", cmd_start))
-        application.add_handler(CommandHandler("status", cmd_status))
-        application.add_handler(CommandHandler("scan", cmd_scan))
-        application.add_handler(CommandHandler("debug", cmd_debug))
-        application.add_handler(CommandHandler("links", cmd_links))
-
-        # Inicializa e inicia o app + polling
-        await application.initialize()
-        await application.start()
-
-        if application.updater is None:
-            raise RuntimeError("Updater não disponível (polling). Verifique a versão do python-telegram-bot.")
-
-        await application.updater.start_polling(drop_pending_updates=True)
-
-        # Autoscan: só cria task DEPOIS de ter um loop rodando
-        autoscan_task: Optional[asyncio.Task] = None
+    async def _post_init(app: Application) -> None:
+        """Roda depois do init/start. Aqui é seguro agendar o autoscan."""
         if AUTOSTART:
-            coro = autoscan_loop(application)
             try:
-                loop_running = asyncio.get_running_loop()
-                autoscan_task = loop_running.create_task(coro, name="autoscan_loop")
-                application.bot_data["autoscan_task"] = autoscan_task
+                task = asyncio.create_task(autoscan_loop(app), name="autoscan_loop")
+                app.bot_data["autoscan_task"] = task
                 logging.info("Autoscan task agendada (intervalo=%ss)", CHECK_INTERVAL)
             except Exception:
-                # Evita warning "coroutine was never awaited"
-                try:
-                    coro.close()
-                except Exception:
-                    pass
                 logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
 
-        # Espera sinal de encerramento
-        stop_event = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
-            if sig is None:
-                continue
-            try:
-                loop.add_signal_handler(sig, stop_event.set)
-            except NotImplementedError:
-                # Em alguns ambientes (ou no Windows local) pode não suportar.
-                pass
+    builder = Application.builder().token(token).post_init(_post_init)
+    if request_obj is not None:
+        try:
+            builder = builder.request(request_obj)
+        except Exception:
+            pass
 
-        await stop_event.wait()
+    application = builder.build()
 
-        # Cancela o autoscan para evitar "Task was destroyed but it is pending!"
-        task = application.bot_data.get("autoscan_task") if hasattr(application, "bot_data") else None
+    # Handlers
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("scan", cmd_scan))
+    application.add_handler(CommandHandler("debug", cmd_debug))
+    application.add_handler(CommandHandler("links", cmd_links))
+
+    # Polling: parâmetros defensivos (filtrados pela assinatura disponível)
+    polling_kwargs = dict(
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=25,
+        read_timeout=25,
+        connect_timeout=10,
+        write_timeout=10,
+        pool_timeout=10,
+        bootstrap_retries=-1,
+    )
+    polling_kwargs = _filter_kwargs_for_callable(application.run_polling, polling_kwargs)
+
+    try:
+        application.run_polling(**polling_kwargs)
+    finally:
+        # Garante cancelamento do autoscan se existir
+        task = None
+        try:
+            task = application.bot_data.get("autoscan_task")
+        except Exception:
+            task = None
         if task is not None:
             try:
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
             except Exception:
-                logging.exception("Falha ao cancelar task do autoscan; continuando shutdown.")
-
-        # Shutdown limpo
-        try:
-            await application.updater.stop()
-        except Exception:
-            logging.exception("Falha ao parar updater; continuando shutdown.")
-
-        try:
-            await application.stop()
-        finally:
-            await application.shutdown()
-
-    # Runner
-    try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        pass
+                pass
 
 
 if __name__ == "__main__":
