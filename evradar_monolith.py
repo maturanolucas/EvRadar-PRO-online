@@ -235,7 +235,8 @@ PRELIVE_SUPER_MAX_ODD: float = _get_env_float("PRELIVE_SUPER_MAX_ODD", 1.35)
 PRELIVE_CACHE_FILE: str = _get_env_str("PRELIVE_CACHE_FILE", "prelive_cache.json")
 PRELIVE_WARMUP_ENABLE: int = _get_env_int("PRELIVE_WARMUP_ENABLE", 1)
 PRELIVE_WARMUP_INTERVAL_MIN: int = _get_env_int("PRELIVE_WARMUP_INTERVAL_MIN", 30)
-PRELIVE_LOOKAHEAD_HOURS: int = _get_env_int("PRELIVE_LOOKAHEAD_HOURS", 36)
+API_FOOTBALL_TIMEZONE: str = _get_env_str("API_FOOTBALL_TIMEZONE", "America/Sao_Paulo")
+PRELIVE_LOOKAHEAD_HOURS: int = _get_env_int("PRELIVE_LOOKAHEAD_HOURS", 72)
 PRELIVE_WARMUP_MAX_FIXTURES: int = _get_env_int("PRELIVE_WARMUP_MAX_FIXTURES", 80)
 # Quando não encontramos odds pré-live, guardamos um "negativo" por poucos minutos (pra re-tentar depois).
 PRELIVE_NEGATIVE_TTL_MIN: int = _get_env_int("PRELIVE_NEGATIVE_TTL_MIN", 20)
@@ -637,16 +638,19 @@ async def _fetch_upcoming_fixtures_for_prelive(client: httpx.AsyncClient) -> Lis
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
 
     now = _now_utc()
-    # olhamos hoje e amanhã (buffer) e filtramos por kickoff <= lookahead_hours
-    dates = [now.date(), (now + timedelta(days=1)).date()]
-    lookahead = timedelta(hours=max(6, int(PRELIVE_LOOKAHEAD_HOURS or 36)))
+    # olhamos um range de datas compatível com o lookahead (pra não dar "0 fixtures" na madrugada)
+    lookahead_hours = max(6, int(PRELIVE_LOOKAHEAD_HOURS or 72))
+    lookahead = timedelta(hours=lookahead_hours)
+    # ceil(lookahead_hours/24) + 1 dia de buffer
+    days_span = max(2, int((lookahead_hours + 23) // 24) + 1)
+    dates = [(now + timedelta(days=i)).date() for i in range(days_span)]
 
     fixtures: List[Dict[str, Any]] = []
     for d in dates:
         date_str = d.isoformat()
         for league_id in LEAGUE_IDS:
             try:
-                params = {"date": date_str, "league": int(league_id)}
+                params = {"date": date_str, "league": int(league_id), "timezone": API_FOOTBALL_TIMEZONE}
                 resp = await client.get(
                     API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures",
                     headers=headers,
@@ -4195,6 +4199,7 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Sem odds ainda (miss): {m}".format(m=summary.get("miss", 0)),
         "",
         "Cache atual (registros): {sz}".format(sz=cache_sz),
+        "Lookahead: {h}h | Timezone fixtures: {tz}".format(h=PRELIVE_LOOKAHEAD_HOURS, tz=API_FOOTBALL_TIMEZONE),
         "Último warmup (UTC): {t}".format(t=last_warm_str),
         "",
         "Dica: isso é exatamente o que garante favorito mesmo quando o jogo entra na janela 55'.",
