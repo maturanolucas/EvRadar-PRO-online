@@ -240,6 +240,8 @@ PRELIVE_LOOKAHEAD_HOURS: int = _get_env_int("PRELIVE_LOOKAHEAD_HOURS", 72)
 PRELIVE_WARMUP_MAX_FIXTURES: int = _get_env_int("PRELIVE_WARMUP_MAX_FIXTURES", 80)
 # Quando não encontramos odds pré-live, guardamos um "negativo" por poucos minutos (pra re-tentar depois).
 PRELIVE_NEGATIVE_TTL_MIN: int = _get_env_int("PRELIVE_NEGATIVE_TTL_MIN", 20)
+PRELIVE_FORCE_REFRESH_HOURS: int = _get_env_int("PRELIVE_FORCE_REFRESH_HOURS", 8)
+PRELIVE_MATCH_WINNER_BET_ID: int = _get_env_int("PRELIVE_MATCH_WINNER_BET_ID", 1)
 
 # NOVO: heurísticas do Lucas — favorito e perfis under/over
 FAVORITE_RATING_THRESH: float = _get_env_float("FAVORITE_RATING_THRESH", 0.15)
@@ -847,13 +849,25 @@ async def _run_prelive_warmup_once() -> Dict[str, Any]:
                         summary["already"] += 1
                         continue
                 else:
-                    if (now - ts) <= timedelta(minutes=PRELIVE_NEGATIVE_TTL_MIN):
+                    # cache negativo (sem odds): para jogos muito próximos, força re-tentar mesmo se recente
+                    soon = False
+                    try:
+                        kickoff_ts = fx.get("kickoff_ts")
+                        if kickoff_ts:
+                            kd = datetime.fromtimestamp(int(kickoff_ts), tz=timezone.utc)
+                            soon = (kd - now) <= timedelta(hours=PRELIVE_FORCE_REFRESH_HOURS)
+                    except Exception:
+                        soon = False
+
+                    if (not soon) and (now - ts) <= timedelta(minutes=PRELIVE_NEGATIVE_TTL_MIN):
                         summary["already"] += 1
                         continue
 
             # chama a mesma rotina que popula o fixture com favorito
             tmp_fixture = {
                 "fixture_id": fid,
+                "league_id": fx.get("league_id"),
+                "kickoff_ts": fx.get("kickoff_ts"),
                 "home_team": fx.get("home_team"),
                 "away_team": fx.get("away_team"),
                 "minute": 0,
@@ -1301,91 +1315,157 @@ async def _fetch_prelive_match_winner_odds_api_football(
 ) -> Optional[Dict[str, Optional[float]]]:
     """Busca odds pré-jogo 1x2 (casa/empate/fora) na API-FOOTBALL (/odds).
 
-    Observação:
-    - Nem sempre o bookmaker/mercado vem completo; quando não achar 1x2, retorna None.
-    - Mantém robusto (melhor sem favorito do que favorito errado).
+    Melhorias:
+    - Força `bet` do Match Winner (padrão PRELIVE_MATCH_WINNER_BET_ID=1) quando disponível.
+    - Tenta múltiplos bookmakers (PRELIVE_ODDS_BOOKMAKER_ID, BOOKMAKER_ID e fallbacks) e por fim sem bookmaker.
+    - Parse mais tolerante (Home/Away/1/2/X/Draw e nomes de times).
     """
     if not API_FOOTBALL_KEY:
         return None
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
-    params: Dict[str, Any] = {"fixture": int(fixture_id)}
+    hn = _normalize_team_name(home_team or "")
+    an = _normalize_team_name(away_team or "")
 
-    # se definido, tenta forçar bookmaker (nem sempre disponível para todos)
-    if PRELIVE_ODDS_BOOKMAKER_ID and PRELIVE_ODDS_BOOKMAKER_ID > 0:
-        params["bookmaker"] = int(PRELIVE_ODDS_BOOKMAKER_ID)
-
+    bet_id = 0
     try:
-        resp = await client.get(
-            API_FOOTBALL_BASE_URL.rstrip("/") + "/odds",
-            headers=headers,
-            params=params,
-            timeout=HTTP_TIMEOUT,
-        )
-        data = resp.json()
+        bet_id = int(PRELIVE_MATCH_WINNER_BET_ID or 0)
     except Exception:
-        logging.exception("Erro ao buscar odds pré-live (API-FOOTBALL) fixture=%s", fixture_id)
-        return None
+        bet_id = 0
+
+    # candidatos de bookmaker (0 = sem filtrar bookmaker)
+    candidates: List[int] = []
+    try:
+        if PRELIVE_ODDS_BOOKMAKER_ID and int(PRELIVE_ODDS_BOOKMAKER_ID) > 0:
+            candidates.append(int(PRELIVE_ODDS_BOOKMAKER_ID))
+    except Exception:
+        pass
 
     try:
-        items = data.get("response") or []
-        if not items:
-            return None
+        if BOOKMAKER_ID and int(BOOKMAKER_ID) > 0 and int(BOOKMAKER_ID) not in candidates:
+            candidates.append(int(BOOKMAKER_ID))
+    except Exception:
+        pass
 
-        # alguns retornos vêm em lista; escolhe o primeiro item
-        item0 = items[0] if isinstance(items, list) else items
-        bookmakers = item0.get("bookmakers") or []
-        if not bookmakers:
-            return None
+    for b in BOOKMAKER_FALLBACK_IDS:
+        try:
+            bi = int(b)
+        except Exception:
+            continue
+        if bi > 0 and bi not in candidates:
+            candidates.append(bi)
 
-        # helper normalizado para comparar valores
-        hn = _normalize_team_name(home_team)
-        an = _normalize_team_name(away_team)
+    candidates.append(0)
+
+    def _parse_1x2(data: Any) -> Optional[Dict[str, Optional[float]]]:
+        try:
+            items = (data or {}).get("response") or []
+        except Exception:
+            items = []
+        if not isinstance(items, list) or not items:
+            return None
 
         home_odd: Optional[float] = None
         draw_odd: Optional[float] = None
         away_odd: Optional[float] = None
 
-        for bm in bookmakers:
-            bets = bm.get("bets") or []
-            for bet in bets:
-                bet_name = str(bet.get("name") or "").lower()
-                # tenta achar mercado de vencedor (1x2)
-                if not any(k in bet_name for k in ["match winner", "winner", "1x2", "fulltime result", "result"]):
+        for item in items:
+            try:
+                bookmakers = (item or {}).get("bookmakers") or []
+            except Exception:
+                bookmakers = []
+            if not isinstance(bookmakers, list):
+                continue
+
+            for bm in bookmakers:
+                bets = (bm or {}).get("bets") or []
+                if not isinstance(bets, list):
                     continue
 
-                values = bet.get("values") or []
-                for v in values:
-                    label = str(v.get("value") or "").strip()
-                    label_l = label.lower()
+                for bet in bets:
                     try:
-                        odd = float(v.get("odd"))
-                    except (TypeError, ValueError):
+                        bid = bet.get("id")
+                        bname = str(bet.get("name") or "").lower()
+                    except Exception:
+                        bid = None
+                        bname = ""
+
+                    # tenta casar por ID (se vier), senão por nome
+                    if bet_id > 0 and bid is not None:
+                        try:
+                            if int(bid) != bet_id:
+                                continue
+                        except Exception:
+                            pass
+                    else:
+                        if not any(k in bname for k in ["match winner", "winner", "1x2", "fulltime result", "result", "1x2 - full time"]):
+                            continue
+
+                    values = bet.get("values") or []
+                    if not isinstance(values, list):
                         continue
 
-                    # mapeia entradas comuns
-                    if label_l in ("home", "1"):
-                        home_odd = odd
-                    elif label_l in ("away", "2"):
-                        away_odd = odd
-                    elif label_l in ("draw", "x"):
-                        draw_odd = odd
-                    else:
-                        # compara por nome do time
+                    for v in values:
+                        label = str(v.get("value") or "").strip()
                         ln = _normalize_team_name(label)
-                        if ln and ln == hn:
+                        try:
+                            odd = float(v.get("odd"))
+                        except (TypeError, ValueError):
+                            continue
+
+                        if ln in ("x", "draw", "tie", "empate", "d"):
+                            draw_odd = odd
+                        elif ln in ("home", "1", "h", "casa", "local"):
                             home_odd = odd
-                        elif ln and ln == an:
+                        elif ln in ("away", "2", "a", "fora", "visitante", "visitor"):
+                            away_odd = odd
+                        elif hn and ln == hn:
+                            home_odd = odd
+                        elif an and ln == an:
                             away_odd = odd
 
-                # se já temos casa e fora, já dá para detectar favorito
-                if home_odd is not None and away_odd is not None:
-                    return {"home": home_odd, "draw": draw_odd, "away": away_odd}
+                    # se já temos casa e fora, já dá pra detectar favorito
+                    if home_odd is not None and away_odd is not None:
+                        return {"home": home_odd, "draw": draw_odd, "away": away_odd}
 
+        # se não fechou casa+fora, só retorna se pegou algo útil
+        if home_odd is not None or away_odd is not None or draw_odd is not None:
+            return {"home": home_odd, "draw": draw_odd, "away": away_odd}
         return None
-    except Exception:
-        logging.exception("Erro ao parsear odds pré-live fixture=%s", fixture_id)
-        return None
+
+    tried: set = set()
+    for bk in candidates:
+        try:
+            if bk in tried:
+                continue
+            tried.add(bk)
+
+            # tenta primeiro com bet_id (se configurado) e depois sem bet (algumas contas/rotas ignoram o param)
+            param_variants: List[Dict[str, Any]] = []
+            if bet_id > 0:
+                param_variants.append({"bet": bet_id})
+            param_variants.append({})
+
+            for extra in param_variants:
+                params: Dict[str, Any] = {"fixture": int(fixture_id)}
+                params.update(extra)
+                if bk and int(bk) > 0:
+                    params["bookmaker"] = int(bk)
+
+                resp = await client.get(
+                    API_FOOTBALL_BASE_URL.rstrip("/") + "/odds",
+                    headers=headers,
+                    params=params,
+                    timeout=HTTP_TIMEOUT,
+                )
+                data = resp.json()
+                parsed = _parse_1x2(data)
+                if parsed and (parsed.get("home") is not None or parsed.get("away") is not None):
+                    return parsed
+        except Exception:
+            logging.exception("Erro ao buscar/parsear odds pré-live (API-FOOTBALL) fixture=%s bk=%s", fixture_id, bk)
+
+    return None
 
 
 async def _ensure_prelive_favorite(
@@ -1424,7 +1504,22 @@ async def _ensure_prelive_favorite(
     odds = await _fetch_prelive_match_winner_odds_api_football(client, fixture_id, home_team, away_team)
     if not odds:
         # não achou; deixa sem favorito (fallback por rating será usado)
-        prelive_favorite_cache[fixture_id] = {"ts": now, "favorite_side": None, "favorite_odd": None, "favorite_strength": 0}
+        prelive_favorite_cache[fixture_id] = {
+            "ts": now,
+            "league_id": fixture.get("league_id"),
+            "kickoff_ts": fixture.get("kickoff_ts"),
+            "home_team": home_team,
+            "away_team": away_team,
+            "prelive_home_team": home_team,
+            "prelive_away_team": away_team,
+            "prelive_home_odd": None,
+            "prelive_draw_odd": None,
+            "prelive_away_odd": None,
+            "favorite_side": None,
+            "favorite_odd": None,
+            "favorite_strength": 0,
+            "miss_reason": "no_prelive_odds",
+        }
         _save_prelive_cache_to_file(force=False)
         return
 
@@ -1452,8 +1547,12 @@ async def _ensure_prelive_favorite(
 
     cache_payload: Dict[str, Any] = {
         "ts": now,
+        "league_id": fixture.get("league_id"),
+        "kickoff_ts": fixture.get("kickoff_ts"),
         "home_team": home_team,
         "away_team": away_team,
+        "prelive_home_team": home_team,
+        "prelive_away_team": away_team,
         "prelive_home_odd": home_odd,
         "prelive_draw_odd": draw_odd,
         "prelive_away_odd": away_odd,
@@ -4508,11 +4607,15 @@ async def cmd_prelive_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception:
         ttl_note = ""
 
+    miss_reason = str(entry.get("miss_reason") or "").strip()
+    state = "OK" if fav_side in ("home", "away") else "MISS"
+
     lines = [
         "📌 Pré-live cache (fixture={fid})".format(fid=fixture_id),
         "{home} vs {away}".format(home=home_team, away=away_team),
         "1x2: H={h} | D={d} | A={a}".format(h=h, d=d, a=a),
         "Favorito: {s} @ {o} | força={fs}".format(s=side_label, o=fav_odd, fs=fav_strength),
+        "Estado: {st}{mr}".format(st=state, mr=(" — " + miss_reason) if (state == "MISS" and miss_reason) else ""),
     ]
     if age_min is not None:
         lines.append("Idade do cache: {m}min | {ttl}".format(m=age_min, ttl=ttl_note))
