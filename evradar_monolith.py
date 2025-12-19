@@ -4505,7 +4505,19 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
-    top_n = fixtures_sorted[:12]
+        # permite /prelive_next 30 para listar mais jogos
+    n_show = 12
+    try:
+        if context.args and str(context.args[0]).strip().isdigit():
+            n_show = int(str(context.args[0]).strip())
+    except Exception:
+        n_show = 12
+    if n_show < 1:
+        n_show = 12
+    if n_show > 50:
+        n_show = 50
+
+    top_n = fixtures_sorted[:n_show]
     lines = [
         "✅ Próximos fixtures detectados (top {n}):".format(n=len(top_n)),
         "Lookahead: {h}h | Timezone fixtures: {tz}".format(h=PRELIVE_LOOKAHEAD_HOURS, tz=API_FOOTBALL_TIMEZONE),
