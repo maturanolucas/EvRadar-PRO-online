@@ -36,6 +36,8 @@ import contextlib
 import signal
 import logging
 import os
+import json
+import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
 
@@ -229,6 +231,15 @@ PRELIVE_ODDS_BOOKMAKER_ID: int = _get_env_int("PRELIVE_ODDS_BOOKMAKER_ID", 0)
 PRELIVE_STRONG_MAX_ODD: float = _get_env_float("PRELIVE_STRONG_MAX_ODD", 1.60)
 PRELIVE_SUPER_MAX_ODD: float = _get_env_float("PRELIVE_SUPER_MAX_ODD", 1.35)
 
+# NOVO: warmup + persistência de odds pré-live (pra não depender do /odds quando o jogo já está em 55')
+PRELIVE_CACHE_FILE: str = _get_env_str("PRELIVE_CACHE_FILE", "prelive_cache.json")
+PRELIVE_WARMUP_ENABLE: int = _get_env_int("PRELIVE_WARMUP_ENABLE", 1)
+PRELIVE_WARMUP_INTERVAL_MIN: int = _get_env_int("PRELIVE_WARMUP_INTERVAL_MIN", 30)
+PRELIVE_LOOKAHEAD_HOURS: int = _get_env_int("PRELIVE_LOOKAHEAD_HOURS", 36)
+PRELIVE_WARMUP_MAX_FIXTURES: int = _get_env_int("PRELIVE_WARMUP_MAX_FIXTURES", 80)
+# Quando não encontramos odds pré-live, guardamos um "negativo" por poucos minutos (pra re-tentar depois).
+PRELIVE_NEGATIVE_TTL_MIN: int = _get_env_int("PRELIVE_NEGATIVE_TTL_MIN", 20)
+
 # NOVO: heurísticas do Lucas — favorito e perfis under/over
 FAVORITE_RATING_THRESH: float = _get_env_float("FAVORITE_RATING_THRESH", 0.15)
 FAVORITE_POWER_THRESH: float = _get_env_float("FAVORITE_POWER_THRESH", 0.18)
@@ -276,6 +287,11 @@ last_odd_cache: Dict[int, Tuple[int, float]] = {}
 # Cache de favorito pré-live (fixture_id -> dict)
 prelive_favorite_cache: Dict[int, Dict[str, Any]] = {}
 
+# Persistência do cache de favorito pré-live em disco (para sobreviver a restarts / evitar "None" quando o jogo já entrou na janela).
+prelive_cache_loaded: bool = False
+prelive_last_warmup_at: Optional[datetime] = None
+prelive_cache_last_saved_at: Optional[datetime] = None
+
 # Cache simples de último "news boost" por fixture (fixture_id -> boost)
 last_news_boost_cache: Dict[int, float] = {}
 
@@ -303,6 +319,91 @@ oddsapi_calls_date_key: str = ""
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def _dt_to_iso(dt: Optional[datetime]) -> str:
+    if not isinstance(dt, datetime):
+        return ""
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+def _dt_from_iso(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _load_prelive_cache_from_file() -> None:
+    """Carrega cache pré-live salvo em disco (se existir)."""
+    global prelive_cache_loaded
+    if prelive_cache_loaded:
+        return
+    prelive_cache_loaded = True
+    try:
+        fname = (PRELIVE_CACHE_FILE or "prelive_cache.json").strip()
+        if not fname:
+            fname = "prelive_cache.json"
+        if not os.path.exists(fname):
+            return
+        with open(fname, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        count = 0
+        for k, v in data.items():
+            try:
+                fid = int(k)
+            except Exception:
+                continue
+            if not isinstance(v, dict):
+                continue
+            ts = v.get("ts")
+            ts_dt = _dt_from_iso(ts) if isinstance(ts, str) else None
+            payload: Dict[str, Any] = dict(v)
+            payload["ts"] = ts_dt or _now_utc()
+            prelive_favorite_cache[fid] = payload
+            count += 1
+        logging.info("Prelive cache carregado do disco: %s registros.", count)
+    except Exception:
+        logging.exception("Falha ao carregar PRELIVE_CACHE_FILE")
+
+def _save_prelive_cache_to_file(force: bool = False) -> None:
+    """Salva cache pré-live em disco (JSON). Throttle leve pra não escrever demais."""
+    global prelive_cache_last_saved_at
+    try:
+        now = _now_utc()
+        if not force and prelive_cache_last_saved_at and (now - prelive_cache_last_saved_at) < timedelta(seconds=30):
+            return
+        fname = (PRELIVE_CACHE_FILE or "prelive_cache.json").strip()
+        if not fname:
+            fname = "prelive_cache.json"
+        # serializa
+        out: Dict[str, Any] = {}
+        for fid, payload in prelive_favorite_cache.items():
+            if not isinstance(payload, dict):
+                continue
+            p = dict(payload)
+            p["ts"] = _dt_to_iso(p.get("ts"))
+            out[str(int(fid))] = p
+        # escrita atômica
+        dname = os.path.dirname(fname) or "."
+        os.makedirs(dname, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=dname, encoding="utf-8") as tf:
+            json.dump(out, tf, ensure_ascii=False)
+            tmp_name = tf.name
+        os.replace(tmp_name, fname)
+        prelive_cache_last_saved_at = now
+    except Exception:
+        logging.exception("Falha ao salvar PRELIVE_CACHE_FILE")
 
 
 # aliases para normalizar nome de time entre APIs
@@ -522,6 +623,179 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
             continue
 
     return fixtures
+
+async def _fetch_upcoming_fixtures_for_prelive(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    """Busca fixtures *não iniciados* (NS) para aquecer o cache de odds pré-live.
+
+    Isso permite detectar favorito mesmo quando o jogo já está em 55' e o endpoint /odds não retorna mais.
+    """
+    if not API_FOOTBALL_KEY:
+        return []
+    if LEAGUE_IDS is None or not isinstance(LEAGUE_IDS, list) or len(LEAGUE_IDS) == 0:
+        return []
+
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+
+    now = _now_utc()
+    # olhamos hoje e amanhã (buffer) e filtramos por kickoff <= lookahead_hours
+    dates = [now.date(), (now + timedelta(days=1)).date()]
+    lookahead = timedelta(hours=max(6, int(PRELIVE_LOOKAHEAD_HOURS or 36)))
+
+    fixtures: List[Dict[str, Any]] = []
+    for d in dates:
+        date_str = d.isoformat()
+        for league_id in LEAGUE_IDS:
+            try:
+                params = {"date": date_str, "league": int(league_id)}
+                resp = await client.get(
+                    API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures",
+                    headers=headers,
+                    params=params,
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                logging.exception("Erro ao buscar fixtures do dia %s (liga=%s) para warmup prelive", date_str, league_id)
+                continue
+
+            response = data.get("response") or []
+            for item in response:
+                try:
+                    fixture = item.get("fixture") or {}
+                    league = item.get("league") or {}
+                    teams = item.get("teams") or {}
+
+                    status = fixture.get("status") or {}
+                    short = (status.get("short") or "").upper()
+                    # queremos só NS (não iniciado)
+                    if short not in ("NS",):
+                        continue
+
+                    fixture_ts_raw = fixture.get("timestamp")
+                    kickoff_ts: Optional[int] = None
+                    try:
+                        if fixture_ts_raw is not None:
+                            kickoff_ts = int(fixture_ts_raw)
+                    except Exception:
+                        kickoff_ts = None
+
+                    kickoff_dt = None
+                    if kickoff_ts:
+                        kickoff_dt = datetime.fromtimestamp(kickoff_ts, tz=timezone.utc)
+                        if kickoff_dt < (now - timedelta(hours=3)):
+                            continue
+                        if kickoff_dt - now > lookahead:
+                            continue
+
+                    home_team_obj = (teams.get("home") or {})
+                    away_team_obj = (teams.get("away") or {})
+                    home_team = home_team_obj.get("name") or "Home"
+                    away_team = away_team_obj.get("name") or "Away"
+
+                    fixtures.append(
+                        {
+                            "fixture_id": int(fixture.get("id")),
+                            "league_id": int(league.get("id") or league_id),
+                            "league_name": league.get("name") or "",
+                            "season": league.get("season"),
+                            "status_short": short,
+                            "minute": 0,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "kickoff_ts": kickoff_ts,
+                        }
+                    )
+                except Exception:
+                    continue
+
+    # dedup por fixture_id
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for f in fixtures:
+        fid = f.get("fixture_id")
+        if fid in seen:
+            continue
+        seen.add(fid)
+        out.append(f)
+
+    # limita para proteger rate limits
+    if PRELIVE_WARMUP_MAX_FIXTURES and len(out) > int(PRELIVE_WARMUP_MAX_FIXTURES):
+        out = out[: int(PRELIVE_WARMUP_MAX_FIXTURES)]
+
+    return out
+
+
+async def _run_prelive_warmup_once() -> Dict[str, Any]:
+    """Roda 1 warmup: busca fixtures futuros e tenta cachear 1x2 pré-live."""
+    global prelive_last_warmup_at
+    summary = {"fixtures": 0, "cached": 0, "already": 0, "miss": 0}
+    if not USE_PRELIVE_FAVORITE or not PRELIVE_WARMUP_ENABLE:
+        return summary
+    if not API_FOOTBALL_KEY:
+        return summary
+    if not LEAGUE_IDS:
+        return summary
+
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        fixtures = await _fetch_upcoming_fixtures_for_prelive(client)
+
+        summary["fixtures"] = len(fixtures)
+        now = _now_utc()
+
+        for fx in fixtures:
+            fid = int(fx.get("fixture_id") or 0)
+            if fid <= 0:
+                continue
+
+            cached = prelive_favorite_cache.get(fid)
+            if cached and isinstance(cached.get("ts"), datetime):
+                ts = cached.get("ts")
+                # cache positivo (tem favorite_side) respeita horas; negativo respeita TTL
+                if cached.get("favorite_side") in ("home", "away"):
+                    if (now - ts) <= timedelta(hours=PRELIVE_CACHE_HOURS):
+                        summary["already"] += 1
+                        continue
+                else:
+                    if (now - ts) <= timedelta(minutes=PRELIVE_NEGATIVE_TTL_MIN):
+                        summary["already"] += 1
+                        continue
+
+            # chama a mesma rotina que popula o fixture com favorito
+            tmp_fixture = {
+                "fixture_id": fid,
+                "home_team": fx.get("home_team"),
+                "away_team": fx.get("away_team"),
+                "minute": 0,
+                "status_short": "NS",
+            }
+            await _ensure_prelive_favorite(client, tmp_fixture)
+            new_cached = prelive_favorite_cache.get(fid)
+            if new_cached and new_cached.get("favorite_side") in ("home", "away"):
+                summary["cached"] += 1
+            else:
+                summary["miss"] += 1
+
+        prelive_last_warmup_at = _now_utc()
+        _save_prelive_cache_to_file(force=True)
+
+    return summary
+
+
+async def prelive_warmup_loop(application: Application) -> None:
+    """Loop em background para manter o cache pré-live aquecido."""
+    logging.info("Prelive warmup loop iniciado (intervalo=%smin)", PRELIVE_WARMUP_INTERVAL_MIN)
+    while True:
+        try:
+            await _run_prelive_warmup_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Erro no prelive_warmup_loop")
+        # dorme
+        sleep_s = max(60, int(PRELIVE_WARMUP_INTERVAL_MIN) * 60)
+        await asyncio.sleep(sleep_s)
 
 
 async def _fetch_statistics_for_fixture(
@@ -1039,16 +1313,21 @@ async def _ensure_prelive_favorite(
     if not USE_PRELIVE_FAVORITE:
         return
 
-    now = datetime.utcnow()
+    now = _now_utc()
     cached = prelive_favorite_cache.get(fixture_id)
     if cached:
         ts = cached.get("ts")
-        if isinstance(ts, datetime) and (now - ts) <= timedelta(hours=PRELIVE_CACHE_HOURS):
-            # reaplica no fixture
-            for k, v in cached.items():
-                if k != "ts":
-                    fixture[k] = v
-            return
+        if isinstance(ts, datetime):
+            # cache positivo dura horas; cache negativo (sem favorite_side) expira rápido pra re-tentar
+            if cached.get("favorite_side") in ("home", "away"):
+                valid = (now - ts) <= timedelta(hours=PRELIVE_CACHE_HOURS)
+            else:
+                valid = (now - ts) <= timedelta(minutes=PRELIVE_NEGATIVE_TTL_MIN)
+            if valid:
+                for k, v in cached.items():
+                    if k != "ts":
+                        fixture[k] = v
+                return
 
     home_team = str(fixture.get("home_team") or "")
     away_team = str(fixture.get("away_team") or "")
@@ -1057,6 +1336,7 @@ async def _ensure_prelive_favorite(
     if not odds:
         # não achou; deixa sem favorito (fallback por rating será usado)
         prelive_favorite_cache[fixture_id] = {"ts": now, "favorite_side": None, "favorite_odd": None, "favorite_strength": 0}
+        _save_prelive_cache_to_file(force=False)
         return
 
     home_odd = odds.get("home")
@@ -1095,7 +1375,6 @@ async def _ensure_prelive_favorite(
     for k, v in cache_payload.items():
         if k != "ts":
             fixture[k] = v
-
 
 async def _fetch_live_odds_for_fixture_odds_api(
     client: httpx.AsyncClient,
@@ -3887,6 +4166,51 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logging.exception("Erro ao enviar resposta do /status")
 
 
+async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Executa um warmup manual do cache de odds pré-live (funciona mesmo sem jogos ao vivo)."""
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message("🧊 Aquecendo cache de odds pré-live (favoritos) ...")
+    except Exception:
+        pass
+
+    _load_prelive_cache_from_file()
+
+    summary = {}
+    try:
+        summary = await _run_prelive_warmup_once()
+    except Exception:
+        logging.exception("Erro no /prelive")
+        summary = {"fixtures": 0, "cached": 0, "already": 0, "miss": 0}
+
+    last_warm = prelive_last_warmup_at
+    last_warm_str = _dt_to_iso(last_warm) if last_warm else "n/a"
+    cache_sz = len(prelive_favorite_cache)
+
+    lines = [
+        "✅ Warmup pré-live concluído.",
+        "Fixtures analisados: {n}".format(n=summary.get("fixtures", 0)),
+        "Novos favoritos cacheados: {c}".format(c=summary.get("cached", 0)),
+        "Já estavam em cache: {a}".format(a=summary.get("already", 0)),
+        "Sem odds ainda (miss): {m}".format(m=summary.get("miss", 0)),
+        "",
+        "Cache atual (registros): {sz}".format(sz=cache_sz),
+        "Último warmup (UTC): {t}".format(t=last_warm_str),
+        "",
+        "Dica: isso é exatamente o que garante favorito mesmo quando o jogo entra na janela 55'.",
+    ]
+    msg = "\n".join(lines)
+
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(msg)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+    except Exception:
+        logging.exception("Erro ao responder /prelive")
+
+
+
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if update.effective_chat:
@@ -4038,6 +4362,20 @@ def main() -> None:
             except Exception:
                 logging.exception("Falha ao iniciar autoscan; seguindo sem AUTOSTART.")
 
+        # Carrega cache pré-live salvo em disco e agenda warmup (opcional)
+        try:
+            _load_prelive_cache_from_file()
+        except Exception:
+            pass
+
+        if PRELIVE_WARMUP_ENABLE and USE_PRELIVE_FAVORITE:
+            try:
+                task2 = asyncio.create_task(prelive_warmup_loop(app), name="prelive_warmup_loop")
+                app.bot_data["prelive_warmup_task"] = task2
+                logging.info("Prelive warmup task agendada (intervalo=%smin)", PRELIVE_WARMUP_INTERVAL_MIN)
+            except Exception:
+                logging.exception("Falha ao iniciar prelive warmup; seguindo sem warmup.")
+
     builder = Application.builder().token(token).post_init(_post_init)
     if request_obj is not None:
         try:
@@ -4053,6 +4391,7 @@ def main() -> None:
     application.add_handler(CommandHandler("scan", cmd_scan))
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
+    application.add_handler(CommandHandler("prelive", cmd_prelive))
 
     # Polling: parâmetros defensivos (filtrados pela assinatura disponível)
     polling_kwargs = dict(
