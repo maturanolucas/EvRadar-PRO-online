@@ -1452,6 +1452,8 @@ async def _ensure_prelive_favorite(
 
     cache_payload: Dict[str, Any] = {
         "ts": now,
+        "home_team": home_team,
+        "away_team": away_team,
         "prelive_home_odd": home_odd,
         "prelive_draw_odd": draw_odd,
         "prelive_away_odd": away_odd,
@@ -4437,6 +4439,96 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 
+async def cmd_prelive_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mostra o que está cacheado para um fixture específico (útil para validar favorito fora do horário de jogos)."""
+    try:
+        if not context.args:
+            msg = "Uso: /prelive_show <fixture_id>\nDica: pegue o fixture_id em /prelive_next."
+            if update.effective_chat:
+                await update.effective_chat.send_message(msg)
+            return
+        fixture_id = int(str(context.args[0]).strip())
+    except Exception:
+        try:
+            if update.effective_chat:
+                await update.effective_chat.send_message("⚠️ fixture_id inválido. Ex: /prelive_show 1388435")
+        except Exception:
+            pass
+        return
+
+    try:
+        _load_prelive_cache_from_file()
+    except Exception:
+        pass
+
+    entry = prelive_favorite_cache.get(fixture_id)
+    if not entry:
+        msg = "\n".join([
+            "⚠️ Não achei esse fixture_id no cache pré-live.",
+            "Dica: rode /prelive para aquecer e depois tente de novo.",
+            "Se ainda não aparecer, verifique se a liga está em LEAGUE_IDS e se o lookahead está cobrindo o horário do jogo.",
+        ])
+        try:
+            if update.effective_chat:
+                await update.effective_chat.send_message(msg)
+        except Exception:
+            pass
+        return
+
+    now = _now_utc()
+    ts = entry.get("ts")
+    age_min = None
+    try:
+        if isinstance(ts, datetime):
+            age_min = int((now - ts).total_seconds() // 60)
+    except Exception:
+        age_min = None
+
+    home_team = str(entry.get("home_team") or "?")
+    away_team = str(entry.get("away_team") or "?")
+    h = entry.get("prelive_home_odd")
+    d = entry.get("prelive_draw_odd")
+    a = entry.get("prelive_away_odd")
+    fav_side = entry.get("favorite_side")
+    fav_odd = entry.get("favorite_odd")
+    fav_strength = entry.get("favorite_strength")
+
+    side_label = "N/D"
+    if fav_side == "home":
+        side_label = "CASA"
+    elif fav_side == "away":
+        side_label = "FORA"
+
+    ttl_note = ""
+    try:
+        if fav_side in ("home", "away"):
+            ttl_note = "TTL: {h}h".format(h=int(PRELIVE_CACHE_HOURS))
+        else:
+            ttl_note = "TTL negativo: {m}min".format(m=int(PRELIVE_NEGATIVE_TTL_MIN))
+    except Exception:
+        ttl_note = ""
+
+    lines = [
+        "📌 Pré-live cache (fixture={fid})".format(fid=fixture_id),
+        "{home} vs {away}".format(home=home_team, away=away_team),
+        "1x2: H={h} | D={d} | A={a}".format(h=h, d=d, a=a),
+        "Favorito: {s} @ {o} | força={fs}".format(s=side_label, o=fav_odd, fs=fav_strength),
+    ]
+    if age_min is not None:
+        lines.append("Idade do cache: {m}min | {ttl}".format(m=age_min, ttl=ttl_note))
+    elif ttl_note:
+        lines.append(ttl_note)
+
+    msg = "\n".join(lines)
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(msg)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+    except Exception:
+        logging.exception("Erro ao responder /prelive_show")
+
+
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -4620,6 +4712,7 @@ def main() -> None:
     application.add_handler(CommandHandler("links", cmd_links))
     application.add_handler(CommandHandler("prelive", cmd_prelive))
     application.add_handler(CommandHandler("prelive_next", cmd_prelive_next))
+    application.add_handler(CommandHandler("prelive_show", cmd_prelive_show))
 
     # Polling: parâmetros defensivos (filtrados pela assinatura disponível)
     polling_kwargs = dict(
