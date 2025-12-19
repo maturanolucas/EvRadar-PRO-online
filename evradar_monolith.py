@@ -293,6 +293,9 @@ prelive_cache_loaded: bool = False
 prelive_last_warmup_at: Optional[datetime] = None
 prelive_cache_last_saved_at: Optional[datetime] = None
 
+# Diagnóstico do último fetch de fixtures pré-live
+prelive_last_fetch_diag: Dict[str, Any] = {}
+
 # Cache simples de último "news boost" por fixture (fixture_id -> boost)
 last_news_boost_cache: Dict[int, float] = {}
 
@@ -626,31 +629,156 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
     return fixtures
 
 async def _fetch_upcoming_fixtures_for_prelive(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    """Busca fixtures *não iniciados* (NS) para aquecer o cache de odds pré-live.
+    """Busca fixtures *não iniciados* para aquecer o cache de odds pré-live.
 
-    Isso permite detectar favorito mesmo quando o jogo já está em 55' e o endpoint /odds não retorna mais.
+    Problema real: quando o jogo entra na janela (55'), o endpoint /odds pode não retornar mais.
+    Então precisamos ter guardado o "favorito pré-live" antes.
+
+    Esta versão reduz MUITO as chamadas (evita loop liga×dia) e ainda guarda diagnóstico
+    quando a API retorna 0 fixtures (rate-limit/param inválido/etc).
     """
+    global prelive_last_fetch_diag
+
+    prelive_last_fetch_diag = {
+        "mode": "",
+        "api_calls": 0,
+        "exceptions": 0,
+        "api_error_hits": 0,
+        "last_api_errors_sample": "",
+        "raw_response_items_last": 0,
+        "fixtures_out": 0,
+    }
+
     if not API_FOOTBALL_KEY:
         return []
-    if LEAGUE_IDS is None or not isinstance(LEAGUE_IDS, list) or len(LEAGUE_IDS) == 0:
+    if not LEAGUE_IDS or not isinstance(LEAGUE_IDS, list):
         return []
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
 
-    now = _now_utc()
-    # olhamos um range de datas compatível com o lookahead (pra não dar "0 fixtures" na madrugada)
+    now_utc = _now_utc()
+
     lookahead_hours = max(6, int(PRELIVE_LOOKAHEAD_HOURS or 72))
     lookahead = timedelta(hours=lookahead_hours)
-    # ceil(lookahead_hours/24) + 1 dia de buffer
+
+    # Datas devem seguir o timezone configurado (madrugada pode virar o dia diferente do UTC)
+    try:
+        tz = ZoneInfo(API_FOOTBALL_TIMEZONE)
+        now_local = datetime.now(tz)
+    except Exception:
+        tz = timezone.utc
+        now_local = now_utc
+
     days_span = max(2, int((lookahead_hours + 23) // 24) + 1)
-    dates = [(now + timedelta(days=i)).date() for i in range(days_span)]
+    dates = [(now_local + timedelta(days=i)).date() for i in range(days_span)]
+
+    def _record_api_errors(data: Any) -> None:
+        try:
+            errs = (data or {}).get("errors") if isinstance(data, dict) else None
+            if errs:
+                prelive_last_fetch_diag["api_error_hits"] = int(prelive_last_fetch_diag.get("api_error_hits") or 0) + 1
+                if not prelive_last_fetch_diag.get("last_api_errors_sample"):
+                    # pequena amostra (sem spammar)
+                    prelive_last_fetch_diag["last_api_errors_sample"] = str(errs)[:320]
+        except Exception:
+            return
+
+    def _append_from_response(response: List[Dict[str, Any]], out_list: List[Dict[str, Any]]) -> None:
+        for item in response or []:
+            try:
+                fixture = item.get("fixture") or {}
+                league = item.get("league") or {}
+                teams = item.get("teams") or {}
+
+                league_id_raw = league.get("id")
+                if league_id_raw is None:
+                    continue
+                league_id = int(league_id_raw)
+                if LEAGUE_IDS and league_id not in LEAGUE_IDS:
+                    continue
+
+                status = fixture.get("status") or {}
+                short = (status.get("short") or "").upper()
+                if short not in ("NS", "TBD"):
+                    continue
+
+                fixture_ts_raw = fixture.get("timestamp")
+                kickoff_ts: Optional[int] = None
+                try:
+                    if fixture_ts_raw is not None:
+                        kickoff_ts = int(fixture_ts_raw)
+                except Exception:
+                    kickoff_ts = None
+
+                if kickoff_ts:
+                    kickoff_dt = datetime.fromtimestamp(kickoff_ts, tz=timezone.utc)
+                    # ignora coisas muito antigas e muito longe
+                    if kickoff_dt < (now_utc - timedelta(hours=3)):
+                        continue
+                    if kickoff_dt - now_utc > lookahead:
+                        continue
+
+                home_team_obj = (teams.get("home") or {})
+                away_team_obj = (teams.get("away") or {})
+                home_team = home_team_obj.get("name") or "Home"
+                away_team = away_team_obj.get("name") or "Away"
+
+                out_list.append(
+                    {
+                        "fixture_id": int(fixture.get("id")),
+                        "league_id": league_id,
+                        "league_name": league.get("name") or "",
+                        "season": league.get("season"),
+                        "status_short": short,
+                        "minute": 0,
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "kickoff_ts": kickoff_ts,
+                    }
+                )
+            except Exception:
+                continue
 
     fixtures: List[Dict[str, Any]] = []
-    for d in dates:
-        date_str = d.isoformat()
-        for league_id in LEAGUE_IDS:
+
+    # 1) Tentativa: "next" (1 chamada), depois filtra localmente por liga.
+    # Nem toda conta/endpoint suporta, então se vier 0 ou erro, cai pro fallback por data.
+    try:
+        prelive_last_fetch_diag["mode"] = "next"
+        params = {
+            "next": str(max(80, int(PRELIVE_WARMUP_MAX_FIXTURES or 80) * 2)),
+            "timezone": API_FOOTBALL_TIMEZONE,
+            "status": "NS",
+        }
+        prelive_last_fetch_diag["api_calls"] += 1
+        resp = await client.get(
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _record_api_errors(data)
+        response = data.get("response") or []
+        prelive_last_fetch_diag["raw_response_items_last"] = len(response)
+        _append_from_response(response, fixtures)
+    except Exception:
+        prelive_last_fetch_diag["exceptions"] += 1
+        fixtures = []
+
+    # 2) Fallback: por data (poucas chamadas: ~3–5), sem passar league na query.
+    if not fixtures:
+        try:
+            prelive_last_fetch_diag["mode"] = (prelive_last_fetch_diag.get("mode") or "") + "->by_date"
+        except Exception:
+            prelive_last_fetch_diag["mode"] = "by_date"
+
+        for d in dates:
+            date_str = d.isoformat()
             try:
-                params = {"date": date_str, "league": int(league_id), "timezone": API_FOOTBALL_TIMEZONE}
+                params = {"date": date_str, "timezone": API_FOOTBALL_TIMEZONE}
+                prelive_last_fetch_diag["api_calls"] += 1
                 resp = await client.get(
                     API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures",
                     headers=headers,
@@ -659,75 +787,32 @@ async def _fetch_upcoming_fixtures_for_prelive(client: httpx.AsyncClient) -> Lis
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                _record_api_errors(data)
+                response = data.get("response") or []
+                prelive_last_fetch_diag["raw_response_items_last"] = len(response)
+                _append_from_response(response, fixtures)
             except Exception:
-                logging.exception("Erro ao buscar fixtures do dia %s (liga=%s) para warmup prelive", date_str, league_id)
+                prelive_last_fetch_diag["exceptions"] += 1
                 continue
 
-            response = data.get("response") or []
-            for item in response:
-                try:
-                    fixture = item.get("fixture") or {}
-                    league = item.get("league") or {}
-                    teams = item.get("teams") or {}
-
-                    status = fixture.get("status") or {}
-                    short = (status.get("short") or "").upper()
-                    # queremos só NS (não iniciado)
-                    if short not in ("NS",):
-                        continue
-
-                    fixture_ts_raw = fixture.get("timestamp")
-                    kickoff_ts: Optional[int] = None
-                    try:
-                        if fixture_ts_raw is not None:
-                            kickoff_ts = int(fixture_ts_raw)
-                    except Exception:
-                        kickoff_ts = None
-
-                    kickoff_dt = None
-                    if kickoff_ts:
-                        kickoff_dt = datetime.fromtimestamp(kickoff_ts, tz=timezone.utc)
-                        if kickoff_dt < (now - timedelta(hours=3)):
-                            continue
-                        if kickoff_dt - now > lookahead:
-                            continue
-
-                    home_team_obj = (teams.get("home") or {})
-                    away_team_obj = (teams.get("away") or {})
-                    home_team = home_team_obj.get("name") or "Home"
-                    away_team = away_team_obj.get("name") or "Away"
-
-                    fixtures.append(
-                        {
-                            "fixture_id": int(fixture.get("id")),
-                            "league_id": int(league.get("id") or league_id),
-                            "league_name": league.get("name") or "",
-                            "season": league.get("season"),
-                            "status_short": short,
-                            "minute": 0,
-                            "home_team": home_team,
-                            "away_team": away_team,
-                            "kickoff_ts": kickoff_ts,
-                        }
-                    )
-                except Exception:
-                    continue
-
-    # dedup por fixture_id
-    seen = set()
+    # dedup e ordena por kickoff
+    seen: set = set()
     out: List[Dict[str, Any]] = []
     for f in fixtures:
         fid = f.get("fixture_id")
-        if fid in seen:
+        if not fid or fid in seen:
             continue
         seen.add(fid)
         out.append(f)
 
-    # limita para proteger rate limits
+    out.sort(key=lambda x: (x.get("kickoff_ts") or 0, x.get("league_id") or 0))
+
     if PRELIVE_WARMUP_MAX_FIXTURES and len(out) > int(PRELIVE_WARMUP_MAX_FIXTURES):
         out = out[: int(PRELIVE_WARMUP_MAX_FIXTURES)]
 
+    prelive_last_fetch_diag["fixtures_out"] = len(out)
     return out
+
 
 
 async def _run_prelive_warmup_once() -> Dict[str, Any]:
@@ -4206,6 +4291,17 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Último warmup (UTC): {t}".format(t=last_warm_str),
     ]
 
+    diag = prelive_last_fetch_diag if isinstance(prelive_last_fetch_diag, dict) else {}
+    if diag:
+        lines.append("Fetch diag: mode={m} | calls={c} | api_err={e} | exc={x} | raw_last={r}".format(
+            m=str(diag.get("mode") or "?"),
+            c=int(diag.get("api_calls") or 0),
+            e=int(diag.get("api_error_hits") or 0),
+            x=int(diag.get("exceptions") or 0),
+            r=int(diag.get("raw_response_items_last") or 0),
+        ))
+        if (summary.get("fixtures", 0) == 0) and diag.get("last_api_errors_sample"):
+            lines.append("API errors (sample): {s}".format(s=str(diag.get("last_api_errors_sample"))))
     if summary.get("fixtures", 0) == 0:
         reasons: List[str] = []
         if not USE_PRELIVE_FAVORITE:
@@ -4284,11 +4380,23 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     fixtures_sorted = sorted(fixtures, key=lambda x: (x.get("kickoff_ts") or 0))
 
     if not fixtures_sorted:
-        msg = "\n".join([
+        lines = [
             "⚠️ Nenhum fixture encontrado no lookahead.",
             "Lookahead: {h}h | Timezone fixtures: {tz}".format(h=PRELIVE_LOOKAHEAD_HOURS, tz=API_FOOTBALL_TIMEZONE),
             "Dica: rode /debug e confirme se LEAGUE_IDS inclui a liga do jogo (Bundesliga=78).",
-        ])
+        ]
+        diag = prelive_last_fetch_diag if isinstance(prelive_last_fetch_diag, dict) else {}
+        if diag:
+            lines.append("Fetch diag: mode={m} | calls={c} | api_err={e} | exc={x} | raw_last={r}".format(
+                m=str(diag.get("mode") or "?"),
+                c=int(diag.get("api_calls") or 0),
+                e=int(diag.get("api_error_hits") or 0),
+                x=int(diag.get("exceptions") or 0),
+                r=int(diag.get("raw_response_items_last") or 0),
+            ))
+            if diag.get("last_api_errors_sample"):
+                lines.append("API errors (sample): {s}".format(s=str(diag.get("last_api_errors_sample"))))
+        msg = "\n".join(lines)
         try:
             if update.effective_chat:
                 await update.effective_chat.send_message(msg)
