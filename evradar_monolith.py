@@ -4199,11 +4199,36 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Sem odds ainda (miss): {m}".format(m=summary.get("miss", 0)),
         "",
         "Cache atual (registros): {sz}".format(sz=cache_sz),
+        "LEAGUE_IDS: {ids}".format(ids=",".join(str(x) for x in LEAGUE_IDS) or "(nenhuma)"),
+        "API_FOOTBALL_KEY: {k}".format(k="ok" if API_FOOTBALL_KEY else "(vazio)"),
+        "USE_PRELIVE_FAVORITE/PRELIVE_WARMUP_ENABLE: {u}/{w}".format(u=int(bool(USE_PRELIVE_FAVORITE)), w=int(bool(PRELIVE_WARMUP_ENABLE))),
         "Lookahead: {h}h | Timezone fixtures: {tz}".format(h=PRELIVE_LOOKAHEAD_HOURS, tz=API_FOOTBALL_TIMEZONE),
         "Último warmup (UTC): {t}".format(t=last_warm_str),
-        "",
-        "Dica: isso é exatamente o que garante favorito mesmo quando o jogo entra na janela 55'.",
     ]
+
+    if summary.get("fixtures", 0) == 0:
+        reasons: List[str] = []
+        if not USE_PRELIVE_FAVORITE:
+            reasons.append("USE_PRELIVE_FAVORITE=0 (pré-live desligado)")
+        if not PRELIVE_WARMUP_ENABLE:
+            reasons.append("PRELIVE_WARMUP_ENABLE=0 (warmup desligado)")
+        if not API_FOOTBALL_KEY:
+            reasons.append("API_FOOTBALL_KEY vazio (não dá pra consultar fixtures/odds)")
+        if not LEAGUE_IDS:
+            reasons.append("LEAGUE_IDS vazio (o warmup não sabe quais ligas consultar)")
+        if not reasons:
+            reasons.append("0 fixtures retornados pela API nas ligas configuradas dentro do lookahead. Se você sabe que há jogo hoje, confira /debug (LEAGUE_IDS e timezone) e os logs do Railway para erro/timeout.")
+
+        lines.extend([
+            "",
+            "⚠️ Nenhum fixture encontrado no warmup.",
+            "Possíveis causas: {r}".format(r=" | ".join(reasons)),
+            "Dica: rode /debug e confira se a Bundesliga está em LEAGUE_IDS (Bundesliga=78).",
+        ])
+
+    lines.append("")
+    lines.append("Dica: isso é exatamente o que garante favorito mesmo quando o jogo entra na janela 55'.")
+
     msg = "\n".join(lines)
 
     try:
@@ -4213,6 +4238,95 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
     except Exception:
         logging.exception("Erro ao responder /prelive")
+
+
+
+async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lista rapidamente os próximos fixtures encontrados (para validar que o pré-live está enxergando a agenda)."""
+    if not API_FOOTBALL_KEY:
+        msg = "⚠️ API_FOOTBALL_KEY vazio — não consigo consultar fixtures/odds pré-live."
+        try:
+            if update.effective_chat:
+                await update.effective_chat.send_message(msg)
+        except Exception:
+            pass
+        return
+
+    if not LEAGUE_IDS:
+        msg = "⚠️ LEAGUE_IDS está vazio — configure as ligas (ex.: Bundesliga=78) e reinicie."
+        try:
+            if update.effective_chat:
+                await update.effective_chat.send_message(msg)
+        except Exception:
+            pass
+        return
+
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message("🗓️ Buscando próximos fixtures (pré-live) ...")
+    except Exception:
+        pass
+
+    try:
+        from zoneinfo import ZoneInfo  # Python 3.9+
+        tz = ZoneInfo(API_FOOTBALL_TIMEZONE)
+    except Exception:
+        tz = None
+
+    fixtures: List[Dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            fixtures = await _fetch_upcoming_fixtures_for_prelive(client)
+    except Exception:
+        logging.exception("Erro no /prelive_next")
+        fixtures = []
+
+    fixtures_sorted = sorted(fixtures, key=lambda x: (x.get("kickoff_ts") or 0))
+
+    if not fixtures_sorted:
+        msg = "\n".join([
+            "⚠️ Nenhum fixture encontrado no lookahead.",
+            "Lookahead: {h}h | Timezone fixtures: {tz}".format(h=PRELIVE_LOOKAHEAD_HOURS, tz=API_FOOTBALL_TIMEZONE),
+            "Dica: rode /debug e confirme se LEAGUE_IDS inclui a liga do jogo (Bundesliga=78).",
+        ])
+        try:
+            if update.effective_chat:
+                await update.effective_chat.send_message(msg)
+        except Exception:
+            pass
+        return
+
+    top_n = fixtures_sorted[:12]
+    lines = [
+        "✅ Próximos fixtures detectados (top {n}):".format(n=len(top_n)),
+        "Lookahead: {h}h | Timezone fixtures: {tz}".format(h=PRELIVE_LOOKAHEAD_HOURS, tz=API_FOOTBALL_TIMEZONE),
+        "",
+    ]
+    for fx in top_n:
+        try:
+            ts = int(fx.get("kickoff_ts") or 0)
+        except Exception:
+            ts = 0
+        dt_utc = datetime.fromtimestamp(max(0, ts), tz=timezone.utc)
+        dt_local = dt_utc.astimezone(tz) if tz else dt_utc
+        hhmm = dt_local.strftime("%d/%m %H:%M")
+        lines.append("{t} — {home} vs {away} (fixture={fid}, liga={lid})".format(
+            t=hhmm,
+            home=str(fx.get("home_team") or "?"),
+            away=str(fx.get("away_team") or "?"),
+            fid=int(fx.get("fixture_id") or 0),
+            lid=int(fx.get("league_id") or 0),
+        ))
+
+    msg = "\n".join(lines)
+    try:
+        if update.effective_chat:
+            await update.effective_chat.send_message(msg)
+        elif TELEGRAM_CHAT_ID:
+            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+    except Exception:
+        logging.exception("Erro ao responder /prelive_next")
+
 
 
 
@@ -4397,6 +4511,7 @@ def main() -> None:
     application.add_handler(CommandHandler("debug", cmd_debug))
     application.add_handler(CommandHandler("links", cmd_links))
     application.add_handler(CommandHandler("prelive", cmd_prelive))
+    application.add_handler(CommandHandler("prelive_next", cmd_prelive_next))
 
     # Polling: parâmetros defensivos (filtrados pela assinatura disponível)
     polling_kwargs = dict(
