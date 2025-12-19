@@ -230,6 +230,8 @@ PRELIVE_CACHE_HOURS: int = _get_env_int("PRELIVE_CACHE_HOURS", 24)
 PRELIVE_ODDS_BOOKMAKER_ID: int = _get_env_int("PRELIVE_ODDS_BOOKMAKER_ID", 0)
 PRELIVE_STRONG_MAX_ODD: float = _get_env_float("PRELIVE_STRONG_MAX_ODD", 1.60)
 PRELIVE_SUPER_MAX_ODD: float = _get_env_float("PRELIVE_SUPER_MAX_ODD", 1.35)
+PRELIVE_LIGHT_MAX_ODD: float = _get_env_float("PRELIVE_LIGHT_MAX_ODD", 2.10)
+PRELIVE_ELITE_MAX_ODD: float = _get_env_float("PRELIVE_ELITE_MAX_ODD", 1.25)
 PRELIVE_LIGHT_MAX_ODD: float = _get_env_float("PRELIVE_LIGHT_MAX_ODD", 2.25)
 
 # NOVO: warmup + persistência de odds pré-live (pra não depender do /odds quando o jogo já está em 55')
@@ -237,6 +239,8 @@ PRELIVE_CACHE_FILE: str = _get_env_str("PRELIVE_CACHE_FILE", "prelive_cache.json
 PRELIVE_WARMUP_ENABLE: int = _get_env_int("PRELIVE_WARMUP_ENABLE", 1)
 PRELIVE_WARMUP_INTERVAL_MIN: int = _get_env_int("PRELIVE_WARMUP_INTERVAL_MIN", 30)
 API_FOOTBALL_TIMEZONE: str = _get_env_str("API_FOOTBALL_TIMEZONE", "America/Sao_Paulo")
+HTTPX_TIMEOUT: float = _get_env_float("HTTPX_TIMEOUT", 20.0)
+HTTPX_RETRY: int = _get_env_int("HTTPX_RETRY", 1)
 PRELIVE_LOOKAHEAD_HOURS: int = _get_env_int("PRELIVE_LOOKAHEAD_HOURS", 72)
 PRELIVE_WARMUP_MAX_FIXTURES: int = _get_env_int("PRELIVE_WARMUP_MAX_FIXTURES", 80)
 # Quando não encontramos odds pré-live, guardamos um "negativo" por poucos minutos (pra re-tentar depois).
@@ -532,12 +536,20 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
     params = {"live": "all"}
 
     try:
-        resp = await client.get(
-            API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures",
-            headers=headers,
-            params=params,
-            timeout=10.0,
-        )
+        resp = None
+        for _attempt in range(HTTPX_RETRY + 1):
+                try:
+                    resp = await client.get(
+                        API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures",
+                        headers=headers,
+                        params=params,
+                        timeout=HTTPX_TIMEOUT,
+                    )
+                    break
+                except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError):
+                    if _attempt >= HTTPX_RETRY:
+                        raise
+                    await asyncio.sleep(0.5)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -1293,22 +1305,45 @@ def _pick_totals_over_sum_plus_half_from_the_odds_api(
 # ---------------------------------------------------------------------------
 
 def _favorite_strength_from_odd(odd: Optional[float]) -> int:
-    """Retorna 0/1/2/3 (nenhum / leve / forte / super) a partir da odd pré-live."""
+    """Classifica a força do favorito a partir da odd pré-live (1x2).
+
+    Retorna um inteiro de 0 a 4 (5 níveis):
+      0 = sem favorito claro / jogo equilibrado
+      1 = favorito leve
+      2 = favorito forte
+      3 = favorito super
+      4 = favorito elite (superfavorito)
+
+    Observação: isso é só para *identificar o lado mais forte* e ponderar o contexto
+    (ex.: favorito perdendo). Não é uma recomendação de aposta.
+    """
     if odd is None:
         return 0
     try:
         o = float(odd)
     except (TypeError, ValueError):
         return 0
+
+    # Quanto menor a odd, mais forte o favorito.
+    try:
+        if PRELIVE_ELITE_MAX_ODD and o <= float(PRELIVE_ELITE_MAX_ODD):
+            return 4
+    except Exception:
+        pass
+
     if o <= PRELIVE_SUPER_MAX_ODD:
         return 3
     if o <= PRELIVE_STRONG_MAX_ODD:
         return 2
-    # acima de PRELIVE_LIGHT_MAX_ODD, trate como "sem favorito claro"
-    if o > PRELIVE_LIGHT_MAX_ODD:
-        return 0
-    # acima disso, pode ser favorito leve (ou jogo equilibrado)
-    return 1
+
+    # acima disso, pode ser um favorito leve (ou jogo bem equilibrado)
+    try:
+        if PRELIVE_LIGHT_MAX_ODD and o <= float(PRELIVE_LIGHT_MAX_ODD):
+            return 1
+    except Exception:
+        return 1
+
+    return 0
 
 
 async def _fetch_prelive_match_winner_odds_api_football(
@@ -2632,7 +2667,7 @@ def _infer_favorite_side_from_signals(
     Retorna: (favorite_side, favorite_strength, reason)
 
     - favorite_side: "home", "away" ou None
-    - favorite_strength: 0 (nenhum), 1 (leve), 2 (forte)
+    - favorite_strength: 0..4 (0=nenhum, 1=leve, 2=forte, 3=super, 4=elite)
     """
     rh = _to_float(rating_home, 0.0)
     ra = _to_float(rating_away, 0.0)
@@ -2681,17 +2716,30 @@ def _infer_favorite_side_from_signals(
 
     strength = 0
     if side is not None:
-        if side_r == side:
-            if score_r >= 0.70:
-                strength = max(strength, 2)
-            elif score_r >= 0.40:
-                strength = max(strength, 1)
+        # Normaliza pela sensibilidade configurada (thresh) e converte em 5 níveis.
+        def _tier_from_norm(norm: float) -> int:
+            try:
+                v = float(norm)
+            except Exception:
+                return 0
+            if v >= 5.0:
+                return 4
+            if v >= 4.0:
+                return 3
+            if v >= 3.0:
+                return 2
+            if v >= 2.0:
+                return 1
+            return 0
 
+        nr = 0.0
+        np = 0.0
+        if side_r == side:
+            nr = score_r / max(FAVORITE_RATING_THRESH, 1e-6)
         if side_p == side:
-            if score_p >= 0.45:
-                strength = max(strength, 2)
-            elif score_p >= 0.25:
-                strength = max(strength, 1)
+            np = score_p / max(FAVORITE_POWER_THRESH, 1e-6)
+
+        strength = max(_tier_from_norm(nr), _tier_from_norm(np))
 
     return side, strength, reason
 
@@ -2771,7 +2819,7 @@ def _compute_score_context_boost(
     # 1) Favorito (prioridade: odds pré-live; fallback: rating)
     fav_side = fixture.get("favorite_side")  # "home" | "away" | None
     try:
-        fav_strength = int(fixture.get("favorite_strength") or 0)  # 0..3
+        fav_strength = int(fixture.get("favorite_strength") or 0)  # 0..4
     except (TypeError, ValueError):
         fav_strength = 0
 
@@ -2795,41 +2843,53 @@ def _compute_score_context_boost(
 
     boost = 0.0
 
-    # 2) Necessidade pelo placar vs favorito
-    if fav_side == "home":
-        if score_diff < 0:  # favorito perdendo em casa
-            boost += 0.035 + 0.010 * min(2, abs(score_diff))
-            if fav_strength >= 2:
-                boost += 0.010
-        elif score_diff == 0:  # empate com favorito em casa
-            boost += 0.018
-            if fav_strength >= 2:
-                boost += 0.008
-            if minute_int >= 55:
-                boost += 0.004
-        else:  # favorito ganhando em casa
-            if score_diff >= 2:
-                boost -= 0.050
-            else:  # 1 gol
-                boost -= 0.032
-    elif fav_side == "away":
-        if score_diff > 0:  # favorito perdendo fora
-            boost += 0.030 + 0.010 * min(2, abs(score_diff))
-            if fav_strength >= 2:
-                boost += 0.008
-        elif score_diff == 0:  # empate com favorito fora
-            boost += 0.012
-            if fav_strength >= 2:
-                boost += 0.006
-            if minute_int >= 55:
-                boost += 0.003
-        else:  # favorito ganhando fora
-            if abs(score_diff) >= 2:
-                boost -= 0.040
-            else:
-                boost -= 0.025
+    # 2) Necessidade pelo placar vs favorito (fav_strength 0..4)
+    if fav_side in ("home", "away"):
+        # Multiplicadores por força do favorito (0..4)
+        pos_mult = [1.00, 1.00, 1.12, 1.25, 1.35]
+        neg_mult = [1.00, 1.08, 1.16, 1.25, 1.35]
+        s = max(0, min(4, int(fav_strength or 0)))
+
+        if fav_side == "home":
+            if score_diff < 0:  # favorito (mandante) perdendo → boost grande
+                boost += (0.060 + 0.015 * min(2, abs(score_diff)))
+                if minute_int >= WINDOW_START:
+                    boost += 0.006
+                if minute_int >= 65:
+                    boost += 0.004
+            elif score_diff == 0:  # empate com favorito mandante → boost médio
+                boost += 0.032
+                if minute_int >= WINDOW_START:
+                    boost += 0.004
+            else:  # favorito ganhando em casa → malus (hard-block é feito mais abaixo)
+                if score_diff >= 2:
+                    boost -= 0.060
+                else:
+                    boost -= 0.040
+
+        else:  # fav_side == "away"
+            if score_diff > 0:  # favorito (visitante) perdendo → boost grande (um pouco menor)
+                boost += (0.048 + 0.012 * min(2, abs(score_diff)))
+                if minute_int >= WINDOW_START:
+                    boost += 0.004
+                if minute_int >= 65:
+                    boost += 0.003
+            elif score_diff == 0:  # empate com favorito fora → boost médio (menor)
+                boost += 0.022
+                if minute_int >= WINDOW_START:
+                    boost += 0.003
+            else:  # favorito ganhando fora → malus
+                if abs(score_diff) >= 2:
+                    boost -= 0.050
+                else:
+                    boost -= 0.032
+
+        # aplica força diretamente na fórmula (mais forte → boost/malus mais intenso)
+        if boost >= 0:
+            boost *= pos_mult[s]
+        else:
+            boost *= neg_mult[s]
     else:
-        # sem favorito claro → nada agressivo
         boost += 0.0
 
     # 3) Perfil under/over real via gols por jogo (munição)
@@ -3071,11 +3131,15 @@ async def _get_pregame_boost_for_fixture(
         else:
             fixture["favorite_side"] = None
 
-        # força aproximada (2=forte, 1=leve)
+        # força aproximada (0..4) pela diferença de rating
         ad = abs(diff_rating)
-        if ad >= 0.70:
+        if ad >= 0.95:
+            fixture["favorite_strength"] = 4
+        elif ad >= 0.75:
+            fixture["favorite_strength"] = 3
+        elif ad >= 0.55:
             fixture["favorite_strength"] = 2
-        elif ad >= 0.40:
+        elif ad >= 0.35:
             fixture["favorite_strength"] = 1
         else:
             fixture["favorite_strength"] = 0
@@ -3871,7 +3935,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                         leader_side = "home" if score_diff > 0 else "away"
 
-                        if BLOCK_FAVORITE_LEADING and (fav_side_eff == leader_side):
+                        if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
+                            ignored.append(("favorite_leading", fixture_id))
                             continue
 
                         # Regra extra: perdedor under + líder com defesa sólida = geralmente não é teu perfil.
