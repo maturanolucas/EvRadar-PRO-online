@@ -3920,17 +3920,18 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                                 side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
                                     rating_home=rating_home,
                                     rating_away=rating_away,
-                                    attack_home_gpm=home_attack_gpm,
-                                    defense_home_gpm=home_defense_gpm,
-                                    attack_away_gpm=away_attack_gpm,
-                                    defense_away_gpm=away_defense_gpm,
+                                    attack_home_gpm=attack_home_gpm,
+                                    defense_home_gpm=defense_home_gpm,
+                                    attack_away_gpm=attack_away_gpm,
+                                    defense_away_gpm=defense_away_gpm,
                                 )
                                 fav_side_eff = side_inf
                                 try:
                                     fav_strength_eff = max(int(fav_strength_eff or 0), int(strength_inf or 0))
                                 except (TypeError, ValueError):
                                     fav_strength_eff = int(strength_inf or 0)
-                            except Exception:
+                            except Exception as e:
+                                logging.warning("infer_favorite_failed fixture_id=%s err=%r", fixture_id, e)
                                 fav_side_eff = None
 
                         leader_side = "home" if score_diff > 0 else "away"
@@ -3941,8 +3942,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                         # Regra extra: perdedor under + líder com defesa sólida = geralmente não é teu perfil.
                         if BLOCK_UNDER_TRAILER_VS_SOLID_DEF:
-                            trailing_attack = away_attack_gpm if score_diff > 0 else home_attack_gpm
-                            leading_def = home_defense_gpm if score_diff > 0 else away_defense_gpm
+                            trailing_attack = attack_away_gpm if score_diff > 0 else attack_home_gpm
+                            leading_def = defense_home_gpm if score_diff > 0 else defense_away_gpm
                             if (
                                 (trailing_attack is not None)
                                 and (leading_def is not None)
@@ -4765,6 +4766,14 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "MIN_ODD/MAX_ODD: {mn:.2f}/{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
         "MIN_PRESSURE_SCORE: {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "COOLDOWN_MINUTES: {cd}".format(cd=COOLDOWN_MINUTES),
+        "",
+        "BLOCK_FAVORITE_LEADING: {v}".format(v=BLOCK_FAVORITE_LEADING),
+        "BLOCK_SUPER_UNDER_LEADING: {v}".format(v=BLOCK_SUPER_UNDER_LEADING),
+        "BLOCK_UNDER_TRAILER_VS_SOLID_DEF: {v}".format(v=BLOCK_UNDER_TRAILER_VS_SOLID_DEF),
+        "FAVORITE_RATING_THRESH: {v}".format(v=FAVORITE_RATING_THRESH),
+        "FAVORITE_POWER_THRESH: {v}".format(v=FAVORITE_POWER_THRESH),
+        "PRELIVE_CACHE_SIZE: {v}".format(v=len(prelive_favorite_cache)),
+
         "",
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
         "BOOKMAKER_ID: {v}".format(v=BOOKMAKER_ID),
