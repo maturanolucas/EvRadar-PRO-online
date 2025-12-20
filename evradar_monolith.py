@@ -240,6 +240,15 @@ PRELIVE_LIGHT_MAX_ODD: float = _get_env_float("PRELIVE_LIGHT_MAX_ODD", 2.15)
 # Bloqueio quando o favorito pré-jogo está vencendo (por padrão, de "favorito" pra cima)
 FAVORITE_BLOCK_MIN_STRENGTH: int = _get_env_int("FAVORITE_BLOCK_MIN_STRENGTH", 2)
 
+# Bloqueio do favorito na frente: por padrão bloqueia com 1 gol de vantagem; exceção só em cenário MUITO forte.
+FAVORITE_LEAD_BLOCK_GOALS: int = _get_env_int("FAVORITE_LEAD_BLOCK_GOALS", 1)
+FAVORITE_LEAD_EXCEPTION_ENABLE: int = _get_env_int("FAVORITE_LEAD_EXCEPTION_ENABLE", 1)
+FAVORITE_LEAD_EXC_MIN_PRESSURE_DELTA: float = _get_env_float("FAVORITE_LEAD_EXC_MIN_PRESSURE_DELTA", 2.0)
+FAVORITE_LEAD_EXC_OPP_ATTACK_MIN: float = _get_env_float("FAVORITE_LEAD_EXC_OPP_ATTACK_MIN", 1.80)
+FAVORITE_LEAD_EXC_FAV_DEF_MIN: float = _get_env_float("FAVORITE_LEAD_EXC_FAV_DEF_MIN", 1.50)
+FAVORITE_LEAD_EXC_ALLOW_ONLY_LEAD1: int = _get_env_int("FAVORITE_LEAD_EXC_ALLOW_ONLY_LEAD1", 1)
+
+
 # NOVO: warmup + persistência de odds pré-live (pra não depender do /odds quando o jogo já está em 55')
 PRELIVE_CACHE_FILE: str = _get_env_str("PRELIVE_CACHE_FILE", "prelive_cache.json")
 PRELIVE_WARMUP_ENABLE: int = _get_env_int("PRELIVE_WARMUP_ENABLE", 1)
@@ -2800,6 +2809,50 @@ def _infer_favorite_side_from_signals(
     return side, strength, reason
 
 
+
+def _allow_favorite_leading_exception(
+    fav_side: Optional[str],
+    score_diff: int,
+    pressure_score: float,
+    attack_home_gpm: Optional[float],
+    defense_home_gpm: Optional[float],
+    attack_away_gpm: Optional[float],
+    defense_away_gpm: Optional[float],
+) -> Tuple[bool, str]:
+    """
+    Exceção para NÃO bloquear quando o favorito pré-jogo está vencendo.
+    Regra do Lucas: só libera em cenário MUITO forte — adversário muito over + favorito que cede gols,
+    e pressão ao vivo bem acima do mínimo.
+    """
+    try:
+        if not FAVORITE_LEAD_EXCEPTION_ENABLE:
+            return False, "disabled"
+        lead = abs(int(score_diff))
+        if FAVORITE_LEAD_EXC_ALLOW_ONLY_LEAD1 and lead != 1:
+            return False, "lead_not_1"
+        if pressure_score < (float(MIN_PRESSURE_SCORE) + float(FAVORITE_LEAD_EXC_MIN_PRESSURE_DELTA)):
+            return False, "pressure_low"
+        if fav_side not in ("home", "away"):
+            return False, "no_fav"
+
+        if fav_side == "home":
+            opp_attack = attack_away_gpm
+            fav_def = defense_home_gpm
+        else:
+            opp_attack = attack_home_gpm
+            fav_def = defense_away_gpm
+
+        if (opp_attack is None) or (fav_def is None):
+            return False, "missing_rates"
+        if float(opp_attack) < float(FAVORITE_LEAD_EXC_OPP_ATTACK_MIN):
+            return False, "opp_attack_low"
+        if float(fav_def) < float(FAVORITE_LEAD_EXC_FAV_DEF_MIN):
+            return False, "fav_def_low"
+
+        return True, "opp_over_and_fav_concedes"
+    except Exception:
+        # segurança: se der qualquer erro aqui, NÃO libera a exceção.
+        return False, "exception_err"
 def _goal_tier_gpm(gpm: Optional[float]) -> Optional[int]:
     """Bucketiza gols/jogo na escala do Lucas.
     0(<1.0), 1([1.0,1.3)), 2([1.3,1.5)), 3([1.5,1.8)), 4(>=1.8)
@@ -3706,13 +3759,10 @@ def _format_manual_no_odds_text(
     if lucas_boost_prob > 0.0:
         nota_parts.append("cenário encaixado no teu faro")
 
-    nota_parts.append(
-        "abrir mercado e só entrar se odd ≥ {mn:.2f}".format(mn=MANUAL_MIN_ODD_HINT)
-    )
     nota = " / ".join(nota_parts)
 
     lines: List[str] = [
-        "⚠️ Alerta manual (sem odd nas APIs)",
+        "⚠️ Observação (dados incompletos)",
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha sugerida: {linha}".format(linha=linha_str),
@@ -3977,9 +4027,21 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                         leader_side = "home" if score_diff > 0 else "away"
 
-                        if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side) and (fav_strength >= FAVORITE_BLOCK_MIN_STRENGTH):
-                            ignored.append(("favorite_leading", fixture_id))
-                            continue
+                        if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
+                            # Bloqueia favorito na frente (teu perfil). Exceção raríssima: adversário muito over + favorito que cede gols + pressão bem acima do mínimo.
+                            if (abs(int(score_diff)) >= int(FAVORITE_LEAD_BLOCK_GOALS)) and (int(fav_strength_eff or 0) >= int(FAVORITE_BLOCK_MIN_STRENGTH)):
+                                allow_exc, _exc_reason = _allow_favorite_leading_exception(
+                                    fav_side=fav_side_eff,
+                                    score_diff=score_diff,
+                                    pressure_score=pressure_score,
+                                    attack_home_gpm=attack_home_gpm,
+                                    defense_home_gpm=defense_home_gpm,
+                                    attack_away_gpm=attack_away_gpm,
+                                    defense_away_gpm=defense_away_gpm,
+                                )
+                                if not allow_exc:
+                                    ignored.append(("favorite_leading", fixture_id))
+                                    continue
 
                         # Regra extra: perdedor under + líder com defesa sólida = geralmente não é teu perfil.
                         if BLOCK_UNDER_TRAILER_VS_SOLID_DEF:
