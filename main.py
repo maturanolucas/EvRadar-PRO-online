@@ -3,7 +3,7 @@
 """
 EvRadar PRO entrypoint (flat layout).
 """
-from evradar_monolith import main
+from evradar_monolith_patched import main
 
 if __name__ == "__main__":
     main()
