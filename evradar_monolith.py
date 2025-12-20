@@ -228,11 +228,17 @@ MANUAL_MIN_ODD_HINT: float = _get_env_float("MANUAL_MIN_ODD_HINT", 1.47)
 USE_PRELIVE_FAVORITE: int = _get_env_int("USE_PRELIVE_FAVORITE", 1)
 PRELIVE_CACHE_HOURS: int = _get_env_int("PRELIVE_CACHE_HOURS", 24)
 PRELIVE_ODDS_BOOKMAKER_ID: int = _get_env_int("PRELIVE_ODDS_BOOKMAKER_ID", 0)
-PRELIVE_STRONG_MAX_ODD: float = _get_env_float("PRELIVE_STRONG_MAX_ODD", 1.60)
-PRELIVE_SUPER_MAX_ODD: float = _get_env_float("PRELIVE_SUPER_MAX_ODD", 1.35)
-PRELIVE_LIGHT_MAX_ODD: float = _get_env_float("PRELIVE_LIGHT_MAX_ODD", 2.10)
+
+# Thresholds do favorito pré-jogo (1X2). Padrão por faixas:
+#  <=1.35 super favorito | <=1.55 grande favorito | <=1.85 favorito | <=2.15 levemente favorito | >2.15 sem favorito
 PRELIVE_ELITE_MAX_ODD: float = _get_env_float("PRELIVE_ELITE_MAX_ODD", 1.25)
-PRELIVE_LIGHT_MAX_ODD: float = _get_env_float("PRELIVE_LIGHT_MAX_ODD", 2.25)
+PRELIVE_SUPER_MAX_ODD: float = _get_env_float("PRELIVE_SUPER_MAX_ODD", 1.35)
+PRELIVE_STRONG_MAX_ODD: float = _get_env_float("PRELIVE_STRONG_MAX_ODD", 1.55)
+PRELIVE_FAVORITE_MAX_ODD: float = _get_env_float("PRELIVE_FAVORITE_MAX_ODD", 1.85)
+PRELIVE_LIGHT_MAX_ODD: float = _get_env_float("PRELIVE_LIGHT_MAX_ODD", 2.15)
+
+# Bloqueio quando o favorito pré-jogo está vencendo (por padrão, de "favorito" pra cima)
+FAVORITE_BLOCK_MIN_STRENGTH: int = _get_env_int("FAVORITE_BLOCK_MIN_STRENGTH", 2)
 
 # NOVO: warmup + persistência de odds pré-live (pra não depender do /odds quando o jogo já está em 55')
 PRELIVE_CACHE_FILE: str = _get_env_str("PRELIVE_CACHE_FILE", "prelive_cache.json")
@@ -1304,18 +1310,78 @@ def _pick_totals_over_sum_plus_half_from_the_odds_api(
 # Favorito pré-live via odds (API-FOOTBALL /odds)
 # ---------------------------------------------------------------------------
 
+
+def _implied_probs_from_odds(
+    home_odd: Optional[float],
+    draw_odd: Optional[float],
+    away_odd: Optional[float],
+) -> Optional[Dict[str, float]]:
+    """Converte preços 1X2 em probabilidades implícitas normalizadas.
+
+    Retorna dict com chaves: home/draw/away (0..1), ou None se dados inválidos.
+    """
+    try:
+        ho = float(home_odd) if home_odd is not None else None
+        do = float(draw_odd) if draw_odd is not None else None
+        ao = float(away_odd) if away_odd is not None else None
+    except Exception:
+        return None
+
+    if not ho or ho <= 1.0 or not do or do <= 1.0 or not ao or ao <= 1.0:
+        return None
+
+    inv_h = 1.0 / ho
+    inv_d = 1.0 / do
+    inv_a = 1.0 / ao
+    s = inv_h + inv_d + inv_a
+    if s <= 0:
+        return None
+    return {"home": inv_h / s, "draw": inv_d / s, "away": inv_a / s}
+
+
+def _favorite_strength_from_prob(p_win: Optional[float]) -> int:
+    """Classifica força do favorito a partir da probabilidade de vitória (0..1).
+
+    Mapeamento 0..4 (5 níveis):
+      0 = sem favorito claro
+      1 = levemente favorito
+      2 = favorito
+      3 = grande favorito
+      4 = super favorito (inclui elite)
+    """
+    if p_win is None:
+        return 0
+    try:
+        p = float(p_win)
+    except Exception:
+        return 0
+    if p <= 0 or p >= 1:
+        return 0
+
+    # converte os thresholds de odd -> probabilidade (p ~= 1/odd)
+    elite_p = 1.0 / float(PRELIVE_ELITE_MAX_ODD) if PRELIVE_ELITE_MAX_ODD else 1.0
+    super_p = 1.0 / float(PRELIVE_SUPER_MAX_ODD) if PRELIVE_SUPER_MAX_ODD else 1.0
+    strong_p = 1.0 / float(PRELIVE_STRONG_MAX_ODD) if PRELIVE_STRONG_MAX_ODD else 1.0
+    fav_p = 1.0 / float(PRELIVE_FAVORITE_MAX_ODD) if PRELIVE_FAVORITE_MAX_ODD else 1.0
+    light_p = 1.0 / float(PRELIVE_LIGHT_MAX_ODD) if PRELIVE_LIGHT_MAX_ODD else 1.0
+
+    if p >= super_p:
+        return 4
+    if p >= strong_p:
+        return 3
+    if p >= fav_p:
+        return 2
+    if p >= light_p:
+        return 1
+    return 0
+
+
+
 def _favorite_strength_from_odd(odd: Optional[float]) -> int:
-    """Classifica a força do favorito a partir da odd pré-live (1x2).
+    """Compat: classifica força do favorito a partir do preço (odd) pré-jogo (1x2).
 
-    Retorna um inteiro de 0 a 4 (5 níveis):
-      0 = sem favorito claro / jogo equilibrado
-      1 = favorito leve
-      2 = favorito forte
-      3 = favorito super
-      4 = favorito elite (superfavorito)
-
-    Observação: isso é só para *identificar o lado mais forte* e ponderar o contexto
-    (ex.: favorito perdendo). Não é uma recomendação de aposta.
+    Internamente, converte para probabilidade implícita aproximada (p ~= 1/odd) e usa
+    os thresholds configurados.
     """
     if odd is None:
         return 0
@@ -1323,28 +1389,9 @@ def _favorite_strength_from_odd(odd: Optional[float]) -> int:
         o = float(odd)
     except (TypeError, ValueError):
         return 0
-
-    # Quanto menor a odd, mais forte o favorito.
-    try:
-        if PRELIVE_ELITE_MAX_ODD and o <= float(PRELIVE_ELITE_MAX_ODD):
-            return 4
-    except Exception:
-        pass
-
-    if o <= PRELIVE_SUPER_MAX_ODD:
-        return 3
-    if o <= PRELIVE_STRONG_MAX_ODD:
-        return 2
-
-    # acima disso, pode ser um favorito leve (ou jogo bem equilibrado)
-    try:
-        if PRELIVE_LIGHT_MAX_ODD and o <= float(PRELIVE_LIGHT_MAX_ODD):
-            return 1
-    except Exception:
-        return 1
-
-    return 0
-
+    if o <= 1.0:
+        return 0
+    return _favorite_strength_from_prob(1.0 / o)
 
 async def _fetch_prelive_match_winner_odds_api_football(
     client: httpx.AsyncClient,
@@ -1582,7 +1629,11 @@ async def _ensure_prelive_favorite(
     except Exception:
         fav_side, fav_odd = None, None
 
-    fav_strength = _favorite_strength_from_odd(fav_odd)
+    probs = _implied_probs_from_odds(home_odd, draw_odd, away_odd)
+    fav_prob: Optional[float] = None
+    if probs and fav_side in ('home','away'):
+        fav_prob = probs.get(fav_side)
+    fav_strength = _favorite_strength_from_prob(fav_prob)
 
     cache_payload: Dict[str, Any] = {
         "ts": now,
@@ -1595,9 +1646,14 @@ async def _ensure_prelive_favorite(
         "prelive_home_odd": home_odd,
         "prelive_draw_odd": draw_odd,
         "prelive_away_odd": away_odd,
+            "prelive_home_prob": (probs.get("home") if probs else None),
+            "prelive_draw_prob": (probs.get("draw") if probs else None),
+            "prelive_away_prob": (probs.get("away") if probs else None),
         "favorite_side": fav_side,
         "favorite_odd": fav_odd,
         "favorite_strength": fav_strength,
+            "favorite_prob": fav_prob,
+            "favorite_source": "implied_probs",
     }
     prelive_favorite_cache[fixture_id] = cache_payload
 
@@ -3496,10 +3552,10 @@ def _format_alert_text(
 
     🏟️ Jogo
     ⏱️ minuto | 🔢 placar
-    ⚙️ Linha: Over x,5 @ odd
-    📊 Probabilidade | Odd justa
-    💰 EV: x% → EV+ / EV-
-    🎯 Stake sugerida: x% da banca
+    ⚙️ Linha: Over x,5
+    📊 Probabilidade
+    
+    
     🧩 Nota: frase curta (pressão / necessidade de gol)
     """
     jogo = "{home} vs {away} — {league}".format(
@@ -3550,14 +3606,8 @@ def _format_alert_text(
     lines = [
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
-        "⚙️ Linha: {linha} @ {odd:.2f}".format(linha=linha_str, odd=odd_current),
-        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
-            p=p_final,
-            odd_j=odd_fair,
-        ),
-        "💰 EV: {ev:.2f}% → {lbl}".format(ev=ev_pct, lbl=ev_label),
-        "🎯 Stake sugerida: {spct:.2f}% da banca".format(spct=stake_pct),
-        "🧩 Nota: {nota}".format(nota=nota),
+        "⚙️ Linha: {linha}".format(linha=linha_str),
+        "📊 Probabilidade: {p:.1f}%".format(p=p_final),        "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
 
@@ -3607,16 +3657,7 @@ def _format_watch_text(
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha}".format(linha=linha_str),
-        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
-            p=p_final,
-            odd_j=odd_fair,
-        ),
-        "⚠️ Odd atual: {odd:.2f} (mínima configurada {mn:.2f})".format(
-            odd=odd_current,
-            mn=MIN_ODD,
-        ),
-        "💰 EV (na odd atual): {ev:.2f}%".format(ev=ev_pct),
-        "🧩 Nota: {nota}".format(nota=nota),
+        "📊 Probabilidade: {p:.1f}%".format(p=p_final),        "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
 
@@ -3936,7 +3977,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                         leader_side = "home" if score_diff > 0 else "away"
 
-                        if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
+                        if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side) and (fav_strength >= FAVORITE_BLOCK_MIN_STRENGTH):
                             ignored.append(("favorite_leading", fixture_id))
                             continue
 
