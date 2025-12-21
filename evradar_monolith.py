@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.3-lite
+GoalAlert - Telegram + Cérebro v0.3-lite
 ------------------------------------------
 Features:
 - Telegram estável (python-telegram-bot v21)
@@ -18,7 +18,7 @@ Features:
 - Impacto de jogadores em campo:
     - Stats por time/temporada (API-FOOTBALL /players)
     - Lineups + substituições (fixtures/lineups + fixtures/events)
-    - Boost de probabilidade conforme "peso ofensivo" do XI atual
+    - Boost de probabilidade conforme “peso ofensivo” do XI atual
 - Filtros de contexto alinhados ao teu faro:
     - Times under vs over (ataque/defesa por gols/jogo)
     - Flag match_super_under (duas equipes bem under)
@@ -40,7 +40,6 @@ import json
 import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import Update
@@ -137,6 +136,7 @@ WINDOW_START: int = _get_env_int("WINDOW_START", 47)
 WINDOW_END: int = _get_env_int("WINDOW_END", 75)
 
 EV_MIN_PCT: float = _get_env_float("EV_MIN_PCT", 4.0)
+MIN_GOAL_PROB: float = _get_env_float("MIN_GOAL_PROB", 0.62)
 MIN_ODD: float = _get_env_float("MIN_ODD", 1.47)
 MAX_ODD: float = _get_env_float("MAX_ODD", 3.50)
 
@@ -902,7 +902,7 @@ async def _run_prelive_warmup_once() -> Dict[str, Any]:
                 "minute": 0,
                 "status_short": "NS",
             }
-            await _ensure_prelive_favorite_robust(client, tmp_fixture)
+            await _ensure_prelive_favorite(client, tmp_fixture)
             new_cached = prelive_favorite_cache.get(fid)
             if new_cached and new_cached.get("favorite_side") in ("home", "away"):
                 summary["cached"] += 1
@@ -1317,299 +1317,359 @@ def _pick_totals_over_sum_plus_half_from_the_odds_api(
     return None
 
 # ---------------------------------------------------------------------------
-# DETECÇÃO DE FAVORITO MELHORADA
+# Favorito pré-live via odds (API-FOOTBALL /odds)
 # ---------------------------------------------------------------------------
 
-async def _fetch_prelive_match_winner_odds_api_football_robust(
+
+def _implied_probs_from_odds(
+    home_odd: Optional[float],
+    draw_odd: Optional[float],
+    away_odd: Optional[float],
+) -> Optional[Dict[str, float]]:
+    """Converte preços 1X2 em probabilidades implícitas normalizadas.
+
+    Retorna dict com chaves: home/draw/away (0..1), ou None se dados inválidos.
+    """
+    try:
+        ho = float(home_odd) if home_odd is not None else None
+        do = float(draw_odd) if draw_odd is not None else None
+        ao = float(away_odd) if away_odd is not None else None
+    except Exception:
+        return None
+
+    if not ho or ho <= 1.0 or not do or do <= 1.0 or not ao or ao <= 1.0:
+        return None
+
+    inv_h = 1.0 / ho
+    inv_d = 1.0 / do
+    inv_a = 1.0 / ao
+    s = inv_h + inv_d + inv_a
+    if s <= 0:
+        return None
+    return {"home": inv_h / s, "draw": inv_d / s, "away": inv_a / s}
+
+
+def _favorite_strength_from_prob(p_win: Optional[float]) -> int:
+    """Classifica força do favorito a partir da probabilidade de vitória (0..1).
+
+    Mapeamento 0..4 (5 níveis):
+      0 = sem favorito claro
+      1 = levemente favorito
+      2 = favorito
+      3 = grande favorito
+      4 = super favorito (inclui elite)
+    """
+    if p_win is None:
+        return 0
+    try:
+        p = float(p_win)
+    except Exception:
+        return 0
+    if p <= 0 or p >= 1:
+        return 0
+
+    # converte os thresholds de odd -> probabilidade (p ~= 1/odd)
+    elite_p = 1.0 / float(PRELIVE_ELITE_MAX_ODD) if PRELIVE_ELITE_MAX_ODD else 1.0
+    super_p = 1.0 / float(PRELIVE_SUPER_MAX_ODD) if PRELIVE_SUPER_MAX_ODD else 1.0
+    strong_p = 1.0 / float(PRELIVE_STRONG_MAX_ODD) if PRELIVE_STRONG_MAX_ODD else 1.0
+    fav_p = 1.0 / float(PRELIVE_FAVORITE_MAX_ODD) if PRELIVE_FAVORITE_MAX_ODD else 1.0
+    light_p = 1.0 / float(PRELIVE_LIGHT_MAX_ODD) if PRELIVE_LIGHT_MAX_ODD else 1.0
+
+    if p >= super_p:
+        return 4
+    if p >= strong_p:
+        return 3
+    if p >= fav_p:
+        return 2
+    if p >= light_p:
+        return 1
+    return 0
+
+
+
+def _favorite_strength_from_odd(odd: Optional[float]) -> int:
+    """Compat: classifica força do favorito a partir do preço (odd) pré-jogo (1x2).
+
+    Internamente, converte para probabilidade implícita aproximada (p ~= 1/odd) e usa
+    os thresholds configurados.
+    """
+    if odd is None:
+        return 0
+    try:
+        o = float(odd)
+    except (TypeError, ValueError):
+        return 0
+    if o <= 1.0:
+        return 0
+    return _favorite_strength_from_prob(1.0 / o)
+
+async def _fetch_prelive_match_winner_odds_api_football(
     client: httpx.AsyncClient,
     fixture_id: int,
     home_team: str,
     away_team: str,
-) -> Optional[Dict[str, float]]:
-    """
-    Busca odds pré-jogo 1x2 (casa/empate/fora) na API-FOOTBALL.
-    Versão mais robusta com fallback para diferentes formatos de odds.
+) -> Optional[Dict[str, Optional[float]]]:
+    """Busca odds pré-jogo 1x2 (casa/empate/fora) na API-FOOTBALL (/odds).
+
+    Melhorias:
+    - Força `bet` do Match Winner (padrão PRELIVE_MATCH_WINNER_BET_ID=1) quando disponível.
+    - Tenta múltiplos bookmakers (PRELIVE_ODDS_BOOKMAKER_ID, BOOKMAKER_ID e fallbacks) e por fim sem bookmaker.
+    - Parse mais tolerante (Home/Away/1/2/X/Draw e nomes de times).
     """
     if not API_FOOTBALL_KEY:
         return None
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
-    
-    # Tenta primeiro sem bookmaker específico para ter mais opções
-    params = {"fixture": fixture_id}
-    
+    hn = _normalize_team_name(home_team or "")
+    an = _normalize_team_name(away_team or "")
+
+    bet_id = 0
     try:
-        resp = await client.get(
-            f"{API_FOOTBALL_BASE_URL.rstrip('/')}/odds",
-            headers=headers,
-            params=params,
-            timeout=HTTP_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logging.warning(f"Erro ao buscar odds pré-live para fixture={fixture_id}: {e}")
-        return None
+        bet_id = int(PRELIVE_MATCH_WINNER_BET_ID or 0)
+    except Exception:
+        bet_id = 0
 
-    response = data.get("response", [])
-    if not response:
-        return None
+    # candidatos de bookmaker (0 = sem filtrar bookmaker)
+    candidates: List[int] = []
+    try:
+        if PRELIVE_ODDS_BOOKMAKER_ID and int(PRELIVE_ODDS_BOOKMAKER_ID) > 0:
+            candidates.append(int(PRELIVE_ODDS_BOOKMAKER_ID))
+    except Exception:
+        pass
 
-    # Procura por odds 1X2 em qualquer bookmaker
-    home_odd = None
-    draw_odd = None
-    away_odd = None
-    
-    for item in response:
-        bookmakers = item.get("bookmakers", [])
-        for bookmaker in bookmakers:
-            bets = bookmaker.get("bets", [])
-            for bet in bets:
-                bet_name = str(bet.get("name", "")).lower()
-                
-                # Procura mercado 1X2
-                if not any(keyword in bet_name for keyword in ["1x2", "match winner", "full time result"]):
+    try:
+        if BOOKMAKER_ID and int(BOOKMAKER_ID) > 0 and int(BOOKMAKER_ID) not in candidates:
+            candidates.append(int(BOOKMAKER_ID))
+    except Exception:
+        pass
+
+    for b in BOOKMAKER_FALLBACK_IDS:
+        try:
+            bi = int(b)
+        except Exception:
+            continue
+        if bi > 0 and bi not in candidates:
+            candidates.append(bi)
+
+    candidates.append(0)
+
+    def _parse_1x2(data: Any) -> Optional[Dict[str, Optional[float]]]:
+        try:
+            items = (data or {}).get("response") or []
+        except Exception:
+            items = []
+        if not isinstance(items, list) or not items:
+            return None
+
+        home_odd: Optional[float] = None
+        draw_odd: Optional[float] = None
+        away_odd: Optional[float] = None
+
+        for item in items:
+            try:
+                bookmakers = (item or {}).get("bookmakers") or []
+            except Exception:
+                bookmakers = []
+            if not isinstance(bookmakers, list):
+                continue
+
+            for bm in bookmakers:
+                bets = (bm or {}).get("bets") or []
+                if not isinstance(bets, list):
                     continue
-                
-                values = bet.get("values", [])
-                for value in values:
-                    odd_value = value.get("odd")
-                    if odd_value is None:
-                        continue
-                    
+
+                for bet in bets:
                     try:
-                        odd_float = float(str(odd_value).replace(",", "."))
-                    except (TypeError, ValueError):
+                        bid = bet.get("id")
+                        bname = str(bet.get("name") or "").lower()
+                    except Exception:
+                        bid = None
+                        bname = ""
+
+                    # tenta casar por ID (se vier), senão por nome
+                    if bet_id > 0 and bid is not None:
+                        try:
+                            if int(bid) != bet_id:
+                                continue
+                        except Exception:
+                            pass
+                    else:
+                        if not any(k in bname for k in ["match winner", "winner", "1x2", "fulltime result", "result", "1x2 - full time"]):
+                            continue
+
+                    values = bet.get("values") or []
+                    if not isinstance(values, list):
                         continue
-                    
-                    # Determina qual odd é baseado no label
-                    label = str(value.get("value", "")).lower().strip()
-                    
-                    if label in ["1", "home", "h"]:
-                        home_odd = odd_float
-                    elif label in ["x", "draw", "d"]:
-                        draw_odd = odd_float
-                    elif label in ["2", "away", "a"]:
-                        away_odd = odd_float
-                    elif "home" in label and home_team.lower() in label:
-                        home_odd = odd_float
-                    elif "away" in label and away_team.lower() in label:
-                        away_odd = odd_float
-    
-    # Se encontrou pelo menos uma odd válida, retorna
-    if home_odd or draw_odd or away_odd:
-        return {
-            "home": home_odd,
-            "draw": draw_odd,
-            "away": away_odd
-        }
-    
+
+                    for v in values:
+                        label = str(v.get("value") or "").strip()
+                        ln = _normalize_team_name(label)
+                        try:
+                            odd = float(v.get("odd"))
+                        except (TypeError, ValueError):
+                            continue
+
+                        if ln in ("x", "draw", "tie", "empate", "d"):
+                            draw_odd = odd
+                        elif ln in ("home", "1", "h", "casa", "local"):
+                            home_odd = odd
+                        elif ln in ("away", "2", "a", "fora", "visitante", "visitor"):
+                            away_odd = odd
+                        elif hn and ln == hn:
+                            home_odd = odd
+                        elif an and ln == an:
+                            away_odd = odd
+
+                    # se já temos casa e fora, já dá pra detectar favorito
+                    if home_odd is not None and away_odd is not None:
+                        return {"home": home_odd, "draw": draw_odd, "away": away_odd}
+
+        # se não fechou casa+fora, só retorna se pegou algo útil
+        if home_odd is not None or away_odd is not None or draw_odd is not None:
+            return {"home": home_odd, "draw": draw_odd, "away": away_odd}
+        return None
+
+    tried: set = set()
+    for bk in candidates:
+        try:
+            if bk in tried:
+                continue
+            tried.add(bk)
+
+            # tenta primeiro com bet_id (se configurado) e depois sem bet (algumas contas/rotas ignoram o param)
+            param_variants: List[Dict[str, Any]] = []
+            if bet_id > 0:
+                param_variants.append({"bet": bet_id})
+            param_variants.append({})
+
+            for extra in param_variants:
+                params: Dict[str, Any] = {"fixture": int(fixture_id)}
+                params.update(extra)
+                if bk and int(bk) > 0:
+                    params["bookmaker"] = int(bk)
+
+                resp = await client.get(
+                    API_FOOTBALL_BASE_URL.rstrip("/") + "/odds",
+                    headers=headers,
+                    params=params,
+                    timeout=HTTP_TIMEOUT,
+                )
+                data = resp.json()
+                parsed = _parse_1x2(data)
+                if parsed and (parsed.get("home") is not None or parsed.get("away") is not None):
+                    return parsed
+        except Exception:
+            logging.exception("Erro ao buscar/parsear odds pré-live (API-FOOTBALL) fixture=%s bk=%s", fixture_id, bk)
+
     return None
 
-def _classify_favorite_strength_from_odds(
-    home_odd: Optional[float], 
-    away_odd: Optional[float]
-) -> Tuple[Optional[str], int, Optional[float]]:
-    """
-    Classifica o favorito e sua força baseado nas odds.
-    
-    Retorna: (lado_favorito, força, odd_do_favorito)
-    Força: 4=super, 3=grande, 2=favorito, 1=leve, 0=sem favorito
-    """
-    if not home_odd or not away_odd:
-        return None, 0, None
-    
-    # Determina qual lado tem menor odd (mais favorito)
-    if home_odd < away_odd:
-        fav_side = "home"
-        fav_odd = home_odd
-        diff_ratio = away_odd / home_odd
-    else:
-        fav_side = "away"
-        fav_odd = away_odd
-        diff_ratio = home_odd / away_odd
-    
-    # Classifica força baseado na odd do favorito
-    if fav_odd <= 1.35:
-        strength = 4  # Super favorito
-    elif fav_odd <= 1.55:
-        strength = 3  # Grande favorito
-    elif fav_odd <= 1.85:
-        strength = 2  # Favorito
-    elif fav_odd <= 2.15:
-        strength = 1  # Levemente favorito
-    else:
-        strength = 0  # Sem favorito claro
-    
-    # Ajusta força baseado na diferença entre as odds
-    if diff_ratio >= 1.5 and strength > 0:
-        strength = min(strength + 1, 4)
-    
-    return fav_side, strength, fav_odd
 
-async def _ensure_prelive_favorite_robust(
+async def _ensure_prelive_favorite(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
 ) -> None:
-    """
-    Versão mais robusta para garantir que temos um favorito pré-live.
-    Tenta múltiplas fontes e fallbacks.
-    """
-    fixture_id = fixture.get("fixture_id")
-    if not fixture_id:
+    """Preenche fixture com favorito pré-live, com cache."""
+    try:
+        fixture_id = int(fixture.get("fixture_id") or 0)
+    except (TypeError, ValueError):
         return
-    
-    home_team = fixture.get("home_team", "")
-    away_team = fixture.get("away_team", "")
-    
-    # 1. Tenta buscar odds pré-live da API-FOOTBALL
-    odds_data = await _fetch_prelive_match_winner_odds_api_football_robust(
-        client, fixture_id, home_team, away_team
-    )
-    
-    if odds_data:
-        home_odd = odds_data.get("home")
-        away_odd = odds_data.get("away")
-        
-        fav_side, fav_strength, fav_odd = _classify_favorite_strength_from_odds(
-            home_odd, away_odd
-        )
-        
-        # Preenche o fixture com os dados do favorito
-        fixture["prelive_home_odd"] = home_odd
-        fixture["prelive_away_odd"] = away_odd
-        fixture["prelive_draw_odd"] = odds_data.get("draw")
-        fixture["favorite_side"] = fav_side
-        fixture["favorite_strength"] = fav_strength
-        fixture["favorite_odd"] = fav_odd
-        fixture["favorite_source"] = "api_football_odds"
-        
-        logging.info(
-            f"Fixture {fixture_id}: Favorito detectado via odds - "
-            f"{fav_side} (força={fav_strength}, odd={fav_odd})"
-        )
+    if fixture_id <= 0:
         return
-    
-    # 2. Fallback: inferência por rating (se tivermos dados de rating)
-    rating_home = fixture.get("rating_home", 0.0)
-    rating_away = fixture.get("rating_away", 0.0)
-    
-    if rating_home > 0 or rating_away > 0:
-        diff = rating_home - rating_away
-        threshold = _get_env_float("FAVORITE_RATING_THRESH", 0.15)
-        
-        if diff >= threshold:
-            fav_side = "home"
-            fav_strength = 1 if diff < threshold * 2 else 2
-        elif diff <= -threshold:
-            fav_side = "away"
-            fav_strength = 1 if abs(diff) < threshold * 2 else 2
-        else:
-            fav_side = None
-            fav_strength = 0
-        
-        if fav_side:
-            fixture["favorite_side"] = fav_side
-            fixture["favorite_strength"] = fav_strength
-            fixture["favorite_source"] = "rating_fallback"
-            logging.info(
-                f"Fixture {fixture_id}: Favorito inferido por rating - "
-                f"{fav_side} (força={fav_strength})"
-            )
-            return
-    
-    # 3. Sem dados suficientes
-    fixture["favorite_side"] = None
-    fixture["favorite_strength"] = 0
-    fixture["favorite_source"] = "none"
-    logging.info(f"Fixture {fixture_id}: Sem dados para determinar favorito")
+    if not USE_PRELIVE_FAVORITE:
+        return
 
-# ---------------------------------------------------------------------------
-# BOOSTS BASEADOS NO FAVORITO - REGRAS ESPECÍFICAS
-# ---------------------------------------------------------------------------
+    now = _now_utc()
+    cached = prelive_favorite_cache.get(fixture_id)
+    if cached:
+        ts = cached.get("ts")
+        if isinstance(ts, datetime):
+            # cache positivo dura horas; cache negativo (sem favorite_side) expira rápido pra re-tentar
+            if cached.get("favorite_side") in ("home", "away"):
+                valid = (now - ts) <= timedelta(hours=PRELIVE_CACHE_HOURS)
+            else:
+                valid = (now - ts) <= timedelta(minutes=PRELIVE_NEGATIVE_TTL_MIN)
+            if valid:
+                for k, v in cached.items():
+                    if k != "ts":
+                        fixture[k] = v
+                return
 
-def _compute_favorite_based_boost(
-    fixture: Dict[str, Any],
-    minute: int,
-    home_goals: int,
-    away_goals: int,
-    pressure_score: float,
-    base_context_boost: float
-) -> float:
-    """
-    Aplica boosts específicos baseados no cenário do favorito.
-    
-    Regras:
-    - Favorito perdendo em casa: boost forte (+0.06 a +0.10)
-    - Favorito perdendo fora: boost bom (+0.04 a +0.07)
-    - Favorito empatando em casa: boost bom (+0.03 a +0.05)
-    - Favorito empatando fora: sem boost (0.0)
-    - Sem favorito: boost neutro (0.0 a +0.02 baseado em pressão)
-    - Favorito na frente: penalização (-0.03 a -0.06)
-    """
-    fav_side = fixture.get("favorite_side")
-    fav_strength = fixture.get("favorite_strength", 0)
-    
-    if not fav_side or fav_strength == 0:
-        # Sem favorito claro - boost neutro baseado em pressão
-        if pressure_score >= 7.0:
-            return 0.02
-        elif pressure_score >= 5.0:
-            return 0.01
-        return 0.0
-    
-    score_diff = home_goals - away_goals
-    
-    # Multiplicador baseado na força do favorito
-    strength_mult = {
-        4: 1.4,  # Super favorito
-        3: 1.3,  # Grande favorito
-        2: 1.2,  # Favorito
-        1: 1.1,  # Levemente favorito
-    }.get(fav_strength, 1.0)
-    
-    boost = 0.0
-    
-    if fav_side == "home":
-        # Favorito é o mandante
-        if score_diff < 0:  # Perdendo
-            boost = 0.06 + (abs(score_diff) * 0.02)  # +0.06, +0.08, +0.10
-            if minute >= 65:  # Mais urgência no final
-                boost += 0.02
-        elif score_diff == 0:  # Empatando
-            boost = 0.03
-            if pressure_score >= 7.0:
-                boost += 0.01
-        else:  # Vencendo
-            boost = -0.03 - (score_diff * 0.015)
-            if score_diff >= 2:
-                boost -= 0.02  # Penalização extra para liderança confortável
-    
-    else:  # fav_side == "away"
-        # Favorito é o visitante
-        if score_diff > 0:  # Perdendo (visitante perdendo = mandante na frente)
-            boost = 0.04 + (abs(score_diff) * 0.015)  # +0.04, +0.055, +0.07
-            if minute >= 65:
-                boost += 0.015
-        elif score_diff == 0:  # Empatando
-            boost = 0.0  # Sem boost para visitante empatando
-            if pressure_score >= 8.0:  # Exceto se pressão MUITO alta
-                boost = 0.01
-        else:  # Vencendo (visitante na frente)
-            boost = -0.025 - (abs(score_diff) * 0.01)
-            if abs(score_diff) >= 2:
-                boost -= 0.015
-    
-    # Aplica multiplicador de força
-    boost *= strength_mult
-    
-    # Limita o boost máximo/minimo
-    if boost > 0.12:
-        boost = 0.12
-    if boost < -0.08:
-        boost = -0.08
-    
-    return boost
+    home_team = str(fixture.get("home_team") or "")
+    away_team = str(fixture.get("away_team") or "")
+
+    odds = await _fetch_prelive_match_winner_odds_api_football(client, fixture_id, home_team, away_team)
+    if not odds:
+        # não achou; deixa sem favorito (fallback por rating será usado)
+        prelive_favorite_cache[fixture_id] = {
+            "ts": now,
+            "league_id": fixture.get("league_id"),
+            "kickoff_ts": fixture.get("kickoff_ts"),
+            "home_team": home_team,
+            "away_team": away_team,
+            "prelive_home_team": home_team,
+            "prelive_away_team": away_team,
+            "prelive_home_odd": None,
+            "prelive_draw_odd": None,
+            "prelive_away_odd": None,
+            "favorite_side": None,
+            "favorite_odd": None,
+            "favorite_strength": 0,
+            "miss_reason": "no_prelive_odds",
+        }
+        _save_prelive_cache_to_file(force=False)
+        return
+
+    home_odd = odds.get("home")
+    draw_odd = odds.get("draw")
+    away_odd = odds.get("away")
+
+    fav_side: Optional[str] = None
+    fav_odd: Optional[float] = None
+    try:
+        if home_odd is not None and away_odd is not None:
+            if float(home_odd) < float(away_odd):
+                fav_side = "home"
+                fav_odd = float(home_odd)
+            elif float(away_odd) < float(home_odd):
+                fav_side = "away"
+                fav_odd = float(away_odd)
+            else:
+                fav_side = None
+                fav_odd = None
+    except Exception:
+        fav_side, fav_odd = None, None
+
+    probs = _implied_probs_from_odds(home_odd, draw_odd, away_odd)
+    fav_prob: Optional[float] = None
+    if probs and fav_side in ('home','away'):
+        fav_prob = probs.get(fav_side)
+    fav_strength = _favorite_strength_from_prob(fav_prob)
+
+    cache_payload: Dict[str, Any] = {
+        "ts": now,
+        "league_id": fixture.get("league_id"),
+        "kickoff_ts": fixture.get("kickoff_ts"),
+        "home_team": home_team,
+        "away_team": away_team,
+        "prelive_home_team": home_team,
+        "prelive_away_team": away_team,
+        "prelive_home_odd": home_odd,
+        "prelive_draw_odd": draw_odd,
+        "prelive_away_odd": away_odd,
+            "prelive_home_prob": (probs.get("home") if probs else None),
+            "prelive_draw_prob": (probs.get("draw") if probs else None),
+            "prelive_away_prob": (probs.get("away") if probs else None),
+        "favorite_side": fav_side,
+        "favorite_odd": fav_odd,
+        "favorite_strength": fav_strength,
+            "favorite_prob": fav_prob,
+            "favorite_source": "implied_probs",
+    }
+    prelive_favorite_cache[fixture_id] = cache_payload
+
+    for k, v in cache_payload.items():
+        if k != "ts":
+            fixture[k] = v
 
 async def _fetch_live_odds_for_fixture_odds_api(
     client: httpx.AsyncClient,
@@ -2656,6 +2716,9 @@ def _is_match_super_under(
     )
 
 
+
+
+
 def _infer_favorite_side_from_signals(
     rating_home: Optional[float],
     rating_away: Optional[float],
@@ -2665,86 +2728,60 @@ def _infer_favorite_side_from_signals(
     defense_away_gpm: Optional[float],
 ) -> Tuple[Optional[str], int, str]:
     """
-    Inferência de favorito quando odds pré-live não estão disponíveis.
+    Inferência de favorito SEM usar odds.
 
     Retorna: (favorite_side, favorite_strength, reason)
 
     - favorite_side: "home", "away" ou None
-    - favorite_strength: 0..4 (0=nenhum, 1=leve, 2=forte, 3=super, 4=elite)
+    - favorite_strength: 0..5 (0=nenhum, 1=leve, 2=médio, 3=forte, 4=muito forte, 5=superfavorito)
+
+    Fonte dos sinais:
+    - rating_home/rating_away (manual + pré-jogo automático)
+    - perfil de ataque/defesa por jogo (gols marcados/sofridos) por time
     """
-    rh = rating_home or 0.0
-    ra = rating_away or 0.0
-    diff_r = rh - ra
+    rh = _to_float(rating_home, 0.0)
+    ra = _to_float(rating_away, 0.0)
+    ah = _to_float(attack_home_gpm, 0.0)
+    dh = _to_float(defense_home_gpm, 0.0)
+    aa = _to_float(attack_away_gpm, 0.0)
+    da = _to_float(defense_away_gpm, 0.0)
 
-    side_r: Optional[str] = None
-    if diff_r >= FAVORITE_RATING_THRESH:
-        side_r = "home"
-    elif diff_r <= -FAVORITE_RATING_THRESH:
-        side_r = "away"
+    # Potencial de gol (ataque próprio + fragilidade do rival; penaliza defesa muito sólida)
+    # Escalas são "suaves" para não explodir o score em ligas muito over.
+    pot_home = (ah + max(0.0, da - 1.20) * 0.60) - max(0.0, 1.20 - dh) * 0.25
+    pot_away = (aa + max(0.0, dh - 1.20) * 0.60) - max(0.0, 1.20 - da) * 0.25
 
-    score_r = abs(diff_r)
+    diff_rating = rh - ra
+    diff_power = pot_home - pot_away
 
-    ah = attack_home_gpm or 0.0
-    dh = defense_home_gpm or 0.0
-    aa = attack_away_gpm or 0.0
-    da = defense_away_gpm or 0.0
+    # Combina e dá um leve peso pro rating (mais estável) sem ignorar potenciais.
+    diff = (0.65 * diff_rating) + (0.35 * diff_power)
 
-    # "power": ataque alto + defesa sólida (baixo sofrido) = favorito mais provável
-    power_home = (ah * 0.70) + (max(0.0, 2.20 - dh) * 0.30) if ah > 0.0 and dh >= 0.0 else 0.0
-    power_away = (aa * 0.70) + (max(0.0, 2.20 - da) * 0.30) if aa > 0.0 and da >= 0.0 else 0.0
+    thr = max(float(FAVORITE_RATING_THRESH), 0.12)
 
-    diff_p = power_home - power_away
-    side_p: Optional[str] = None
-    if diff_p >= FAVORITE_POWER_THRESH:
-        side_p = "home"
-    elif diff_p <= -FAVORITE_POWER_THRESH:
-        side_p = "away"
+    side: Optional[str] = None
+    if diff >= thr:
+        side = "home"
+    elif diff <= -thr:
+        side = "away"
 
-    score_p = abs(diff_p)
-
-    # decisão final (quando conflita, escolhe a evidência "mais forte" normalizada)
-    side: Optional[str] = side_r or side_p
-    reason = "rating" if side_r else ("power" if side_p else "none")
-
-    if side_r and side_p and side_r != side_p:
-        nr = score_r / max(FAVORITE_RATING_THRESH, 1e-6)
-        np = score_p / max(FAVORITE_POWER_THRESH, 1e-6)
-        if nr >= np:
-            side = side_r
-            reason = "rating(conflict)"
-        else:
-            side = side_p
-            reason = "power(conflict)"
-
+    # Converte em tiers 0..5 (normalizado pelo threshold)
     strength = 0
     if side is not None:
-        # Normaliza pela sensibilidade configurada (thresh) e converte em 5 níveis.
-        def _tier_from_norm(norm: float) -> int:
-            try:
-                v = float(norm)
-            except Exception:
-                return 0
-            if v >= 5.0:
-                return 4
-            if v >= 4.0:
-                return 3
-            if v >= 3.0:
-                return 2
-            if v >= 2.0:
-                return 1
-            return 0
+        norm = abs(diff) / max(thr, 1e-6)
+        if norm >= 5.0:
+            strength = 5
+        elif norm >= 3.8:
+            strength = 4
+        elif norm >= 2.8:
+            strength = 3
+        elif norm >= 2.0:
+            strength = 2
+        else:
+            strength = 1
 
-        nr = 0.0
-        np = 0.0
-        if side_r == side:
-            nr = score_r / max(FAVORITE_RATING_THRESH, 1e-6)
-        if side_p == side:
-            np = score_p / max(FAVORITE_POWER_THRESH, 1e-6)
-
-        strength = max(_tier_from_norm(nr), _tier_from_norm(np))
-
+    reason = "signals(rating+attack/defense)"
     return side, strength, reason
-
 
 
 def _allow_favorite_leading_exception(
@@ -2790,8 +2827,6 @@ def _allow_favorite_leading_exception(
     except Exception:
         # segurança: se der qualquer erro aqui, NÃO libera a exceção.
         return False, "exception_err"
-
-
 def _goal_tier_gpm(gpm: Optional[float]) -> Optional[int]:
     """Bucketiza gols/jogo na escala do Lucas.
     0(<1.0), 1([1.0,1.3)), 2([1.3,1.5)), 3([1.5,1.8)), 4(>=1.8)
@@ -2840,6 +2875,12 @@ def _compute_score_context_boost(
 ) -> float:
     """
     Ajuste de probabilidade baseado em CONTEXTO de placar + favorito.
+
+    Regras alinhadas ao teu padrão:
+    - Favorito perdendo → necessidade alta de gol (+boost), escalado pela força do favorito.
+    - Favorito empatando → boost (matriz diferente casa/fora e força).
+    - Favorito ganhando → malus forte (torneira fecha), escalado pela força e pelo tamanho da vantagem.
+    - Perfil under real reduz necessidade, especialmente se o favorito já está confortável.
     """
     try:
         minute_int = int(fixture.get("minute") or 0)
@@ -2850,82 +2891,112 @@ def _compute_score_context_boost(
         home_goals = int(fixture.get("home_goals") or 0)
         away_goals = int(fixture.get("away_goals") or 0)
     except (TypeError, ValueError):
-        home_goals, away_goals = 0, 0
+        home_goals = 0
+        away_goals = 0
 
-    score_diff = home_goals - away_goals  # >0 home vence
+    score_diff = home_goals - away_goals  # + = casa na frente
 
-    # Perfis de ataque/defesa
-    attack_home_gpm = fixture.get("attack_home_gpm")
-    defense_home_gpm = fixture.get("defense_home_gpm")
-    attack_away_gpm = fixture.get("attack_away_gpm")
-    defense_away_gpm = fixture.get("defense_away_gpm")
-
-    home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
-    away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
-    
-    # Favorito (já deve estar detectado via _ensure_prelive_favorite_robust)
+    # 1) Favorito e força (0..5)
     fav_side = fixture.get("favorite_side")
-    fav_strength = fixture.get("favorite_strength", 0)
+    fav_strength = fixture.get("favorite_strength")
+
+    if fav_side not in ("home", "away"):
+        # tenta inferir pelos sinais pré-jogo (rating + ataque/defesa)
+        side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
+            rating_home=rating_home,
+            rating_away=rating_away,
+            attack_home_gpm=fixture.get("attack_home_gpm"),
+            defense_home_gpm=fixture.get("defense_home_gpm"),
+            attack_away_gpm=fixture.get("attack_away_gpm"),
+            defense_away_gpm=fixture.get("defense_away_gpm"),
+        )
+        fav_side = side_inf
+        fav_strength = strength_inf
+        if fav_side in ("home", "away"):
+            fixture["favorite_side"] = fav_side
+            fixture["favorite_strength"] = int(fav_strength or 0)
+
+    try:
+        s = max(0, min(5, int(fav_strength or 0)))
+    except Exception:
+        s = 0
+
+    # Multiplicadores por força (0..5)
+    pos_mult = [1.00, 1.06, 1.14, 1.23, 1.33, 1.45]
+    neg_mult = [1.00, 1.08, 1.16, 1.25, 1.36, 1.50]
 
     boost = 0.0
 
-    # Se não temos favorito claro, retorna boost baseado apenas em rating
-    if not fav_side or fav_strength == 0:
-        # Times parelhos - boost baseado em pressão será aplicado depois
-        return 0.0
+    # 2) Necessidade pelo placar vs favorito
+    if fav_side in ("home", "away"):
+        if fav_side == "home":
+            if score_diff < 0:  # favorito mandante perdendo → boost grande
+                base = (0.060 + 0.015 * min(2, abs(score_diff)))
+                if minute_int >= WINDOW_START:
+                    base += 0.006
+                if minute_int >= 65:
+                    base += 0.004
+                boost += base * pos_mult[s]
+            elif score_diff == 0:  # empate com favorito em casa → (muito forte)
+                # matriz: favorito em casa (muito forte), superfavorito em casa empatado (forte)
+                base = 0.032
+                if s >= 5:
+                    base = 0.040
+                elif s >= 4:
+                    base = 0.038
+                elif s >= 3:
+                    base = 0.036
+                if minute_int >= WINDOW_START:
+                    base += 0.004
+                boost += base * pos_mult[s]
+            else:  # favorito ganhando em casa → malus
+                if score_diff >= 2:
+                    base = -0.060
+                else:
+                    base = -0.040
+                boost += base * neg_mult[s]
+        else:
+            # favorito fora
+            if score_diff > 0:  # favorito visitante perdendo → boost grande
+                base = (0.055 + 0.015 * min(2, abs(score_diff)))
+                if minute_int >= WINDOW_START:
+                    base += 0.005
+                if minute_int >= 65:
+                    base += 0.003
+                boost += base * pos_mult[s]
+            elif score_diff == 0:  # empate com favorito fora → fraco/médio conforme força
+                # matriz: favorito fora (forte), favorito fora empatado (fraco),
+                # superfavorito fora empatado (médio)
+                if s >= 5:
+                    base = 0.028
+                elif s >= 4:
+                    base = 0.026
+                elif s >= 3:
+                    base = 0.023
+                elif s >= 2:
+                    base = 0.020
+                else:
+                    base = 0.016
+                if minute_int >= WINDOW_START:
+                    base += 0.003
+                boost += base * pos_mult[s]
+            else:  # favorito visitante ganhando → malus
+                if abs(score_diff) >= 2:
+                    base = -0.058
+                else:
+                    base = -0.038
+                boost += base * neg_mult[s]
 
-    # Multiplicadores por força do favorito (0..4)
-    pos_mult = [1.00, 1.00, 1.12, 1.25, 1.35]
-    neg_mult = [1.00, 1.08, 1.16, 1.25, 1.35]
-    s = max(0, min(4, int(fav_strength or 0)))
+    # 3) Perfil under (gols feitos/sofridos) e torneira
+    attack_home_gpm = _to_float(fixture.get("attack_home_gpm"), 0.0)
+    defense_home_gpm = _to_float(fixture.get("defense_home_gpm"), 0.0)
+    attack_away_gpm = _to_float(fixture.get("attack_away_gpm"), 0.0)
+    defense_away_gpm = _to_float(fixture.get("defense_away_gpm"), 0.0)
 
-    if fav_side == "home":
-        if score_diff < 0:  # favorito (mandante) perdendo → boost forte
-            boost += (0.060 + 0.015 * min(2, abs(score_diff)))
-            if minute_int >= WINDOW_START:
-                boost += 0.006
-            if minute_int >= 65:
-                boost += 0.004
-        elif score_diff == 0:  # empate com favorito mandante → boost bom
-            boost += 0.032
-            if minute_int >= WINDOW_START:
-                boost += 0.004
-        else:  # favorito ganhando em casa → malus
-            if score_diff >= 2:
-                boost -= 0.060
-            else:
-                boost -= 0.040
-                # Penalização extra se o mandante under está na frente
-                if home_under:
-                    boost -= 0.020
+    home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
+    away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
-    else:  # fav_side == "away"
-        if score_diff > 0:  # favorito (visitante) perdendo → boost bom
-            boost += (0.048 + 0.012 * min(2, abs(score_diff)))
-            if minute_int >= WINDOW_START:
-                boost += 0.004
-            if minute_int >= 65:
-                boost += 0.003
-        elif score_diff == 0:  # empate com favorito fora → boost leve
-            boost += 0.022
-            if minute_int >= WINDOW_START:
-                boost += 0.003
-        else:  # favorito ganhando fora → malus
-            if abs(score_diff) >= 2:
-                boost -= 0.050
-            else:
-                boost -= 0.032
-                # Penalização extra se o visitante under está na frente
-                if away_under:
-                    boost -= 0.015
-
-    # aplica força diretamente na fórmula
-    if boost >= 0:
-        boost *= pos_mult[s]
-    else:
-        boost *= neg_mult[s]
-
-    # Ajuste por perfil under/over
+    # se o time "under" está na frente, penaliza mais
     if home_under and score_diff > 0:
         boost -= 0.020
         if fav_side == "home":
@@ -2935,7 +3006,13 @@ def _compute_score_context_boost(
         if fav_side == "away":
             boost -= 0.010
 
-    # Escala por minuto
+    # se o favorito under está empatando/vencendo, reduz ainda mais
+    if fav_side == "home" and home_under and score_diff >= 0:
+        boost -= 0.012
+    if fav_side == "away" and away_under and score_diff <= 0:
+        boost -= 0.010
+
+    # 4) Escala por minuto (tua janela)
     if minute_int < 50:
         scale = 0.6
     elif minute_int < 60:
@@ -2949,7 +3026,7 @@ def _compute_score_context_boost(
 
     boost *= scale
 
-    # Clamp final
+    # Clamp final (±6 pp)
     if boost > 0.06:
         boost = 0.06
     if boost < -0.06:
@@ -2958,13 +3035,18 @@ def _compute_score_context_boost(
     return boost
 
 
-
 def _compute_knockout_malus(
     fixture: Dict[str, Any],
     context_boost_prob: float,
 ) -> float:
     """
     Malus extra para jogos de mata-mata ida/volta (1ª partida tende a ser mais fechada).
+
+    Heurística:
+    - Só aplica em competições tipo "Cup" ou com nome típico de copa/torneio continental.
+    - Janela ~45–80'.
+    - Placar apertado (0x0, 1x0, 1x1, 2x1) e poucos gols.
+    - Reduz um pouco o contexto positivo (favorito atrás/empatando).
     """
     league_type = (fixture.get("league_type") or "").lower()
     league_name = (fixture.get("league_name") or "").lower()
@@ -3084,21 +3166,30 @@ async def _get_pregame_boost_for_fixture(
     """
     Retorna:
         (pregame_boost_prob, context_boost_prob, rating_home, rating_away)
+
+    pregame_boost_prob → pré-jogo manual + automático
+    context_boost_prob → ajuste de necessidade de gol (favorito x placar x casa/fora)
+    rating_home / rating_away → ratings usados para detectar cenário under, etc.
+    Além disso, preenche no fixture:
+        - attack_home_gpm / defense_home_gpm
+        - attack_away_gpm / defense_away_gpm
+        - match_super_under (bool)
     """
     manual_boost = _get_pregame_boost_manual(fixture)
 
     home_name = fixture.get("home_team") or ""
     away_name = fixture.get("away_team") or ""
 
-    # Favorito pré-live (odds) — função melhorada
+    # Favorito pré-live (odds) — se não tiver, seguimos com fallback de rating
     try:
-        await _ensure_prelive_favorite_robust(client, fixture)
+        await _ensure_prelive_favorite(client, fixture)
     except Exception:
         logging.exception("Erro ao garantir favorito pré-live para fixture=%s", fixture.get("fixture_id"))
 
     # ratings manuais como fallback
     rating_home = PREMATCH_TEAM_RATINGS.get(home_name, 0.0)
     rating_away = PREMATCH_TEAM_RATINGS.get(away_name, 0.0)
+
 
     league_id = fixture.get("league_id")
     season = fixture.get("season")
@@ -3120,6 +3211,33 @@ async def _get_pregame_boost_for_fixture(
             )
             auto_boost = 0.0
 
+
+    # Se não conseguimos odds pré-live, define um favorito por rating (fallback leve).
+    # IMPORTANTe: este fallback precisa rodar DEPOIS do pré-jogo automático, senão o favorito pode ficar "None"
+    # mesmo quando o auto_data já trouxe rating_home/rating_away.
+    if fixture.get("favorite_side") is None:
+        diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
+        thr = float(FAVORITE_RATING_THRESH)
+        if diff_rating >= thr:
+            fixture["favorite_side"] = "home"
+        elif diff_rating <= -thr:
+            fixture["favorite_side"] = "away"
+        else:
+            fixture["favorite_side"] = None
+
+        # força aproximada (0..4) pela diferença de rating
+        ad = abs(diff_rating)
+        if ad >= 0.95:
+            fixture["favorite_strength"] = 4
+        elif ad >= 0.75:
+            fixture["favorite_strength"] = 3
+        elif ad >= 0.55:
+            fixture["favorite_strength"] = 2
+        elif ad >= 0.35:
+            fixture["favorite_strength"] = 1
+        else:
+            fixture["favorite_strength"] = 0
+
     # Pega perfis de ataque/defesa (gols por jogo) do cache
     attack_home_gpm, defense_home_gpm = _get_team_attack_defense_from_cache(
         home_team_id, league_id, season
@@ -3140,6 +3258,26 @@ async def _get_pregame_boost_for_fixture(
         defense_away_gpm,
     )
     fixture["match_super_under"] = match_super_under
+
+    # Se ainda não achamos favorito, tenta inferir usando ataque/defesa (mais sensível que só rating)
+    if fixture.get("favorite_side") not in ("home", "away"):
+        try:
+            side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
+                rating_home=rating_home,
+                rating_away=rating_away,
+                attack_home_gpm=attack_home_gpm,
+                defense_home_gpm=defense_home_gpm,
+                attack_away_gpm=attack_away_gpm,
+                defense_away_gpm=defense_away_gpm,
+            )
+            if side_inf in ("home", "away"):
+                fixture["favorite_side"] = side_inf
+                try:
+                    fixture["favorite_strength"] = max(int(fixture.get("favorite_strength") or 0), int(strength_inf or 0))
+                except (TypeError, ValueError):
+                    fixture["favorite_strength"] = int(strength_inf or 0)
+        except Exception:
+            pass
 
     pregame_total = manual_boost + auto_boost
     if pregame_total > 0.03:
@@ -3163,6 +3301,7 @@ async def _get_pregame_boost_for_fixture(
 
     # Ajuste do contexto pelo tipo de time (over x under)
     try:
+        # times claramente over (ataque forte ou defesa vazada)
         home_overish = attack_home_gpm >= 1.8 or defense_away_gpm >= 1.6
         away_overish = attack_away_gpm >= 1.8 or defense_home_gpm >= 1.6
         any_overish = home_overish or away_overish
@@ -3173,15 +3312,18 @@ async def _get_pregame_boost_for_fixture(
         )
 
         if both_underish:
+            # jogo muito under → necessidade de gol não pode inflar tanto
             context_boost *= 0.4
         elif any_overish:
+            # jogo com característica over → peso levemente maior
             context_boost *= 1.1
         else:
+            # meio termo → leve redução
             context_boost *= 0.9
     except Exception:
         pass
 
-    # Ajuste extra para mata-mata ida/volta
+    # Ajuste extra para mata-mata ida/volta (1º jogo tende a ser mais travado)
     try:
         ko_malus = _compute_knockout_malus(fixture, context_boost)
         context_boost += ko_malus
@@ -3191,7 +3333,7 @@ async def _get_pregame_boost_for_fixture(
             fixture.get("fixture_id"),
         )
 
-    # Clamp de segurança
+    # Clamp de segurança para o contexto (±5 pp já é um empurrão forte)
     if context_boost > 0.05:
         context_boost = 0.05
     if context_boost < -0.05:
@@ -3212,7 +3354,12 @@ def _compute_lucas_pattern_boost(
     context_boost_prob: float,
 ) -> float:
     """
-    Boost adicional de probabilidade (0–10 pp) alinhado ao teu padrão.
+    Boost adicional de probabilidade (0–10 pp) alinhado ao teu padrão:
+
+    - Pressão alta (muitos chutes / perigo).
+    - Placar tenso (diferença ≤ 1, nada de goleada confortável).
+    - Janela de minuto que você mais entra (55–70).
+    - Necessidade de gol via contexto (favorito atrás/empatando).
     """
     try:
         minute_int = int(minute)
@@ -3238,7 +3385,7 @@ def _compute_lucas_pattern_boost(
     elif total_goals == 0 and pressure_score >= 5.5:
         boost += 0.03
 
-    # Janela de tempo preferida
+    # Janela de tempo preferida (onde você costuma pegar 1.47–1.70)
     if 55 <= minute_int <= 70:
         boost += 0.02
     elif 47 <= minute_int < 55 or 70 < minute_int <= 80:
@@ -3246,15 +3393,17 @@ def _compute_lucas_pattern_boost(
 
     # Necessidade de gol vinda do contexto (favorito atrás/empatando)
     if context_boost_prob > 0.0:
+        # context_boost_prob está em probabilidade (0–1) → converte para peso
         boost += min(context_boost_prob * 0.5, 0.03)
 
-    # Em goleadas o próprio contexto já derruba bastante
+    # Em goleadas o próprio contexto já derruba bastante, então não forçamos boost
     if abs(score_diff) >= 3 and minute_int >= 55:
         boost = 0.0
 
-    # Penalização para contextos claramente negativos
+    # Penalização para contextos claramente negativos (favorito confortável no placar)
     if context_boost_prob < 0.0:
         context_pp = context_boost_prob * 100.0
+        # contexto bem negativo (ex.: favorito forte ganhando em casa)
         if context_pp <= -2.0 and minute_int >= 55:
             boost *= 0.2
         elif context_pp < 0.0 and minute_int >= 50:
@@ -3286,7 +3435,14 @@ def _estimate_prob_and_odd(
 ) -> Dict[str, float]:
     """
     Estima probabilidade de +1 gol e uma odd "aproximada".
+
+    IMPORTANTE:
+    - Quando forced_odd_current vem da API (odd real da casa),
+      não fazemos clamp em [MIN_ODD, MAX_ODD] aqui.
+    - O filtro por faixa de odds é feito no scan.
+    - Inclui boost extra "padrão Lucas" para cenários que batem com teu faro.
     """
+
     total_goals = home_goals + away_goals
 
     home_shots = stats.get("home_shots_total", 0)
@@ -3337,7 +3493,7 @@ def _estimate_prob_and_odd(
     if pressure_score > 10.0:
         pressure_score = 10.0
 
-    # Base levemente mais agressiva
+    # Base levemente mais agressiva que a versão anterior
     base_prob = 0.38
     base_prob += (pressure_score / 10.0) * 0.37
 
@@ -3367,13 +3523,14 @@ def _estimate_prob_and_odd(
     )
     base_prob += lucas_boost_prob
 
-    # Malus por linhas altas (3.5, 4.5, 5.5...)
+    # Clamp final
+    # Malus por linhas altas (3.5, 4.5, 5.5...) — por padrão desconfiamos, a menos que o resto compense
     try:
         linha_gols = (home_goals + away_goals) + 0.5
     except Exception:
         linha_gols = 0.5
     if linha_gols >= HIGH_LINE_START:
-        steps_high = int((linha_gols - 2.5) // 1.0)
+        steps_high = int((linha_gols - 2.5) // 1.0)  # 3.5->1, 4.5->2, ...
         if steps_high > 0:
             base_prob -= steps_high * float(HIGH_LINE_STEP_MALUS_PROB)
 
@@ -3405,7 +3562,13 @@ def _estimate_prob_and_odd(
 
 def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
     """
-    Sugestão de stake em % da banca.
+    Sugestão de stake em % da banca, aproximando tua lógica de tiers:
+
+    - EV >= 7%  → ~3.0% da banca
+    - 5%–7%     → ~2.5%
+    - 3%–5%     → ~2.0%
+    - 1.5%–3%   → 1.2%
+    - abaixo disso: 0.8% simbólico
     """
     if ev_pct >= 7.0:
         return 3.0
@@ -3423,7 +3586,14 @@ def _format_alert_text(
     metrics: Dict[str, float],
 ) -> str:
     """
-    Layout enxuto.
+    Alerta principal (sem odds / sem aposta): foco em "dinâmica ofensiva"
+    com probabilidade + contexto/pressão.
+
+    🏟️ Jogo
+    ⏱️ minuto | 🔢 placar
+    ⚙️ Linha: Over x,5
+    📊 Probabilidade
+    🧩 Nota: pressão / necessidade / perfil
     """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
@@ -3431,28 +3601,22 @@ def _format_alert_text(
         league=fixture["league_name"],
     )
     minuto = fixture["minute"]
-    placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
+    placar = "{h}-{a}".format(h=fixture["home_goals"], a=fixture["away_goals"])
 
-    total_goals = fixture["home_goals"] + fixture["away_goals"]
+    total_goals = (fixture.get("home_goals") or 0) + (fixture.get("away_goals") or 0)
     linha_gols = total_goals + 0.5
     linha_str = "Over {v:.1f}".format(v=linha_gols)
 
-    p_final = metrics["p_final"] * 100.0
-    odd_fair = metrics["odd_fair"]
-    odd_current = metrics["odd_current"]
-    ev_pct = metrics["ev_pct"]
-    pressure_score = metrics["pressure_score"]
-    context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
-    lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
+    p_final = float(metrics.get("p_final", 0.0)) * 100.0
+    pressure_score = float(metrics.get("pressure_score", 0.0))
 
-    stake_pct = _suggest_stake_pct(ev_pct, odd_current)
+    context_boost_prob = float(metrics.get("context_boost_prob", 0.0)) * 100.0
+    lucas_boost_prob = float(metrics.get("lucas_boost_prob", 0.0)) * 100.0
+    news_boost_prob = float(metrics.get("news_boost_prob", 0.0)) * 100.0
+    pregame_boost_prob = float(metrics.get("pregame_boost_prob", 0.0)) * 100.0
+    player_boost_prob = float(metrics.get("player_boost_prob", 0.0)) * 100.0
 
-    # EV+ / EV-
-    ev_label = "EV+" if ev_pct >= 0.0 else "EV-"
-
-    # Nota rápida, 1 linha
     nota_parts: List[str] = []
-
     if pressure_score >= 7.5:
         nota_parts.append("pressão forte")
     elif pressure_score >= 5.0:
@@ -3460,44 +3624,30 @@ def _format_alert_text(
     else:
         nota_parts.append("pressão no limite")
 
+    # leitura rápida do contexto (favorito/placar)
     if context_boost_prob > 0.5:
-        nota_parts.append("favorito ainda precisa do gol")
+        nota_parts.append("necessidade alta")
     elif context_boost_prob < -0.5:
-        nota_parts.append("favorito confortável")
+        nota_parts.append("cenário tende a esfriar")
 
+    # camadas opcionais
+    if news_boost_prob >= 0.8:
+        nota_parts.append("notícias pró-ritmo")
+    if pregame_boost_prob >= 0.8:
+        nota_parts.append("pré-jogo over")
+    if player_boost_prob >= 0.8:
+        nota_parts.append("sub/ataque reforçado")
     if lucas_boost_prob > 0.0:
-        nota_parts.append("padrão bem alinhado ao teu faro")
-
-    nota = " / ".join(nota_parts)
-
-    # Adiciona informação do favorito se existir
-    fav_info = ""
-    fav_side = fixture.get("favorite_side")
-    fav_strength = fixture.get("favorite_strength", 0)
-    
-    if fav_side and fav_strength > 0:
-        fav_text = {
-            4: "Super favorito",
-            3: "Grande favorito", 
-            2: "Favorito",
-            1: "Levemente favorito"
-        }.get(fav_strength, "Favorito")
-        fav_info = f"\n⭐ {fav_text}: {fav_side.upper()}"
+        nota_parts.append("padrão Lucas")
 
     lines = [
+        "🚨 Alerta de dinâmica ofensiva",
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha}".format(linha=linha_str),
-        "📊 Probabilidade: {p:.1f}% | Odd: {odd:.2f} | EV: {ev:.1f}%".format(
-            p=p_final, odd=odd_current, ev=ev_pct
-        ),
-        "💰 Sugestão de stake: {stake:.1f}% da banca".format(stake=stake_pct),
-        "🧩 Nota: {nota}".format(nota=nota),
+        "📊 Probabilidade: {p:.1f}%".format(p=p_final),
+        "🧩 Nota: {nota}".format(nota=" / ".join(nota_parts)),
     ]
-    
-    if fav_info:
-        lines.append(fav_info)
-        
     return "\n".join(lines)
 
 
@@ -3506,7 +3656,8 @@ def _format_watch_text(
     metrics: Dict[str, float],
 ) -> str:
     """
-    Alerta de OBSERVAÇÃO.
+    Mensagem de "observação" quando o cenário está bom, mas ainda falta
+    alguma confirmação (ex.: ritmo/pressão no limite).
     """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
@@ -3514,39 +3665,32 @@ def _format_watch_text(
         league=fixture["league_name"],
     )
     minuto = fixture["minute"]
-    placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
+    placar = "{h}-{a}".format(h=fixture["home_goals"], a=fixture["away_goals"])
 
-    total_goals = fixture["home_goals"] + fixture["away_goals"]
+    total_goals = (fixture.get("home_goals") or 0) + (fixture.get("away_goals") or 0)
     linha_gols = total_goals + 0.5
     linha_str = "Over {v:.1f}".format(v=linha_gols)
 
-    p_final = metrics["p_final"] * 100.0
-    odd_fair = metrics["odd_fair"]
-    odd_current = metrics["odd_current"]
-    ev_pct = metrics["ev_pct"]
-    pressure_score = metrics["pressure_score"]
+    p_final = float(metrics.get("p_final", 0.0)) * 100.0
+    pressure_score = float(metrics.get("pressure_score", 0.0))
 
-    # Nota curta
     nota_parts: List[str] = []
     if pressure_score >= 7.5:
         nota_parts.append("pressão forte")
     elif pressure_score >= 5.0:
         nota_parts.append("pressão boa")
     else:
-        nota_parts.append("pressão ok")
+        nota_parts.append("pressão no limite")
 
-    nota_parts.append("esperar odd bater a mínima antes de entrar")
-    nota = " / ".join(nota_parts)
+    nota_parts.append("observar mais 1–2 min")
 
     lines = [
-        "👀 Observação de gol",
+        "👀 Observação de cenário",
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha}".format(linha=linha_str),
-        "📊 Probabilidade: {p:.1f}% | Odd atual: {odd:.2f} (abaixo do mínimo)".format(
-            p=p_final, odd=odd_current
-        ),
-        "🧩 Nota: {nota}".format(nota=nota),
+        "📊 Probabilidade: {p:.1f}%".format(p=p_final),
+        "🧩 Nota: {nota}".format(nota=" / ".join(nota_parts)),
     ]
     return "\n".join(lines)
 
@@ -3556,7 +3700,8 @@ def _format_manual_no_odds_text(
     metrics: Dict[str, float],
 ) -> str:
     """
-    Alerta MANUAL quando não há odd em nenhuma API.
+    Alerta MANUAL quando não há odd em nenhuma API, mas o jogo está no teu padrão.
+    Layout enxuto, focado em probabilidade e plano de ação.
     """
     jogo = "{home} vs {away} — {league}".format(
         home=fixture["home_team"],
@@ -3606,7 +3751,6 @@ def _format_manual_no_odds_text(
             odd_j=odd_fair,
         ),
         "🧩 Nota: {nota}".format(nota=nota),
-        "ℹ️ Sem odds ao vivo disponíveis. Confira a casa antes de entrar.",
     ]
     return "\n".join(lines)
 
@@ -3616,6 +3760,7 @@ def _format_pattern_only_text(
     metrics: Dict[str, float],
 ) -> str:
     """
+    (Atualmente não usado diretamente; mantido como backup)
     Alerta de PADRÃO FORTE quando a API não trouxer odd nem cache.
     """
     jogo = "{home} vs {away} — {league}".format(
@@ -3661,12 +3806,19 @@ def _format_pattern_only_text(
 
 
 # ---------------------------------------------------------------------------
-# FUNÇÃO PRINCIPAL DE SCAN ATUALIZADA
+# Função principal de scan (CÉREBRO)
 # ---------------------------------------------------------------------------
 
 async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     """
-    Executa UM ciclo de varredura com detecção melhorada do favorito.
+    Executa UM ciclo de varredura.
+    Usa odd ao vivo ou, em caso de mercado suspenso, a última odd em cache
+    da linha correta.
+
+    Tipos de alerta:
+    - ALERTA NORMAL: cenário bom + odd dentro da faixa [MIN_ODD, MAX_ODD]
+    - ALERTA OBSERVAÇÃO: cenário bom + odd POSITIVA mas abaixo de MIN_ODD
+    - ALERTA MANUAL: jogo muito no padrão, mas SEM odd nas APIs (você julga o preço)
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -3678,7 +3830,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
     if not API_FOOTBALL_KEY:
         last_status_text = (
-            "[EvRadar PRO] Scan concluído (origem={origin}). "
+            "[GoalAlert] Scan concluído (origem={origin}). "
             "API_FOOTBALL_KEY não definido; nenhum jogo analisado."
         ).format(origin=origin)
         logging.warning(last_status_text)
@@ -3694,65 +3846,25 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
         for fx in fixtures:
             try:
-                # 1. Buscar estatísticas
                 stats = await _fetch_statistics_for_fixture(client, fx["fixture_id"])
                 if not stats:
                     continue
 
                 total_goals = fx["home_goals"] + fx["away_goals"]
-                minute = fx["minute"]
-                
-                # 2. Detectar favorito PRIMEIRO
-                await _ensure_prelive_favorite_robust(client, fx)
-                
-                fav_side = fx.get("favorite_side")
-                fav_strength = fx.get("favorite_strength", 0)
-                
-                logging.info(
-                    f"Fixture {fx['fixture_id']}: {fx['home_team']} vs {fx['away_team']} - "
-                    f"Favorito: {fav_side} (força={fav_strength})"
-                )
 
-                # 3. Aplicar filtros baseados no favorito
-                score_diff = fx["home_goals"] - fx["away_goals"]
-                
-                # Bloqueio: favorito na frente (se configurado)
-                if BLOCK_FAVORITE_LEADING and fav_side and fav_strength >= FAVORITE_BLOCK_MIN_STRENGTH:
-                    leader_side = "home" if score_diff > 0 else "away" if score_diff < 0 else None
-                    
-                    if leader_side == fav_side:
-                        # Favorito está na frente
-                        lead_goals = abs(score_diff)
-                        
-                        # Verifica se deve bloquear
-                        if lead_goals >= FAVORITE_LEAD_BLOCK_GOALS:
-                            # Calcular pressão primeiro
-                            pressure_score = _calculate_pressure_score(stats)
-                            
-                            # Verifica exceções
-                            allow_exception, reason = _allow_favorite_leading_exception(
-                                fav_side=fav_side,
-                                score_diff=score_diff,
-                                pressure_score=pressure_score,
-                                attack_home_gpm=fx.get("attack_home_gpm"),
-                                defense_home_gpm=fx.get("defense_home_gpm"),
-                                attack_away_gpm=fx.get("attack_away_gpm"),
-                                defense_away_gpm=fx.get("defense_away_gpm"),
-                            )
-                            
-                            if not allow_exception:
-                                logging.info(
-                                    f"Fixture {fx['fixture_id']} bloqueado: "
-                                    f"favorito {fav_side} está na frente por {lead_goals} gol(s) - {reason}"
-                                )
-                                continue
 
-                # 4. Buscar odds ao vivo
-                api_odd = None
+                # Base do placar (sempre definido p/ evitar UnboundLocalError)
+                score_diff = (fx.get("home_goals") or 0) - (fx.get("away_goals") or 0)
+                minute_int = fx.get("minute") or 0
+                try:
+                    minute_int = int(minute_int)
+                except (TypeError, ValueError):
+                    minute_int = 0
+                api_odd: Optional[float] = None
                 got_live_odd = False
                 used_cache_odd = False
 
-                # Tenta API-FOOTBALL
+                # 1) Tenta API-FOOTBALL
                 try:
                     api_odd = await _fetch_live_odds_for_fixture(
                         client=client,
@@ -3768,12 +3880,16 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             api_odd = cached_odd
                             used_cache_odd = True
                 except Exception:
+                    logging.exception(
+                        "Erro inesperado ao buscar odds ao vivo (API-FOOTBALL) para fixture=%s",
+                        fx["fixture_id"],
+                    )
                     cached_odd = _get_cached_odd_for_line(fx["fixture_id"], total_goals)
                     if cached_odd is not None:
                         api_odd = cached_odd
                         used_cache_odd = True
 
-                # Tenta The Odds API se necessário
+                # 2) Se nada veio da API-FOOTBALL (nem cache), tenta The Odds API
                 if api_odd is None and ODDS_API_KEY and ODDS_API_USE:
                     try:
                         oddsapi_odd = await _fetch_live_odds_for_fixture_odds_api(
@@ -3781,40 +3897,158 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             fixture=fx,
                             total_goals=total_goals,
                         )
-                        if oddsapi_odd is not None:
-                            api_odd = oddsapi_odd
-                            got_live_odd = True
-                            _update_last_odd_cache(fx["fixture_id"], total_goals, api_odd)
                     except Exception:
-                        pass
+                        logging.exception(
+                            "Erro inesperado ao buscar odds via The Odds API para fixture=%s",
+                            fx["fixture_id"],
+                        )
+                        oddsapi_odd = None
 
-                # 5. Calcular boosts
+                    if oddsapi_odd is not None:
+                        api_odd = oddsapi_odd
+                        got_live_odd = True
+                        _update_last_odd_cache(fx["fixture_id"], total_goals, api_odd)
+
+                # 3) Boosts que não dependem de odd (sempre calculados)
                 news_boost_prob = 0.0
                 try:
-                    news_boost_prob = await _fetch_news_boost_for_fixture(client, fx)
+                    news_boost_prob = await _fetch_news_boost_for_fixture(
+                        client=client,
+                        fixture=fx,
+                    )
                 except Exception:
+                    logging.exception(
+                        "Erro inesperado ao calcular news boost para fixture=%s",
+                        fx["fixture_id"],
+                    )
                     news_boost_prob = 0.0
 
-                # Pré-jogo e contexto
                 pregame_boost_prob = 0.0
                 context_boost_prob = 0.0
                 rating_home = 0.0
                 rating_away = 0.0
-                
                 try:
                     (
                         pregame_boost_prob,
                         context_boost_prob,
                         rating_home,
                         rating_away,
-                    ) = await _get_pregame_boost_for_fixture(client, fx)
+                    ) = await _get_pregame_boost_for_fixture(
+                        client=client,
+                        fixture=fx,
+                    )
                 except Exception:
+                    logging.exception(
+                        "Erro inesperado ao calcular pré-jogo/contexto para fixture=%s",
+                        fx["fixture_id"],
+                    )
                     pregame_boost_prob = 0.0
                     context_boost_prob = 0.0
                     rating_home = 0.0
                     rating_away = 0.0
 
-                # Player boost
+                # -------------------------------
+                # Filtros do teu perfil (PÓS pré-jogo, com favorito pré-live já definido)
+                # -------------------------------
+                try:
+                    fav_side = fx.get("favorite_side")
+                    try:
+                        fav_strength = int(fx.get("favorite_strength") or 0)
+                    except (TypeError, ValueError):
+                        fav_strength = 0
+
+                    attack_home_gpm = _to_float(fx.get("attack_home_gpm", fx.get("home_attack_gpm", 0.0)), 0.0)
+                    defense_home_gpm = _to_float(fx.get("defense_home_gpm", fx.get("home_defense_gpm", 0.0)), 0.0)
+                    attack_away_gpm = _to_float(fx.get("attack_away_gpm", fx.get("away_attack_gpm", 0.0)), 0.0)
+                    defense_away_gpm = _to_float(fx.get("defense_away_gpm", fx.get("away_defense_gpm", 0.0)), 0.0)
+
+                    home_no_ammo = _is_team_no_ammo(attack_home_gpm, defense_home_gpm)
+                    away_no_ammo = _is_team_no_ammo(attack_away_gpm, defense_away_gpm)
+
+                    # 1) Se quem está perdendo tem "pouca munição" (time under/sem gol), você quase nunca quer.
+                    if (score_diff != 0) and (minute_int >= 55):
+                        trailing_side = "away" if score_diff > 0 else "home"
+                        trailing_no_ammo = away_no_ammo if trailing_side == "away" else home_no_ammo
+                        if trailing_no_ammo:
+                            continue
+
+                    # 1b) Bloqueio: jogo já muito encaminhado (2+ gols de diferença) no 2º tempo.
+                    if BLOCK_LEAD_BY_2 and (minute_int >= LEAD_BY_2_MINUTE) and (abs(score_diff) >= 2):
+                        continue
+
+                    # 1c) Bloqueio: match super under com alguém já na frente (tende a travar/administrar).
+                    if BLOCK_SUPER_UNDER_LEADING and match_super_under and (minute_int >= 55) and (score_diff != 0):
+                        continue
+
+                    # 2) Bloqueio: favorito pré-live já na frente (principalmente em casa) — raro ser teu perfil.
+                    if (score_diff != 0) and (minute_int >= 55):
+                        diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
+                        fav_side_eff = fav_side if fav_side in ("home", "away") else None
+                        fav_strength_eff = int(fav_strength or 0)
+
+                        if fav_side_eff is None:
+                            try:
+                                side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
+                                    rating_home=rating_home,
+                                    rating_away=rating_away,
+                                    attack_home_gpm=attack_home_gpm,
+                                    defense_home_gpm=defense_home_gpm,
+                                    attack_away_gpm=attack_away_gpm,
+                                    defense_away_gpm=defense_away_gpm,
+                                )
+                                fav_side_eff = side_inf
+                                try:
+                                    fav_strength_eff = max(int(fav_strength_eff or 0), int(strength_inf or 0))
+                                except (TypeError, ValueError):
+                                    fav_strength_eff = int(strength_inf or 0)
+                            except Exception as e:
+                                logging.warning("infer_favorite_failed fixture_id=%s err=%r", fixture_id, e)
+                                fav_side_eff = None
+
+                        leader_side = "home" if score_diff > 0 else "away"
+
+                        if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
+                            # Bloqueia favorito na frente (teu perfil). Exceção raríssima: adversário muito over + favorito que cede gols + pressão bem acima do mínimo.
+                            if (abs(int(score_diff)) >= int(FAVORITE_LEAD_BLOCK_GOALS)) and (int(fav_strength_eff or 0) >= int(FAVORITE_BLOCK_MIN_STRENGTH)):
+                                allow_exc, _exc_reason = _allow_favorite_leading_exception(
+                                    fav_side=fav_side_eff,
+                                    score_diff=score_diff,
+                                    pressure_score=pressure_score,
+                                    attack_home_gpm=attack_home_gpm,
+                                    defense_home_gpm=defense_home_gpm,
+                                    attack_away_gpm=attack_away_gpm,
+                                    defense_away_gpm=defense_away_gpm,
+                                )
+                                if not allow_exc:
+                                    ignored.append(("favorite_leading", fixture_id))
+                                    continue
+
+                        # Regra extra: perdedor under + líder com defesa sólida = geralmente não é teu perfil.
+                        if BLOCK_UNDER_TRAILER_VS_SOLID_DEF:
+                            trailing_attack = attack_away_gpm if score_diff > 0 else attack_home_gpm
+                            leading_def = defense_home_gpm if score_diff > 0 else defense_away_gpm
+                            if (
+                                (trailing_attack is not None)
+                                and (leading_def is not None)
+                                and (trailing_attack > 0.0)
+                                and (leading_def > 0.0)
+                                and (trailing_attack < UNDER_ATTACK_MAX)
+                                and (leading_def < SOLID_DEFENSE_MAX)
+                            ):
+                                continue
+
+                        # Conservador: sem favorito definido, mas líder parece mais forte → trata como favorito na frente.
+                        if BLOCK_FAVORITE_LEADING and (fav_side_eff is None):
+                            # usa rating + ataque como heurística simples
+                            diff_attack = float(home_attack_gpm or 0.0) - float(away_attack_gpm or 0.0)
+                            if (leader_side == "home" and (diff_rating >= (FAVORITE_RATING_THRESH * 0.66) or diff_attack >= 0.20)) or (
+                                leader_side == "away" and (diff_rating <= -(FAVORITE_RATING_THRESH * 0.66) or diff_attack <= -0.20)
+                            ):
+                                continue
+                except Exception:
+                    # nunca quebrar scan por causa de filtro
+                    pass
+
                 player_boost_prob = 0.0
                 if USE_PLAYER_IMPACT:
                     try:
@@ -3823,28 +4057,227 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             fixture=fx,
                         )
                     except Exception:
+                        logging.exception(
+                            "Erro inesperado ao calcular impacto de jogadores para fixture=%s",
+                            fx["fixture_id"],
+                        )
                         player_boost_prob = 0.0
+                # Flag de mandante claramente under (para filtros duros) — calculado após extrair perfis GPM
+                                # Perfis de ataque/defesa (gols por jogo) — sempre definidos (anti-crash)
+                def _to_float(_v, _default=0.0):
+                    try:
+                        if _v is None:
+                            return float(_default)
+                        return float(_v)
+                    except (TypeError, ValueError):
+                        return float(_default)
 
-                # 6. Calcular pressão
-                pressure_score = _calculate_pressure_score(stats)
+                attack_home_gpm = _to_float(fx.get("attack_home_gpm", fx.get("home_attack_gpm", 0.0)), 0.0)
+                defense_home_gpm = _to_float(fx.get("defense_home_gpm", fx.get("home_defense_gpm", 0.0)), 0.0)
+                attack_away_gpm = _to_float(fx.get("attack_away_gpm", fx.get("away_attack_gpm", 0.0)), 0.0)
+                defense_away_gpm = _to_float(fx.get("defense_away_gpm", fx.get("away_defense_gpm", 0.0)), 0.0)
+                match_super_under = bool(fx.get("match_super_under", False))
 
-                # 7. Boost baseado no favorito (NOVA LÓGICA)
-                favorite_boost = _compute_favorite_based_boost(
-                    fixture=fx,
-                    minute=minute,
-                    home_goals=fx["home_goals"],
-                    away_goals=fx["away_goals"],
-                    pressure_score=pressure_score,
-                    base_context_boost=context_boost_prob
-                )
 
-                # 8. Filtros de pressão mínima
-                if pressure_score < MIN_PRESSURE_SCORE:
-                    continue
+                home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
+                away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
+                # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
+                fx["attack_home_gpm"] = attack_home_gpm
+                fx["defense_home_gpm"] = defense_home_gpm
+                fx["attack_away_gpm"] = attack_away_gpm
+                fx["defense_away_gpm"] = defense_away_gpm
+                fx["home_attack_gpm"] = attack_home_gpm
+                fx["home_defense_gpm"] = defense_home_gpm
+                fx["away_attack_gpm"] = attack_away_gpm
+                fx["away_defense_gpm"] = defense_away_gpm
+                # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
+                if api_odd is None:
+                    logging.info(
+                        "Fixture %s sem odd ao vivo (API-FOOTBALL/The Odds API) e sem cache.",
+                        fx["fixture_id"],
+                    )
 
-                # 9. Estimativa de probabilidade com TODOS os boosts
+                    if not ALLOW_ALERTS_WITHOUT_ODDS:
+                        logging.info(
+                            "ALLOW_ALERTS_WITHOUT_ODDS=0; ignorando fixture %s.",
+                            fx["fixture_id"],
+                        )
+                        continue
+
+                    # Calcula probabilidade e pressão, sem EV baseado em odd real
+                    metrics = _estimate_prob_and_odd(
+                        minute=fx["minute"],
+                        stats=stats,
+                        home_goals=fx["home_goals"],
+                        away_goals=fx["away_goals"],
+                        forced_odd_current=None,
+                        news_boost_prob=news_boost_prob,
+                        pregame_boost_prob=pregame_boost_prob,
+                        player_boost_prob=player_boost_prob,
+                        context_boost_prob=context_boost_prob,
+                    )
+
+                    # Filtros de contexto / goleada / pressão semelhantes aos alertas normais
+                    score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
+                    minute_int = fx["minute"] or 0
+                    try:
+                        minute_int = int(minute_int)
+                    except (TypeError, ValueError):
+                        minute_int = 0
+
+                    # Mandante under vencendo: cenário que você geralmente evita
+                    if home_under and score_diff > 0 and minute_int >= 50:
+                        continue
+
+                    # Visitante under vencendo: cenário que você geralmente evita
+                    if away_under and score_diff < 0 and minute_int >= 50:
+                        continue
+
+                    # Goleada a partir dos 55' → em geral você ignora
+                    if abs(score_diff) >= 3 and minute_int >= 55:
+                        continue
+
+                    context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
+
+                    # Filtro forte para jogos com contexto negativo (favorito confortável etc.)
+                    if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
+                        continue
+
+                # NOVO: filtro de empate alinhado ao teu faro (favorito + munição under/over)
+                is_draw = (score_diff == 0)
+                if is_draw:
+                    # Dados de munição (cache pré-jogo já anexado no fx)
+                    home_attack_gpm = fx.get("home_attack_gpm")
+                    home_defense_gpm = fx.get("home_defense_gpm")
+                    away_attack_gpm = fx.get("away_attack_gpm")
+                    away_defense_gpm = fx.get("away_defense_gpm")
+
+                    # Bloqueio duro: empate em jogo “seco” (pouca munição)
+                    if _is_match_super_under(home_attack_gpm, home_defense_gpm, away_attack_gpm, away_defense_gpm):
+                        continue
+
+                    # EXCEÇÃO A: amplo favorito pressionando (“amassando”) contra defesa frágil
+                    fav_side = fx.get("favorite_side")
+                    try:
+                        fav_strength = int(fx.get("favorite_strength") or 0)
+                    except (TypeError, ValueError):
+                        fav_strength = 0
+
+                    diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
+                    if fav_side not in ("home", "away"):
+                        try:
+                            side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
+                                rating_home=rating_home,
+                                rating_away=rating_away,
+                                attack_home_gpm=home_attack_gpm,
+                                defense_home_gpm=home_defense_gpm,
+                                attack_away_gpm=away_attack_gpm,
+                                defense_away_gpm=away_defense_gpm,
+                            )
+                            fav_side = side_inf
+                            try:
+                                fav_strength = max(int(fav_strength or 0), int(strength_inf or 0))
+                            except (TypeError, ValueError):
+                                fav_strength = int(strength_inf or 0)
+                        except Exception:
+                            fav_side = None
+
+                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
+
+                    if fav_side == "home":
+                        opp_def_weak = (away_defense_gpm is not None) and (away_defense_gpm >= 1.5)
+                    elif fav_side == "away":
+                        opp_def_weak = (home_defense_gpm is not None) and (home_defense_gpm >= 1.5)
+                    else:
+                        opp_def_weak = False
+
+                    allow_big_fav_amass = (
+                        big_fav
+                        and opp_def_weak
+                        and (pressure_score >= 7.0)
+                        and (context_pp >= 1.3)
+                    )
+
+                    # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem “super over” e o jogo estiver MUITO aberto
+                    home_super_over = _is_super_over_team(home_attack_gpm, home_defense_gpm)
+                    away_super_over = _is_super_over_team(away_attack_gpm, away_defense_gpm)
+                    allow_both_super_over = (
+                        home_super_over and away_super_over
+                        and (pressure_score >= 7.5)
+                        and (context_pp >= 1.0)
+                        and (minute_int >= 50)
+                    )
+
+                    if not (allow_big_fav_amass or allow_both_super_over):
+                        continue
+
+
+                    # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
+                    fav_side2 = fx.get("favorite_side")
+                    try:
+                        fav_strength2 = int(fx.get("favorite_strength") or 0)
+                    except (TypeError, ValueError):
+                        fav_strength2 = 0
+                    diff_rating = rating_home - rating_away
+                    fav_home_clear = ((fav_side2 == "home") and (fav_strength2 >= 2)) or (diff_rating >= 0.7)
+                    if fav_home_clear and score_diff > 0 and minute_int >= 55:
+                        # se favorito está ganhando em casa e contexto não indica necessidade real,
+                        # e/ou pressão não é absurda, ignora alerta manual
+                        if (
+                            context_pp <= 0.5
+                            or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
+                        ):
+                            continue
+
+                    # Bloqueio extra: linhas altas em jogos super under
+                    linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
+                    if match_super_under and linha_num >= 2.5:
+                        continue
+
+                    # Desconfiança em linhas altas (3.5+): exige pressão maior
+                    if linha_num >= HIGH_LINE_START:
+                        steps_high = int((linha_num - 2.5) // 1.0)
+                        req_pressure = MIN_PRESSURE_SCORE + (HIGH_LINE_PRESSURE_STEP * steps_high)
+                        if metrics["pressure_score"] < req_pressure:
+                            continue
+
+                    if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
+                        continue
+
+                    # Limiar de probabilidade para valer um alerta manual:
+                    # precisa ser maior que o break-even da odd mínima sugerida
+                    if MANUAL_MIN_ODD_HINT > 1.0:
+                        prob_min_for_manual = 1.0 / MANUAL_MIN_ODD_HINT
+                    else:
+                        prob_min_for_manual = 0.68  # fallback seguro
+
+                    if metrics["p_final"] < prob_min_for_manual:
+                        # prob baixa demais para o preço-alvo (ex.: < 1/1.47)
+                        continue
+
+                    # Cooldown por jogo
+                    now = _now_utc()
+                    fixture_id = fx["fixture_id"]
+                    cd_key = _cooldown_key(fixture_id, fx.get("home_goals", 0), fx.get("away_goals", 0))
+                    last_ts = fixture_last_alert_at.get(cd_key)
+                    if last_ts is not None:
+                        if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
+                            continue
+
+                    alert_text = _format_manual_no_odds_text(fx, metrics)
+                    alerts.append(alert_text)
+                    fixture_last_alert_at[cd_key] = now
+                    continue  # pula restante da lógica (sem odd real)
+
+                # 5) Fluxo normal com odd real
+                if used_cache_odd and not got_live_odd:
+                    logging.info(
+                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay, mesma linha SUM_PLUS_HALF).",
+                        fx["fixture_id"],
+                    )
+
                 metrics = _estimate_prob_and_odd(
-                    minute=minute,
+                    minute=fx["minute"],
                     stats=stats,
                     home_goals=fx["home_goals"],
                     away_goals=fx["away_goals"],
@@ -3852,50 +4285,28 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     news_boost_prob=news_boost_prob,
                     pregame_boost_prob=pregame_boost_prob,
                     player_boost_prob=player_boost_prob,
-                    context_boost_prob=context_boost_prob + favorite_boost,
+                    context_boost_prob=context_boost_prob,
                 )
-
-                # 10. Filtro de EV mínimo
-                if metrics["ev_pct"] < EV_MIN_PCT:
-                    continue
-
-                # 11. Filtro de faixa de odds (se tiver odd real)
-                if api_odd is not None:
-                    if api_odd < MIN_ODD or api_odd > MAX_ODD:
-                        if not (api_odd < MIN_ODD and ALLOW_WATCH_ALERTS):
-                            continue
-
-                # 12. Cooldown
-                now = _now_utc()
-                fixture_id = fx["fixture_id"]
-                cd_key = _cooldown_key(fixture_id, fx.get("home_goals", 0), fx.get("away_goals", 0))
-                last_ts = fixture_last_alert_at.get(cd_key)
-                if last_ts is not None:
-                    if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
-                        continue
-
-                # 13. Gerar alerta
-                if api_odd is None and not ALLOW_ALERTS_WITHOUT_ODDS:
-                    continue
-                
-                if api_odd is None:
-                    alert_text = _format_manual_no_odds_text(fx, metrics)
-                elif api_odd < MIN_ODD and ALLOW_WATCH_ALERTS:
-                    alert_text = _format_watch_text(fx, metrics)
-                else:
-                    alert_text = _format_alert_text(fx, metrics)
-                
+                # Sem odds: este bot apenas sinaliza "dinâmica ofensiva".
+                # A validação é feita por pressão + probabilidade + contexto (favorito/placar) e camadas (news/jogadores/pré-jogo).
+                alert_text = _format_alert_text(fx, metrics)
                 alerts.append(alert_text)
                 fixture_last_alert_at[cd_key] = now
 
-            except Exception as e:
-                logging.exception(f"Erro ao processar fixture {fx.get('fixture_id')}: {e}")
+                alerts.append(alert_text)
+                fixture_last_alert_at[cd_key] = now
+
+            except Exception:
+                logging.exception(
+                    "Erro ao processar fixture_id=%s",
+                    fx.get("fixture_id"),
+                )
                 continue
 
     last_scan_alerts = len(alerts)
-    
+
     last_status_text = (
-        "[EvRadar PRO] Scan concluído (origem={origin}). "
+        "[GoalAlert] Scan concluído (origem={origin}). "
         "Eventos ao vivo na janela/ligas: {live} | Alertas enviados: {alerts}"
     ).format(
         origin=origin,
@@ -3907,58 +4318,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     return alerts
 
 
-def _calculate_pressure_score(stats: Dict[str, Any]) -> float:
-    """
-    Calcula o score de pressão baseado em estatísticas do jogo.
-    """
-    home_shots = stats.get("home_shots_total", 0)
-    away_shots = stats.get("away_shots_total", 0)
-    home_on = stats.get("home_shots_on", 0)
-    away_on = stats.get("away_shots_on", 0)
-    home_dang = stats.get("home_dangerous", 0)
-    away_dang = stats.get("away_dangerous", 0)
-
-    total_shots = home_shots + away_shots
-    total_on = home_on + away_on
-    total_dang = home_dang + away_dang
-
-    pressure = 0.0
-
-    # Chutes totais
-    if total_shots >= 20:
-        pressure += 3.0
-    elif total_shots >= 15:
-        pressure += 2.5
-    elif total_shots >= 10:
-        pressure += 2.0
-    elif total_shots >= 6:
-        pressure += 1.0
-
-    # Chutes no alvo
-    if total_on >= 8:
-        pressure += 3.0
-    elif total_on >= 5:
-        pressure += 2.5
-    elif total_on >= 3:
-        pressure += 2.0
-    elif total_on >= 1:
-        pressure += 1.0
-
-    # Ataques perigosos
-    if total_dang >= 50:
-        pressure += 3.0
-    elif total_dang >= 35:
-        pressure += 2.5
-    elif total_dang >= 20:
-        pressure += 2.0
-    elif total_dang >= 10:
-        pressure += 1.0
-
-    return min(pressure, 10.0)
-
-
 async def autoscan_loop(application: Application) -> None:
-    """Loop de autoscan em background."""
+    """Loop de autoscan em background (usa create_task; não bloqueia polling)."""
     logging.info("Autoscan loop iniciado (intervalo=%ss)", CHECK_INTERVAL)
     while True:
         try:
@@ -3991,29 +4352,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.3-lite: odds reais + news + pré-jogo auto + camada de jogadores).",
+        "👋 GoalAlert online (cérebro v0.3: estatística ao vivo + news + pré-jogo + jogadores).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
-        "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
-        "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
-        "Alertas sem odd na API (manual): {m} (odd mínima sugerida ≥ {od:.2f})".format(
-            m=manual_mode_status,
-            od=MANUAL_MIN_ODD_HINT,
-        ),
-        "Banca virtual para sugestão: R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
+        "Probabilidade mínima (p_final): {p:.0f}%".format(p=MIN_GOAL_PROB * 100.0),
         "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
-        "Camada de jogadores (impacto): {pl}".format(pl=player_layer_status),
+        "Camada de notícias: {nw}".format(nw=("ligada" if USE_NEWS_API else "desligada")),
+        "Camada de pré-jogo: {pg}".format(pg=("ligada" if USE_API_PREGAME else "desligada")),
+        "Camada de jogadores: {pl}".format(pl=player_layer_status),
         "Autoscan: {auto} (intervalo {sec}s)".format(auto=autoscan_status, sec=CHECK_INTERVAL),
         "",
         "Comandos:",
         "  /scan   → rodar varredura agora",
         "  /status → ver último resumo",
         "  /debug  → info técnica",
-        "  /links  → links úteis / bookmaker",
-        "  /prelive → aquecer cache pré-live",
-        "  /prelive_next [n] → listar próximos fixtures",
-        "  /prelive_show <fixture_id> → mostrar cache específico",
+        "  /links  → fontes e docs",
     ]
     text = "\n".join(lines)
     try:
@@ -4027,7 +4381,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
-        "📊 Último status do EvRadar PRO:",
+        "📊 Último status do GoalAlert:",
         "",
         last_status_text,
         "",
@@ -4050,7 +4404,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Executa um warmup manual do cache de odds pré-live."""
+    """Executa um warmup manual do cache de odds pré-live (funciona mesmo sem jogos ao vivo)."""
     try:
         if update.effective_chat:
             await update.effective_chat.send_message("🧊 Aquecendo cache de odds pré-live (favoritos) ...")
@@ -4107,7 +4461,7 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not LEAGUE_IDS:
             reasons.append("LEAGUE_IDS vazio (o warmup não sabe quais ligas consultar)")
         if not reasons:
-            reasons.append("0 fixtures retornados pela API nas ligas configuradas dentro do lookahead.")
+            reasons.append("0 fixtures retornados pela API nas ligas configuradas dentro do lookahead. Se você sabe que há jogo hoje, confira /debug (LEAGUE_IDS e timezone) e os logs do Railway para erro/timeout.")
 
         lines.extend([
             "",
@@ -4132,7 +4486,7 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lista rapidamente os próximos fixtures encontrados."""
+    """Lista rapidamente os próximos fixtures encontrados (para validar que o pré-live está enxergando a agenda)."""
     if not API_FOOTBALL_KEY:
         msg = "⚠️ API_FOOTBALL_KEY vazio — não consigo consultar fixtures/odds pré-live."
         try:
@@ -4158,6 +4512,7 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pass
 
     try:
+        from zoneinfo import ZoneInfo  # Python 3.9+
         tz = ZoneInfo(API_FOOTBALL_TIMEZONE)
     except Exception:
         tz = None
@@ -4197,7 +4552,7 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
-    # permite /prelive_next 30 para listar mais jogos
+        # permite /prelive_next 30 para listar mais jogos
     n_show = 12
     try:
         if context.args and str(context.args[0]).strip().isdigit():
@@ -4243,7 +4598,7 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_prelive_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mostra o que está cacheado para um fixture específico."""
+    """Mostra o que está cacheado para um fixture específico (útil para validar favorito fora do horário de jogos)."""
     try:
         if not context.args:
             msg = "Uso: /prelive_show <fixture_id>\nDica: pegue o fixture_id em /prelive_next."
@@ -4380,41 +4735,29 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return key[0:4] + "..." + key[-4:]
 
     lines = [
-        "🛠 Debug EvRadar PRO",
+        "🛠 Debug GoalAlert",
         "",
         "LEAGUE_IDS: {ids}".format(ids=",".join(str(x) for x in LEAGUE_IDS) or "(nenhuma)"),
         "WINDOW_START/END: {ws}/{we}".format(ws=WINDOW_START, we=WINDOW_END),
-        "EV_MIN_PCT: {ev:.2f}%".format(ev=EV_MIN_PCT),
-        "MIN_ODD/MAX_ODD: {mn:.2f}/{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "MIN_GOAL_PROB: {p:.0f}%".format(p=MIN_GOAL_PROB * 100.0),
         "MIN_PRESSURE_SCORE: {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "COOLDOWN_MINUTES: {cd}".format(cd=COOLDOWN_MINUTES),
         "",
-        "BLOCK_FAVORITE_LEADING: {v}".format(v=BLOCK_FAVORITE_LEADING),
-        "BLOCK_SUPER_UNDER_LEADING: {v}".format(v=BLOCK_SUPER_UNDER_LEADING),
-        "BLOCK_UNDER_TRAILER_VS_SOLID_DEF: {v}".format(v=BLOCK_UNDER_TRAILER_VS_SOLID_DEF),
-        "FAVORITE_RATING_THRESH: {v}".format(v=FAVORITE_RATING_THRESH),
-        "FAVORITE_POWER_THRESH: {v}".format(v=FAVORITE_POWER_THRESH),
-        "PRELIVE_CACHE_SIZE: {v}".format(v=len(prelive_favorite_cache)),
-
+        "Favorito (pré-jogo):",
+        "  FAVORITE_RATING_THRESH: {t:.2f}".format(t=FAVORITE_RATING_THRESH),
+        "  Força: 0..5 (0=nenhum | 5=superfavorito)",
         "",
-        "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
-        "BOOKMAKER_ID: {v}".format(v=BOOKMAKER_ID),
-        "BOOKMAKER_FALLBACK_IDS: {v}".format(
-            v=",".join(str(x) for x in BOOKMAKER_FALLBACK_IDS) or "(nenhum)"
-        ),
-        "ODDS_BET_ID: {v}".format(v=ODDS_BET_ID),
+        "Camadas:",
+        "  USE_API_PREGAME: {v}".format(v=USE_API_PREGAME),
+        "  USE_PLAYER_IMPACT: {v}".format(v=USE_PLAYER_IMPACT),
+        "  USE_NEWS_API: {v}".format(v=USE_NEWS_API),
         "",
-        "USE_API_PREGAME: {v}".format(v=USE_API_PREGAME),
-        "USE_PLAYER_IMPACT: {v}".format(v=USE_PLAYER_IMPACT),
-        "USE_NEWS_API: {v}".format(v=USE_NEWS_API),
+        "Autoscan:",
+        "  AUTOSTART: {v}".format(v=AUTOSTART),
+        "  CHECK_INTERVAL: {v}s".format(v=CHECK_INTERVAL),
         "",
-        "ODDS_API_USE: {v}".format(v=ODDS_API_USE),
-        "ODDS_API_DAILY_LIMIT: {v}".format(v=ODDS_API_DAILY_LIMIT),
-        "ODDS_API_LEAGUE_MAP: {v}".format(v=ODDS_API_LEAGUE_MAP or "{}"),
-        "",
-        "API_FOOTBALL_KEY: {v}".format(v=_mask(API_FOOTBALL_KEY)),
-        "ODDS_API_KEY: {v}".format(v=_mask(ODDS_API_KEY)),
-        "NEWS_API_KEY: {v}".format(v=_mask(NEWS_API_KEY)),
+        "Cache:",
+        "  PRELIVE_CACHE_SIZE: {v}".format(v=len(prelive_favorite_cache)),
     ]
     text = "\n".join(lines)
     try:
@@ -4428,17 +4771,15 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
-        "🔗 Links úteis EvRadar PRO",
+        "🔗 Links úteis GoalAlert",
         "",
-        "Casa/base para operar:",
-        "- {book}: {url}".format(book=BOOKMAKER_NAME, url=BOOKMAKER_URL),
-        "",
-        "APIs utilizadas (requer chaves configuradas no Railway/.env):",
-        "- API-FOOTBALL (fixtures, estatísticas, odds): https://www.api-football.com/",
-        "- The Odds API (odds globais): https://the-odds-api.com/",
+        "Fontes / APIs:",
+        "- API-FOOTBALL (jogos e estatísticas): https://www.api-football.com/",
         "- NewsAPI (notícias): https://newsapi.org/",
         "",
-        "Dica: mantém essas chaves em variáveis de ambiente e NUNCA commita pro GitHub.",
+        "Notas:",
+        "- Configure as chaves no Railway/.env",
+        "- Este bot não recomenda nem executa nada; apenas resume dados e contexto do jogo.",
     ]
     text = "\n".join(lines)
     try:
@@ -4466,7 +4807,7 @@ def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
 
 
 def main() -> None:
-    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
+    logging.info("Iniciando bot do GoalAlert (cérebro v0.3-lite)...")
 
     token = TELEGRAM_BOT_TOKEN.strip() if TELEGRAM_BOT_TOKEN else ""
     if not token:
