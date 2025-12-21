@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.3-lite
+EvRadar PRO - Telegram + Cérebro v0.4-lite
 ------------------------------------------
 Features:
 - Telegram estável (python-telegram-bot v21)
@@ -27,8 +27,9 @@ Features:
     - Linhas altas em jogos super under podem ser bloqueadas
     - Malus específico para mata-mata ida/volta (1º jogo tende a ser mais travado)
 - Cálculo de EV e alertas Telegram quando EV >= EV_MIN_PCT
+- Filtro INTELIGENTE de favorito na frente com sistema de exceções
 
-Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-jogo manual).
+Baseado na versão v0.3-lite com filtro de favorito na frente melhorado.
 """
 
 import asyncio
@@ -144,6 +145,10 @@ ALLOW_WATCH_ALERTS: int = _get_env_int("ALLOW_WATCH_ALERTS", 0)
 
 # Bloqueio do teu perfil: evitar jogos com o FAVORITO na frente (ex.: Twente/City/Brugge). Defina 0 para desativar.
 BLOCK_FAVORITE_LEADING: int = _get_env_int("BLOCK_FAVORITE_LEADING", 1)
+
+# NOVO: Controle do filtro de favorito na frente
+FAVORITE_LEADING_MIN_EXCEPTION_SCORE: float = _get_env_float("FAVORITE_LEADING_MIN_EXCEPTION_SCORE", 4.0)
+FAVORITE_LEADING_AUTO_BLOCK_MINUTE: int = _get_env_int("FAVORITE_LEADING_AUTO_BLOCK_MINUTE", 70)
 
 # Bloqueio adicional (teu perfil): evita jogos "muito encaminhados" no 2º tempo (qualquer lado abrindo 2+ gols).
 BLOCK_LEAD_BY_2: int = _get_env_int("BLOCK_LEAD_BY_2", 1)
@@ -3249,6 +3254,168 @@ async def _get_pregame_boost_for_fixture(
 
 
 # ---------------------------------------------------------------------------
+# NOVO: Sistema de Exceção para Favorito na Frente
+# ---------------------------------------------------------------------------
+
+def _compute_favorite_leading_exception_score(
+    fixture: Dict[str, Any],
+    metrics: Dict[str, float],
+    stats: Dict[str, Any],
+    rating_home: float,
+    rating_away: float
+) -> float:
+    """
+    Calcula uma pontuação de exceção (0-10) para jogos com favorito na frente.
+    Quanto maior a pontuação, mais razões para NÃO bloquear o jogo.
+    """
+    score = 0.0
+    
+    minute = fixture.get("minute", 0)
+    home_goals = fixture.get("home_goals", 0)
+    away_goals = fixture.get("away_goals", 0)
+    score_diff = home_goals - away_goals
+    
+    # 1. PRESSÃO EXTREMA (máx 3.0 pontos)
+    pressure = metrics.get("pressure_score", 0.0)
+    if pressure >= 8.5:
+        score += 2.0
+    elif pressure >= 7.5:
+        score += 1.5
+    elif pressure >= 7.0:
+        score += 1.0
+    
+    # 2. PERIGO CONCENTRADO (máx 2.0 pontos)
+    home_dangerous = stats.get("home_dangerous", 0)
+    away_dangerous = stats.get("away_dangerous", 0)
+    dangerous_total = home_dangerous + away_dangerous
+    
+    if dangerous_total >= 50:
+        score += 1.0
+    if dangerous_total >= 40 and minute >= 60:
+        score += 0.5
+    if dangerous_total >= 35 and minute >= 65:
+        score += 0.5
+    
+    # 3. FINALIZAÇÕES NO ALVO (máx 1.5 pontos)
+    home_shots_on = stats.get("home_shots_on", 0)
+    away_shots_on = stats.get("away_shots_on", 0)
+    shots_on_total = home_shots_on + away_shots_on
+    
+    if shots_on_total >= 8:
+        score += 1.0
+    elif shots_on_total >= 6:
+        score += 0.5
+    
+    # 4. CONTEXTO DE NECESSIDADE (máx 2.0 pontos)
+    context_boost = metrics.get("context_boost_prob", 0.0) * 100  # em %
+    
+    # Time perdendo tem MOTIVAÇÃO FORTE (não é under, ataque bom)
+    trailing_side = "away" if score_diff > 0 else "home"
+    
+    if trailing_side == "away":
+        # Visitante perdendo
+        if rating_away >= 0.0:  # Time não é under
+            score += 1.0
+        if rating_away >= 0.5:  # Time ofensivo
+            score += 0.5
+    else:
+        # Mandante perdendo
+        if rating_home >= 0.0:
+            score += 1.0
+        if rating_home >= 0.5:
+            score += 0.5
+    
+    # 5. JOGO MUITO ABERTO (máx 1.5 pontos)
+    if minute >= 55:
+        # Muitos ataques perigosos nos últimos minutos
+        if dangerous_total >= 30 and minute <= 70:
+            score += 0.5
+        # Muitos chutes no alvo
+        if shots_on_total >= 5 and minute <= 65:
+            score += 0.5
+        # Placar ainda apertado (só 1 gol de diferença)
+        if abs(score_diff) == 1:
+            score += 0.5
+    
+    return min(score, 10.0)  # Cap em 10 pontos
+
+
+def _should_allow_favorite_leading(
+    fixture: Dict[str, Any],
+    metrics: Dict[str, float],
+    stats: Dict[str, Any],
+    rating_home: float,
+    rating_away: float
+) -> bool:
+    """
+    Decide se permite um jogo com favorito na frente baseado em fatores compensatórios.
+    Retorna True para PERMITIR, False para BLOQUEAR.
+    """
+    if not BLOCK_FAVORITE_LEADING:
+        return True
+    
+    minute = fixture.get("minute", 0)
+    score_diff = fixture.get("home_goals", 0) - fixture.get("away_goals", 0)
+    
+    # --- REGRAS DE BLOQUEIO AUTOMÁTICO (NUNCA PERMITIR) ---
+    
+    # 1. Diferença de 3+ gols
+    if abs(score_diff) >= 3:
+        return False
+    
+    # 2. Favorito elite (superfavorito) na frente após 60'
+    fav_strength = fixture.get("favorite_strength", 0)
+    if fav_strength >= 3 and minute >= 60:
+        return False
+    
+    # 3. Jogo super under com favorito na frente
+    if fixture.get("match_super_under", False) and minute >= 55:
+        return False
+    
+    # 4. Mandante under vencendo por 2+ gols
+    home_under = _is_team_under_profile(
+        fixture.get("attack_home_gpm", 0),
+        fixture.get("defense_home_gpm", 0)
+    )
+    if home_under and score_diff >= 2 and minute >= 50:
+        return False
+    
+    # --- CALCULA PONTUAÇÃO DE EXCEÇÃO ---
+    exception_score = _compute_favorite_leading_exception_score(
+        fixture, metrics, stats, rating_home, rating_away
+    )
+    
+    # --- REQUISITOS MÍNIMOS POR MINUTO ---
+    minute_requirements = {
+        47: 3.0,   # Início da janela: precisa de 3+ pontos
+        55: 4.0,   # Meio da janela: precisa de 4+ pontos
+        65: 5.0,   # Fim da janela: precisa de 5+ pontos
+        75: 6.0,   # Final: precisa de 6+ pontos
+    }
+    
+    req_score = 3.0  # padrão
+    for min_req, score_req in sorted(minute_requirements.items()):
+        if minute >= min_req:
+            req_score = score_req
+    
+    # Permite se a pontuação de exceção for maior que o requisito
+    allow = exception_score >= req_score
+    
+    # Log detalhado
+    logging.info(
+        "Fixture %s: favorito na frente - Pontuação exceção: %.1f/10.0 | "
+        "Requisito (min %s): %.1f | Decisão: %s",
+        fixture.get("fixture_id"),
+        exception_score,
+        minute,
+        req_score,
+        "PERMITIDO" if allow else "BLOQUEADO"
+    )
+    
+    return allow
+
+
+# ---------------------------------------------------------------------------
 # Boost extra "padrão Lucas" (faro de gol)
 # ---------------------------------------------------------------------------
 
@@ -3491,50 +3658,76 @@ def _format_alert_text(
     fixture: Dict[str, Any],
     metrics: Dict[str, float],
 ) -> str:
-    """Formata um alerta **neutro** (estudo de probabilidade de gol).
+    """
+    Layout enxuto, padrão único pra você só bater o olho e decidir:
 
-    Não menciona odds/EV/stake. O objetivo é sinalizar **chance de sair mais 1 gol**.
+    🏟️ Jogo
+    ⏱️ minuto | 🔢 placar
+    ⚙️ Linha: Over x,5 @ odd
+    📊 Probabilidade | Odd justa
+    💰 EV: x% → EV+ / EV-
+    🎯 Stake sugerida: x% da banca
+    🧩 Nota: frase curta (pressão / necessidade de gol)
     """
     jogo = "{home} vs {away} — {league}".format(
-        home=fixture.get("home_team", ""),
-        away=fixture.get("away_team", ""),
-        league=fixture.get("league_name", ""),
+        home=fixture["home_team"],
+        away=fixture["away_team"],
+        league=fixture["league_name"],
     )
-    minuto = fixture.get("minute", 0)
-    placar = "{hg}–{ag}".format(hg=fixture.get("home_goals", 0), ag=fixture.get("away_goals", 0))
+    minuto = fixture["minute"]
+    placar = "{hg}–{ag}".format(hg=fixture["home_goals"], ag=fixture["away_goals"])
 
-    p_final = float(metrics.get("p_final", 0.0) or 0.0)
-    pressure_score = float(metrics.get("pressure_score", 0.0) or 0.0)
-    need_index = float(metrics.get("need_index", 0.0) or 0.0)
-    lucas_boost_prob = float(metrics.get("lucas_boost_prob", 0.0) or 0.0)
+    total_goals = fixture["home_goals"] + fixture["away_goals"]
+    linha_gols = total_goals + 0.5
+    linha_str = "Over {v:.1f}".format(v=linha_gols)
 
+    p_final = metrics["p_final"] * 100.0
+    odd_fair = metrics["odd_fair"]
+    odd_current = metrics["odd_current"]
+    ev_pct = metrics["ev_pct"]
+    pressure_score = metrics["pressure_score"]
+    context_boost_prob = metrics.get("context_boost_prob", 0.0) * 100.0
+    lucas_boost_prob = metrics.get("lucas_boost_prob", 0.0) * 100.0
+
+    stake_pct = _suggest_stake_pct(ev_pct, odd_current)
+
+    # EV+ / EV-
+    ev_label = "EV+" if ev_pct >= 0.0 else "EV-"
+
+    # Nota rápida, 1 linha
     nota_parts: List[str] = []
-    if pressure_score >= 6.0:
-        nota_parts.append("pressão muito alta")
-    elif pressure_score >= 4.0:
+
+    if pressure_score >= 7.5:
+        nota_parts.append("pressão forte")
+    elif pressure_score >= 5.0:
         nota_parts.append("pressão boa")
-    elif pressure_score >= 3.5:
+    else:
         nota_parts.append("pressão no limite")
 
-    if need_index >= 0.75:
-        nota_parts.append("contexto pede gol")
-    elif need_index >= 0.50:
-        nota_parts.append("boa necessidade")
-    elif need_index >= 0.25:
-        nota_parts.append("necessidade moderada")
+    if context_boost_prob > 0.5:
+        nota_parts.append("favorito ainda precisa do gol")
+    elif context_boost_prob < -0.5:
+        nota_parts.append("favorito confortável")
 
     if lucas_boost_prob > 0.0:
-        nota_parts.append("padrão alinhado ao teu faro")
+        nota_parts.append("padrão bem alinhado ao teu faro")
 
-    nota = " / ".join(nota_parts) if nota_parts else "sinais mistos"
+    nota = " / ".join(nota_parts)
 
     lines = [
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
-        "📊 Probabilidade (mais 1 gol): {p:.1f}%".format(p=p_final),
+        "⚙️ Linha: {linha} @ {odd:.2f}".format(linha=linha_str, odd=odd_current),
+        "📊 Probabilidade: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
+            p=p_final,
+            odd_j=odd_fair,
+        ),
+        "💰 EV: {ev:.2f}% → {lbl}".format(ev=ev_pct, lbl=ev_label),
+        "🎯 Stake sugerida: {spct:.2f}% da banca".format(spct=stake_pct),
         "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
+
 
 def _format_watch_text(
     fixture: Dict[str, Any],
@@ -3883,7 +4076,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if BLOCK_SUPER_UNDER_LEADING and match_super_under and (minute_int >= 55) and (score_diff != 0):
                         continue
 
-                    # 2) Bloqueio: favorito pré-live já na frente (principalmente em casa) — raro ser teu perfil.
+                    # 2) Filtro de favorito na frente COM EXCEÇÕES
                     if (score_diff != 0) and (minute_int >= 55):
                         diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
                         fav_side_eff = fav_side if fav_side in ("home", "away") else None
@@ -3894,29 +4087,37 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                                 side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
                                     rating_home=rating_home,
                                     rating_away=rating_away,
-                                    attack_home_gpm=home_attack_gpm,
-                                    defense_home_gpm=home_defense_gpm,
-                                    attack_away_gpm=away_attack_gpm,
-                                    defense_away_gpm=away_defense_gpm,
+                                    attack_home_gpm=attack_home_gpm,
+                                    defense_home_gpm=defense_home_gpm,
+                                    attack_away_gpm=attack_away_gpm,
+                                    defense_away_gpm=defense_away_gpm,
                                 )
                                 fav_side_eff = side_inf
                                 try:
                                     fav_strength_eff = max(int(fav_strength_eff or 0), int(strength_inf or 0))
                                 except (TypeError, ValueError):
                                     fav_strength_eff = int(strength_inf or 0)
-                            except Exception:
+                            except Exception as e:
+                                logging.warning("infer_favorite_failed fixture_id=%s err=%r", fixture_id, e)
                                 fav_side_eff = None
 
                         leader_side = "home" if score_diff > 0 else "away"
 
                         if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
-                            ignored.append(("favorite_leading", fixture_id))
-                            continue
+                            # NOVO: Usar sistema de exceção inteligente
+                            if not _should_allow_favorite_leading(
+                                fixture=fx,
+                                metrics=metrics,
+                                stats=stats,
+                                rating_home=rating_home,
+                                rating_away=rating_away
+                            ):
+                                continue
 
                         # Regra extra: perdedor under + líder com defesa sólida = geralmente não é teu perfil.
                         if BLOCK_UNDER_TRAILER_VS_SOLID_DEF:
-                            trailing_attack = away_attack_gpm if score_diff > 0 else home_attack_gpm
-                            leading_def = home_defense_gpm if score_diff > 0 else away_defense_gpm
+                            trailing_attack = attack_away_gpm if score_diff > 0 else attack_home_gpm
+                            leading_def = defense_home_gpm if score_diff > 0 else defense_away_gpm
                             if (
                                 (trailing_attack is not None)
                                 and (leading_def is not None)
@@ -3934,7 +4135,15 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             if (leader_side == "home" and (diff_rating >= (FAVORITE_RATING_THRESH * 0.66) or diff_attack >= 0.20)) or (
                                 leader_side == "away" and (diff_rating <= -(FAVORITE_RATING_THRESH * 0.66) or diff_attack <= -0.20)
                             ):
-                                continue
+                                # Aplica o mesmo sistema de exceção
+                                if not _should_allow_favorite_leading(
+                                    fixture=fx,
+                                    metrics=metrics,
+                                    stats=stats,
+                                    rating_home=rating_home,
+                                    rating_away=rating_away
+                                ):
+                                    continue
                 except Exception:
                     # nunca quebrar scan por causa de filtro
                     pass
@@ -4042,11 +4251,11 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     away_attack_gpm = fx.get("away_attack_gpm")
                     away_defense_gpm = fx.get("away_defense_gpm")
 
-                    # Bloqueio duro: empate em jogo “seco” (pouca munição)
+                    # Bloqueio duro: empate em jogo "seco" (pouca munição)
                     if _is_match_super_under(home_attack_gpm, home_defense_gpm, away_attack_gpm, away_defense_gpm):
                         continue
 
-                    # EXCEÇÃO A: amplo favorito pressionando (“amassando”) contra defesa frágil
+                    # EXCEÇÃO A: amplo favorito pressionando ("amassando") contra defesa frágil
                     fav_side = fx.get("favorite_side")
                     try:
                         fav_strength = int(fx.get("favorite_strength") or 0)
@@ -4088,7 +4297,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         and (context_pp >= 1.3)
                     )
 
-                    # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem “super over” e o jogo estiver MUITO aberto
+                    # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over" e o jogo estiver MUITO aberto
                     home_super_over = _is_super_over_team(home_attack_gpm, home_defense_gpm)
                     away_super_over = _is_super_over_team(away_attack_gpm, away_defense_gpm)
                     allow_both_super_over = (
@@ -4166,6 +4375,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         fx["fixture_id"],
                     )
 
+                # CALCULA MÉTRICAS (precisa das stats já carregadas)
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
                     stats=stats,
@@ -4344,11 +4554,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.3-lite: odds reais + news + pré-jogo auto + camada de jogadores).",
+        "👋 EvRadar PRO online (cérebro v0.4-lite: filtro inteligente de favorito na frente).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
+        "Filtro favorito na frente: {status} (min exceção: {score:.1f} pts)".format(
+            status="ATIVADO" if BLOCK_FAVORITE_LEADING else "DESATIVADO",
+            score=FAVORITE_LEADING_MIN_EXCEPTION_SCORE
+        ),
         "Alertas sem odd na API (manual): {m} (odd mínima sugerida ≥ {od:.2f})".format(
             m=manual_mode_status,
             od=MANUAL_MIN_ODD_HINT,
@@ -4692,7 +4906,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if update.effective_chat:
             await update.effective_chat.send_message(
-                "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)..."
+                "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.4-lite, filtro inteligente de favorito na frente)..."
             )
     except Exception:
         logging.exception("Erro ao enviar mensagem inicial do /scan")
@@ -4731,7 +4945,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return key[0:4] + "..." + key[-4:]
 
     lines = [
-        "🛠 Debug EvRadar PRO",
+        "🛠 Debug EvRadar PRO v0.4",
         "",
         "LEAGUE_IDS: {ids}".format(ids=",".join(str(x) for x in LEAGUE_IDS) or "(nenhuma)"),
         "WINDOW_START/END: {ws}/{we}".format(ws=WINDOW_START, we=WINDOW_END),
@@ -4739,6 +4953,16 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "MIN_ODD/MAX_ODD: {mn:.2f}/{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
         "MIN_PRESSURE_SCORE: {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "COOLDOWN_MINUTES: {cd}".format(cd=COOLDOWN_MINUTES),
+        "",
+        "BLOCK_FAVORITE_LEADING: {v}".format(v=BLOCK_FAVORITE_LEADING),
+        "FAVORITE_LEADING_MIN_EXCEPTION_SCORE: {v}".format(v=FAVORITE_LEADING_MIN_EXCEPTION_SCORE),
+        "FAVORITE_LEADING_AUTO_BLOCK_MINUTE: {v}".format(v=FAVORITE_LEADING_AUTO_BLOCK_MINUTE),
+        "BLOCK_SUPER_UNDER_LEADING: {v}".format(v=BLOCK_SUPER_UNDER_LEADING),
+        "BLOCK_UNDER_TRAILER_VS_SOLID_DEF: {v}".format(v=BLOCK_UNDER_TRAILER_VS_SOLID_DEF),
+        "FAVORITE_RATING_THRESH: {v}".format(v=FAVORITE_RATING_THRESH),
+        "FAVORITE_POWER_THRESH: {v}".format(v=FAVORITE_POWER_THRESH),
+        "PRELIVE_CACHE_SIZE: {v}".format(v=len(prelive_favorite_cache)),
+
         "",
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
         "BOOKMAKER_ID: {v}".format(v=BOOKMAKER_ID),
@@ -4809,7 +5033,7 @@ def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
 
 
 def main() -> None:
-    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.3-lite)...")
+    logging.info("Iniciando bot do EvRadar PRO (cérebro v0.4-lite)...")
 
     token = TELEGRAM_BOT_TOKEN.strip() if TELEGRAM_BOT_TOKEN else ""
     if not token:
