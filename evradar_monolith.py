@@ -1801,17 +1801,18 @@ async def _fetch_live_odds_for_fixture_odds_api(
         except Exception:
             fixture_dt = None
 
-    def _parse_commence_time(ev: Dict[str, Any]) -> Optional[datetime]:
-        ct_raw = ev.get("commence_time")
-        if not ct_raw:
+   def _parse_commence_time(ev: Dict[str, Any]) -> Optional[datetime]:
+    ct_raw = ev.get("commence_time")
+    if not ct_raw:
         return None
-        try:
-            ct_str = str(ct_raw)
-            if ct_str.endswith("Z"):
-                ct_str = ct_str.replace("Z", "+00:00")
-            return datetime.fromisoformat(ct_str)
-        except Exception:
-            return None
+    try:
+        ct_str = str(ct_raw)
+        if ct_str.endswith("Z"):
+            ct_str = ct_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(ct_str)
+    except Exception:
+        return None
+
 
     def _names_match(a: str, b: str) -> bool:
         """
