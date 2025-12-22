@@ -1613,7 +1613,7 @@ async def _ensure_prelive_favorite(
 
     odds = await _fetch_prelive_match_winner_odds_api_football(client, fixture_id, home_team, away_team)
     if not odds:
-        # não achou; deixa sem favorito (fallback por rating será usado)
+        # não achou; deixa sem favorito
         logging.info("[PRELIVE] Fixture %s: sem odds pré-live", fixture_id)
         prelive_favorite_cache[fixture_id] = {
             "ts": now,
@@ -1804,7 +1804,7 @@ async def _fetch_live_odds_for_fixture_odds_api(
     def _parse_commence_time(ev: Dict[str, Any]) -> Optional[datetime]:
         ct_raw = ev.get("commence_time")
         if not ct_raw:
-            return None
+        return None
         try:
             ct_str = str(ct_raw)
             if ct_str.endswith("Z"):
@@ -2747,97 +2747,6 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _infer_favorite_side_from_signals(
-    rating_home: Optional[float],
-    rating_away: Optional[float],
-    attack_home_gpm: Optional[float],
-    defense_home_gpm: Optional[float],
-    attack_away_gpm: Optional[float],
-    defense_away_gpm: Optional[float],
-) -> Tuple[Optional[str], int, str]:
-    """
-    Inferência de favorito quando odds pré-live não estão disponíveis.
-
-    Retorna: (favorite_side, favorite_strength, reason)
-
-    - favorite_side: "home", "away" ou None
-    - favorite_strength: 0..4 (0=nenhum, 1=leve, 2=forte, 3=super, 4=elite)
-    """
-    rh = _to_float(rating_home, 0.0)
-    ra = _to_float(rating_away, 0.0)
-    diff_r = rh - ra
-
-    side_r: Optional[str] = None
-    if diff_r >= FAVORITE_RATING_THRESH:
-        side_r = "home"
-    elif diff_r <= -FAVORITE_RATING_THRESH:
-        side_r = "away"
-
-    score_r = abs(diff_r)
-
-    ah = _to_float(attack_home_gpm, 0.0)
-    dh = _to_float(defense_home_gpm, 0.0)
-    aa = _to_float(attack_away_gpm, 0.0)
-    da = _to_float(defense_away_gpm, 0.0)
-
-    # "power": ataque alto + defesa sólida (baixo sofrido) = favorito mais provável
-    # (não é o mesmo que cenário ideal para over; aqui é só para identificar o lado mais forte)
-    power_home = (ah * 0.70) + (max(0.0, 2.20 - dh) * 0.30) if ah > 0.0 and dh >= 0.0 else 0.0
-    power_away = (aa * 0.70) + (max(0.0, 2.20 - da) * 0.30) if aa > 0.0 and da >= 0.0 else 0.0
-
-    diff_p = power_home - power_away
-    side_p: Optional[str] = None
-    if diff_p >= FAVORITE_POWER_THRESH:
-        side_p = "home"
-    elif diff_p <= -FAVORITE_POWER_THRESH:
-        side_p = "away"
-
-    score_p = abs(diff_p)
-
-    # decisão final (quando conflita, escolhe a evidência "mais forte" normalizada)
-    side: Optional[str] = side_r or side_p
-    reason = "rating" if side_r else ("power" if side_p else "none")
-
-    if side_r and side_p and side_r != side_p:
-        nr = score_r / max(FAVORITE_RATING_THRESH, 1e-6)
-        np = score_p / max(FAVORITE_POWER_THRESH, 1e-6)
-        if nr >= np:
-            side = side_r
-            reason = "rating(conflict)"
-        else:
-            side = side_p
-            reason = "power(conflict)"
-
-    strength = 0
-    if side is not None:
-        # Normaliza pela sensibilidade configurada (thresh) e converte em 5 níveis.
-        def _tier_from_norm(norm: float) -> int:
-            try:
-                v = float(norm)
-            except Exception:
-                return 0
-            if v >= 5.0:
-                return 4
-            if v >= 4.0:
-                return 3
-            if v >= 3.0:
-                return 2
-            if v >= 2.0:
-                return 1
-            return 0
-
-        nr = 0.0
-        np = 0.0
-        if side_r == side:
-            nr = score_r / max(FAVORITE_RATING_THRESH, 1e-6)
-        if side_p == side:
-            np = score_p / max(FAVORITE_POWER_THRESH, 1e-6)
-
-        strength = max(_tier_from_norm(nr), _tier_from_norm(np))
-
-    return side, strength, reason
-
-
 def _allow_favorite_leading_exception(
     fav_side: Optional[str],
     score_diff: int,
@@ -2881,27 +2790,6 @@ def _allow_favorite_leading_exception(
     except Exception:
         # segurança: se der qualquer erro aqui, NÃO libera a exceção.
         return False, "exception_err"
-
-def _goal_tier_gpm(gpm: Optional[float]) -> Optional[int]:
-    """Bucketiza gols/jogo na escala do Lucas.
-    0(<1.0), 1([1.0,1.3)), 2([1.3,1.5)), 3([1.5,1.8)), 4(>=1.8)
-    """
-    if gpm is None:
-        return None
-    try:
-        v = float(gpm)
-    except (TypeError, ValueError):
-        return None
-    if v < 1.0:
-        return 0
-    if v < 1.3:
-        return 1
-    if v < 1.5:
-        return 2
-    if v < 1.8:
-        return 3
-    return 4
-
 
 def _has_goal_ammo(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
     """Munição p/ gol: ou faz >=1.5/jogo ou toma >=1.5/jogo."""
@@ -2955,7 +2843,7 @@ def _compute_score_context_boost(
     home_under = False
     away_under = False
     
-    # 1) Favorito (prioridade: odds pré-live; fallback: rating)
+    # 1) Favorito (prioridade: odds pré-live)
     fav_side = fixture.get("favorite_side")  # "home" | "away" | None
     try:
         fav_strength = int(fixture.get("favorite_strength") or 0)  # 0..4
@@ -2967,24 +2855,6 @@ def _compute_score_context_boost(
     defense_home_gpm = fixture.get("defense_home_gpm")
     attack_away_gpm = fixture.get("attack_away_gpm")
     defense_away_gpm = fixture.get("defense_away_gpm")
-
-    if fav_side not in ("home", "away"):
-        try:
-            side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
-                rating_home=rating_home,
-                rating_away=rating_away,
-                attack_home_gpm=attack_home_gpm,
-                defense_home_gpm=defense_home_gpm,
-                attack_away_gpm=attack_away_gpm,
-                defense_away_gpm=defense_away_gpm,
-            )
-            fav_side = side_inf
-            try:
-                fav_strength = max(int(fav_strength or 0), int(strength_inf or 0))
-            except (TypeError, ValueError):
-                fav_strength = int(strength_inf or 0)
-        except Exception:
-            fav_side = None
 
     boost = 0.0
 
@@ -3226,7 +3096,7 @@ async def _get_pregame_boost_for_fixture(
     home_name = fixture.get("home_team") or ""
     away_name = fixture.get("away_team") or ""
 
-    # Favorito pré-live (odds) — se não tiver, seguimos com fallback de rating
+    # Favorito pré-live (odds) — se não tiver, mantém None
     try:
         await _ensure_prelive_favorite(client, fixture)
     except Exception:
@@ -3257,33 +3127,6 @@ async def _get_pregame_boost_for_fixture(
             )
             auto_boost = 0.0
 
-
-    # Se não conseguimos odds pré-live, define um favorito por rating (fallback leve).
-    # IMPORTANTE: este fallback precisa rodar DEPOIS do pré-jogo automático, senão o favorito pode ficar "None"
-    # mesmo quando o auto_data já trouxe rating_home/rating_away.
-    if fixture.get("favorite_side") is None:
-        diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
-        thr = float(FAVORITE_RATING_THRESH)
-        if diff_rating >= thr:
-            fixture["favorite_side"] = "home"
-        elif diff_rating <= -thr:
-            fixture["favorite_side"] = "away"
-        else:
-            fixture["favorite_side"] = None
-
-        # força aproximada (0..4) pela diferença de rating
-        ad = abs(diff_rating)
-        if ad >= 0.95:
-            fixture["favorite_strength"] = 4
-        elif ad >= 0.75:
-            fixture["favorite_strength"] = 3
-        elif ad >= 0.55:
-            fixture["favorite_strength"] = 2
-        elif ad >= 0.35:
-            fixture["favorite_strength"] = 1
-        else:
-            fixture["favorite_strength"] = 0
-
     # Pega perfis de ataque/defesa (gols por jogo) do cache
     attack_home_gpm, defense_home_gpm = _get_team_attack_defense_from_cache(
         home_team_id, league_id, season
@@ -3305,25 +3148,8 @@ async def _get_pregame_boost_for_fixture(
     )
     fixture["match_super_under"] = match_super_under
 
-    # Se ainda não achamos favorito, tenta inferir usando ataque/defesa (mais sensível que só rating)
-    if fixture.get("favorite_side") not in ("home", "away"):
-        try:
-            side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
-                rating_home=rating_home,
-                rating_away=rating_away,
-                attack_home_gpm=attack_home_gpm,
-                defense_home_gpm=defense_home_gpm,
-                attack_away_gpm=attack_away_gpm,
-                defense_away_gpm=defense_away_gpm,
-            )
-            if side_inf in ("home", "away"):
-                fixture["favorite_side"] = side_inf
-                try:
-                    fixture["favorite_strength"] = max(int(fixture.get("favorite_strength") or 0), int(strength_inf or 0))
-                except (TypeError, ValueError):
-                    fixture["favorite_strength"] = int(strength_inf or 0)
-        except Exception:
-            pass
+    # IMPORTANTE: Não inferir favorito via rating - usar apenas odds pré-live
+    # Se não houver odds pré-live, favorite_side permanece None
 
     pregame_total = manual_boost + auto_boost
     if pregame_total > 0.03:
@@ -4039,25 +3865,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         fav_side_eff = fav_side if fav_side in ("home", "away") else None
                         fav_strength_eff = int(fav_strength or 0)
 
-                        if fav_side_eff is None:
-                            try:
-                                side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
-                                    rating_home=rating_home,
-                                    rating_away=rating_away,
-                                    attack_home_gpm=attack_home_gpm,
-                                    defense_home_gpm=defense_home_gpm,
-                                    attack_away_gpm=attack_away_gpm,
-                                    defense_away_gpm=defense_away_gpm,
-                                )
-                                fav_side_eff = side_inf
-                                try:
-                                    fav_strength_eff = max(int(fav_strength_eff or 0), int(strength_inf or 0))
-                                except (TypeError, ValueError):
-                                    fav_strength_eff = int(strength_inf or 0)
-                            except Exception as e:
-                                logging.warning("infer_favorite_failed fixture_id=%s err=%r", fx["fixture_id"], e)
-                                fav_side_eff = None
-
                         leader_side = "home" if score_diff > 0 else "away"
 
                         if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
@@ -4089,14 +3896,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             ):
                                 continue
 
-                        # Conservador: sem favorito definido, mas líder parece mais forte → trata como favorito na frente.
-                        if BLOCK_FAVORITE_LEADING and (fav_side_eff is None):
-                            # usa rating + ataque como heurística simples
-                            diff_attack = float(attack_home_gpm or 0.0) - float(attack_away_gpm or 0.0)
-                            if (leader_side == "home" and (diff_rating >= (FAVORITE_RATING_THRESH * 0.66) or diff_attack >= 0.20)) or (
-                                leader_side == "away" and (diff_rating <= -(FAVORITE_RATING_THRESH * 0.66) or diff_attack <= -0.20)
-                            ):
-                                continue
                 except Exception:
                     # nunca quebrar scan por causa de filtro
                     pass
@@ -4208,23 +4007,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         fav_strength = 0
 
                     diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
-                    if fav_side not in ("home", "away"):
-                        try:
-                            side_inf, strength_inf, _reason = _infer_favorite_side_from_signals(
-                                rating_home=rating_home,
-                                rating_away=rating_away,
-                                attack_home_gpm=home_attack_gpm,
-                                defense_home_gpm=home_defense_gpm,
-                                attack_away_gpm=away_attack_gpm,
-                                defense_away_gpm=away_defense_gpm,
-                            )
-                            fav_side = side_inf
-                            try:
-                                fav_strength = max(int(fav_strength or 0), int(strength_inf or 0))
-                            except (TypeError, ValueError):
-                                fav_strength = int(strength_inf or 0)
-                        except Exception:
-                            fav_side = None
 
                     big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
 
