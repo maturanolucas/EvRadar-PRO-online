@@ -1,34 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.3-lite
-------------------------------------------
-Features:
-- Telegram estável (python-telegram-bot v21)
-- Consulta jogos ao vivo na API-FOOTBALL
-- Filtro por ligas e janela de tempo
-- Score de pressão / chances ao vivo
-- Probabilidade de +1 gol no 2º tempo
-- Odds em tempo real (API-FOOTBALL) com backup em cache
-- Integração opcional com The Odds API para odds ao vivo
-- News boost (NewsAPI, opcional)
-- Pré-jogo boost:
-    - Manual (PREMATCH_TEAM_RATINGS)
-    - Automático (API-FOOTBALL /teams/statistics, com cache diário)
-- Impacto de jogadores em campo:
-    - Stats por time/temporada (API-FOOTBALL /players)
-    - Lineups + substituições (fixtures/lineups + fixtures/events)
-    - Boost de probabilidade conforme "peso ofensivo" do XI atual
-- Filtros de contexto alinhados ao teu faro:
-    - Times under vs over (ataque/defesa por gols/jogo)
-    - Flag match_super_under (duas equipes bem under)
-    - Muito mais cautela em EMPATES (só libera favorito forte + pressão alta + defesa frágil)
-    - Mandante claramente under vencendo → torneira quase sempre fechada
-    - Linhas altas em jogos super under podem ser bloqueadas
-    - Malus específico para mata-mata ida/volta (1º jogo tende a ser mais travado)
-- Cálculo de EV e alertas Telegram quando EV >= EV_MIN_PCT
-
-Baseado na tua versão estável anterior (v0.2-lite + odds reais + news + pré-jogo manual).
+EvRadar PRO - Telegram + Cérebro v0.3-lite MODIFICADO
+-----------------------------------------------------
+MODIFICAÇÃO PRINCIPAL: Não depende mais de odds ao vivo para enviar alertas.
+Mantém obtenção de odds pré-live para definir favorito, mas alertas são
+baseados apenas na probabilidade estimada e filtros.
 """
 
 import asyncio
@@ -69,7 +46,7 @@ def _get_env_float(name: str, default: float) -> float:
         return default
     try:
         return float(raw.replace(",", "."))
-    except ValueError:
+    except (TypeError, ValueError):
         return default
 
 
@@ -3685,19 +3662,14 @@ def _format_pattern_only_text(
 
 
 # ---------------------------------------------------------------------------
-# Função principal de scan (CÉREBRO)
+# Função principal de scan (CÉREBRO) - MODIFICADA
 # ---------------------------------------------------------------------------
 
 async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     """
     Executa UM ciclo de varredura.
-    Usa odd ao vivo ou, em caso de mercado suspenso, a última odd em cache
-    da linha correta.
-
-    Tipos de alerta:
-    - ALERTA NORMAL: cenário bom + odd dentro da faixa [MIN_ODD, MAX_ODD]
-    - ALERTA OBSERVAÇÃO: cenário bom + odd POSITIVA mas abaixo de MIN_ODD
-    - ALERTA MANUAL: jogo muito no padrão, mas SEM odd nas APIs (você julga o preço)
+    MODIFICAÇÃO: Não depende mais de odds ao vivo para enviar alertas.
+    Usa odd justa (fair odd) para calcular EV.
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -3731,63 +3703,26 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 total_goals = fx["home_goals"] + fx["away_goals"]
 
-                # Base do placar (sempre definido p/ evitar UnboundLocalError)
+                # Base do placar
                 score_diff = (fx.get("home_goals") or 0) - (fx.get("away_goals") or 0)
                 minute_int = fx.get("minute") or 0
                 try:
                     minute_int = int(minute_int)
                 except (TypeError, ValueError):
                     minute_int = 0
-                api_odd: Optional[float] = None
-                got_live_odd = False
-                used_cache_odd = False
 
-                # 1) Tenta API-FOOTBALL
+                # Tenta obter odds ao vivo (apenas para referência, não bloqueia)
+                api_odd: Optional[float] = None
                 try:
                     api_odd = await _fetch_live_odds_for_fixture(
                         client=client,
                         fixture_id=fx["fixture_id"],
                         total_goals=total_goals,
                     )
-                    if api_odd is not None:
-                        _update_last_odd_cache(fx["fixture_id"], total_goals, api_odd)
-                        got_live_odd = True
-                    else:
-                        cached_odd = _get_cached_odd_for_line(fx["fixture_id"], total_goals)
-                        if cached_odd is not None:
-                            api_odd = cached_odd
-                            used_cache_odd = True
                 except Exception:
-                    logging.exception(
-                        "Erro inesperado ao buscar odds ao vivo (API-FOOTBALL) para fixture=%s",
-                        fx["fixture_id"],
-                    )
-                    cached_odd = _get_cached_odd_for_line(fx["fixture_id"], total_goals)
-                    if cached_odd is not None:
-                        api_odd = cached_odd
-                        used_cache_odd = True
+                    pass
 
-                # 2) Se nada veio da API-FOOTBALL (nem cache), tenta The Odds API
-                if api_odd is None and ODDS_API_KEY and ODDS_API_USE:
-                    try:
-                        oddsapi_odd = await _fetch_live_odds_for_fixture_odds_api(
-                            client=client,
-                            fixture=fx,
-                            total_goals=total_goals,
-                        )
-                    except Exception:
-                        logging.exception(
-                            "Erro inesperado ao buscar odds via The Odds API para fixture=%s",
-                            fx["fixture_id"],
-                        )
-                        oddsapi_odd = None
-
-                    if oddsapi_odd is not None:
-                        api_odd = oddsapi_odd
-                        got_live_odd = True
-                        _update_last_odd_cache(fx["fixture_id"], total_goals, api_odd)
-
-                # 3) Boosts que não dependem de odd (sempre calculados)
+                # Boosts que não dependem de odd
                 news_boost_prob = 0.0
                 try:
                     news_boost_prob = await _fetch_news_boost_for_fixture(
@@ -3795,10 +3730,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         fixture=fx,
                     )
                 except Exception:
-                    logging.exception(
-                        "Erro inesperado ao calcular news boost para fixture=%s",
-                        fx["fixture_id"],
-                    )
                     news_boost_prob = 0.0
 
                 pregame_boost_prob = 0.0
@@ -3816,10 +3747,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         fixture=fx,
                     )
                 except Exception:
-                    logging.exception(
-                        "Erro inesperado ao calcular pré-jogo/contexto para fixture=%s",
-                        fx["fixture_id"],
-                    )
                     pregame_boost_prob = 0.0
                     context_boost_prob = 0.0
                     rating_home = 0.0
@@ -3908,13 +3835,9 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             fixture=fx,
                         )
                     except Exception:
-                        logging.exception(
-                            "Erro inesperado ao calcular impacto de jogadores para fixture=%s",
-                            fx["fixture_id"],
-                        )
                         player_boost_prob = 0.0
                         
-                # Perfis de ataque/defesa (gols por jogo) — sempre definidos (anti-crash)
+                # Perfis de ataque/defesa
                 attack_home_gpm = _to_float(fx.get("attack_home_gpm", fx.get("home_attack_gpm", 0.0)), 0.0)
                 defense_home_gpm = _to_float(fx.get("defense_home_gpm", fx.get("home_defense_gpm", 0.0)), 0.0)
                 attack_away_gpm = _to_float(fx.get("attack_away_gpm", fx.get("away_attack_gpm", 0.0)), 0.0)
@@ -3923,191 +3846,14 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
                 away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
-                # Aliases p/ consistência (há trechos que usam home_attack_gpm / away_attack_gpm)
-                fx["attack_home_gpm"] = attack_home_gpm
-                fx["defense_home_gpm"] = defense_home_gpm
-                fx["attack_away_gpm"] = attack_away_gpm
-                fx["defense_away_gpm"] = defense_away_gpm
-                fx["home_attack_gpm"] = attack_home_gpm
-                fx["home_defense_gpm"] = defense_home_gpm
-                fx["away_attack_gpm"] = attack_away_gpm
-                fx["away_defense_gpm"] = defense_away_gpm
 
-                # 4) Caso não haja odd em NENHUMA fonte → modo MANUAL (se permitido)
-                if api_odd is None:
-                    logging.info(
-                        "Fixture %s sem odd ao vivo (API-FOOTBALL/The Odds API) e sem cache.",
-                        fx["fixture_id"],
-                    )
-
-                    if not ALLOW_ALERTS_WITHOUT_ODDS:
-                        logging.info(
-                            "ALLOW_ALERTS_WITHOUT_ODDS=0; ignorando fixture %s.",
-                            fx["fixture_id"],
-                        )
-                        continue
-
-                    # Calcula probabilidade e pressão, sem EV baseado em odd real
-                    metrics = _estimate_prob_and_odd(
-                        minute=fx["minute"],
-                        stats=stats,
-                        home_goals=fx["home_goals"],
-                        away_goals=fx["away_goals"],
-                        forced_odd_current=None,
-                        news_boost_prob=news_boost_prob,
-                        pregame_boost_prob=pregame_boost_prob,
-                        player_boost_prob=player_boost_prob,
-                        context_boost_prob=context_boost_prob,
-                    )
-
-                    # Filtros de contexto / goleada / pressão semelhantes aos alertas normais
-                    score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
-                    minute_int = fx["minute"] or 0
-                    try:
-                        minute_int = int(minute_int)
-                    except (TypeError, ValueError):
-                        minute_int = 0
-
-                    # Mandante under vencendo: cenário que você geralmente evita
-                    if home_under and score_diff > 0 and minute_int >= 50:
-                        continue
-
-                    # Visitante under vencendo: cenário que você geralmente evita
-                    if away_under and score_diff < 0 and minute_int >= 50:
-                        continue
-
-                    # Goleada a partir dos 55' → em geral você ignora
-                    if abs(score_diff) >= 3 and minute_int >= 55:
-                        continue
-
-                    context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
-
-                    # Filtro forte para jogos com contexto negativo (favorito confortável etc.)
-                    if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
-                        continue
-
-                # NOVO: filtro de empate alinhado ao teu faro (favorito + munição under/over)
-                is_draw = (score_diff == 0)
-                if is_draw:
-                    # Dados de munição (cache pré-jogo já anexado no fx)
-                    home_attack_gpm = fx.get("attack_home_gpm")
-                    home_defense_gpm = fx.get("defense_home_gpm")
-                    away_attack_gpm = fx.get("attack_away_gpm")
-                    away_defense_gpm = fx.get("defense_away_gpm")
-
-                    # Bloqueio duro: empate em jogo "seco" (pouca munição)
-                    if _is_match_super_under(home_attack_gpm, home_defense_gpm, away_attack_gpm, away_defense_gpm):
-                        continue
-
-                    # EXCEÇÃO A: amplo favorito pressionando ("amassando") contra defesa frágil
-                    fav_side = fx.get("favorite_side")
-                    try:
-                        fav_strength = int(fx.get("favorite_strength") or 0)
-                    except (TypeError, ValueError):
-                        fav_strength = 0
-
-                    diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
-
-                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
-
-                    if fav_side == "home":
-                        opp_def_weak = (away_defense_gpm is not None) and (away_defense_gpm >= 1.5)
-                    elif fav_side == "away":
-                        opp_def_weak = (home_defense_gpm is not None) and (home_defense_gpm >= 1.5)
-                    else:
-                        opp_def_weak = False
-
-                    allow_big_fav_amass = (
-                        big_fav
-                        and opp_def_weak
-                        and (pressure_score >= 7.0)
-                        and (context_pp >= 1.3)
-                    )
-
-                    # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over" e o jogo estiver MUITO aberto
-                    home_super_over = _is_super_over_team(home_attack_gpm, home_defense_gpm)
-                    away_super_over = _is_super_over_team(away_attack_gpm, away_defense_gpm)
-                    allow_both_super_over = (
-                        home_super_over and away_super_over
-                        and (pressure_score >= 7.5)
-                        and (context_pp >= 1.0)
-                        and (minute_int >= 50)
-                    )
-
-                    if not (allow_big_fav_amass or allow_both_super_over):
-                        continue
-
-
-                    # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
-                    fav_side2 = fx.get("favorite_side")
-                    try:
-                        fav_strength2 = int(fx.get("favorite_strength") or 0)
-                    except (TypeError, ValueError):
-                        fav_strength2 = 0
-                    diff_rating = rating_home - rating_away
-                    fav_home_clear = ((fav_side2 == "home") and (fav_strength2 >= 2)) or (diff_rating >= 0.7)
-                    if fav_home_clear and score_diff > 0 and minute_int >= 55:
-                        # se favorito está ganhando em casa e contexto não indica necessidade real,
-                        # e/ou pressão não é absurda, ignora alerta manual
-                        if (
-                            context_pp <= 0.5
-                            or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
-                        ):
-                            continue
-
-                    # Bloqueio extra: linhas altas em jogos super under
-                    linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
-                    if match_super_under and linha_num >= 2.5:
-                        continue
-
-                    # Desconfiança em linhas altas (3.5+): exige pressão maior
-                    if linha_num >= HIGH_LINE_START:
-                        steps_high = int((linha_num - 2.5) // 1.0)
-                        req_pressure = MIN_PRESSURE_SCORE + (HIGH_LINE_PRESSURE_STEP * steps_high)
-                        if metrics["pressure_score"] < req_pressure:
-                            continue
-
-                    if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
-                        continue
-
-                    # Limiar de probabilidade para valer um alerta manual:
-                    # precisa ser maior que o break-even da odd mínima sugerida
-                    if MANUAL_MIN_ODD_HINT > 1.0:
-                        prob_min_for_manual = 1.0 / MANUAL_MIN_ODD_HINT
-                    else:
-                        prob_min_for_manual = 0.68  # fallback seguro
-
-                    if metrics["p_final"] < prob_min_for_manual:
-                        # prob baixa demais para o preço-alvo (ex.: < 1/1.47)
-                        continue
-
-                    # Cooldown por jogo
-                    now = _now_utc()
-                    fixture_id = fx["fixture_id"]
-                    cd_key = _cooldown_key(fixture_id, fx.get("home_goals", 0), fx.get("away_goals", 0))
-                    last_ts = fixture_last_alert_at.get(cd_key)
-                    if last_ts is not None:
-                        if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
-                            continue
-
-                    alert_text = _format_manual_no_odds_text(fx, metrics)
-                    alerts.append(alert_text)
-                    fixture_last_alert_at[cd_key] = now
-                    continue  # pula restante da lógica (sem odd real)
-
-                # 5) Fluxo normal com odd real
-                if used_cache_odd and not got_live_odd:
-                    logging.info(
-                        "Usando odd em cache para fixture %s (mercado possivelmente suspenso ou em delay, mesma linha SUM_PLUS_HALF).",
-                        fx["fixture_id"],
-                    )
-
+                # Calcula probabilidade com odd real se disponível, senão com odd justa
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
                     stats=stats,
                     home_goals=fx["home_goals"],
                     away_goals=fx["away_goals"],
-                    forced_odd_current=api_odd,
+                    forced_odd_current=api_odd,  # Usa odd real se tiver, senão None (calcula com odd justa)
                     news_boost_prob=news_boost_prob,
                     pregame_boost_prob=pregame_boost_prob,
                     player_boost_prob=player_boost_prob,
@@ -4141,41 +3887,58 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # NOVO: filtro pesado para empates em jogos under/equilibrados
                 is_draw = (score_diff == 0)
                 if is_draw:
-                    under_draw_block = False
+                    # Dados de munição (cache pré-jogo já anexado no fx)
+                    home_attack_gpm = fx.get("attack_home_gpm")
+                    home_defense_gpm = fx.get("defense_home_gpm")
+                    away_attack_gpm = fx.get("attack_away_gpm")
+                    away_defense_gpm = fx.get("defense_away_gpm")
 
-                    # super under + tempo avançado
-                    if match_super_under and minute_int >= 50:
-                        under_draw_block = True
+                    # Bloqueio duro: empate em jogo "seco" (pouca munição)
+                    if _is_match_super_under(home_attack_gpm, home_defense_gpm, away_attack_gpm, away_defense_gpm):
+                        continue
 
-                    # dois times com rating ruim para gols, pressão fraca
-                    if not under_draw_block:
-                        if (
-                            rating_home <= 0.0
-                            and rating_away <= 0.0
-                            and minute_int >= 50
-                            and metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 1.0)
-                        ):
-                            under_draw_block = True
+                    # EXCEÇÃO A: amplo favorito pressionando ("amassando") contra defesa frágil
+                    fav_side = fx.get("favorite_side")
+                    try:
+                        fav_strength = int(fx.get("favorite_strength") or 0)
+                    except (TypeError, ValueError):
+                        fav_strength = 0
 
-                    # jogo empatado, sem grande favorito pressionando
-                    if not under_draw_block:
-                        if context_pp < 1.0 and metrics["pressure_score"] < 7.0 and minute_int >= 55:
-                            under_draw_block = True
+                    diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
 
-                    # exceção: favorito pressionando muito + defesa frágil
-                    if under_draw_block:
-                        if context_pp >= 2.0 and metrics["pressure_score"] >= 7.0:
-                            under_draw_block = False
+                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
 
-                    if under_draw_block:
+                    if fav_side == "home":
+                        opp_def_weak = (away_defense_gpm is not None) and (away_defense_gpm >= 1.5)
+                    elif fav_side == "away":
+                        opp_def_weak = (home_defense_gpm is not None) and (home_defense_gpm >= 1.5)
+                    else:
+                        opp_def_weak = False
+
+                    allow_big_fav_amass = (
+                        big_fav
+                        and opp_def_weak
+                        and (metrics["pressure_score"] >= 7.0)
+                        and (context_pp >= 1.3)
+                    )
+
+                    # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over" e o jogo estiver MUITO aberto
+                    home_super_over = _is_super_over_team(home_attack_gpm, home_defense_gpm)
+                    away_super_over = _is_super_over_team(away_attack_gpm, away_defense_gpm)
+                    allow_both_super_over = (
+                        home_super_over and away_super_over
+                        and (metrics["pressure_score"] >= 7.5)
+                        and (context_pp >= 1.0)
+                        and (minute_int >= 50)
+                    )
+
+                    if not (allow_big_fav_amass or allow_both_super_over):
                         continue
 
                 # Filtro específico: favorito forte vencendo em casa (ex.: Barcelona/Monaco)
                 diff_rating = rating_home - rating_away
                 fav_home_clear = diff_rating >= 0.7
                 if fav_home_clear and score_diff > 0 and minute_int >= 55:
-                    # se favorito está ganhando em casa e contexto não indica necessidade real
-                    # ou pressão não for bem acima do mínimo, ignora sinal
                     if (
                         context_pp <= 0.5
                         or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
@@ -4209,20 +3972,28 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
                         continue
 
-                # Aqui odd vem das APIs (ou cache real) → aplica faixa de odds
-                if odd_cur > MAX_ODD:
-                    continue
+                # Verificação de odds (apenas para referência, não bloqueia)
+                # Se não temos odd real, usamos a odd justa
+                if api_odd is None:
+                    # Usamos odd justa + 3% como referência
+                    odd_ref = metrics["odd_fair"] * 1.03
+                else:
+                    odd_ref = api_odd
 
-                if odd_cur < MIN_ODD:
+                # Se temos odd real e está abaixo do mínimo, pode ser watch
+                if api_odd is not None and api_odd < MIN_ODD:
                     if ALLOW_WATCH_ALERTS:
                         alert_text = _format_watch_text(fx, metrics)
-                    else:
-                        continue
+                        alerts.append(alert_text)
+                        fixture_last_alert_at[cd_key] = now
+                    continue
+                elif api_odd is not None and api_odd > MAX_ODD:
+                    continue
                 else:
+                    # Não temos odd real ou está na faixa aceitável
                     alert_text = _format_alert_text(fx, metrics)
-
-                alerts.append(alert_text)
-                fixture_last_alert_at[cd_key] = now
+                    alerts.append(alert_text)
+                    fixture_last_alert_at[cd_key] = now
 
             except Exception:
                 logging.exception(
@@ -4280,16 +4051,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.3-lite: odds reais + news + pré-jogo auto + camada de jogadores).",
+        "👋 EvRadar PRO online (cérebro v0.3-lite MODIFICADO: NÃO depende de odds ao vivo).",
+        "",
+        "MODIFICAÇÃO: Alerta de gol iminente baseado apenas em probabilidade e filtros.",
+        "Odd ao vivo é opcional (busca acima de 1.47 manualmente).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
         "Faixa de odds: {mn:.2f}–{mx:.2f}".format(mn=MIN_ODD, mx=MAX_ODD),
-        "Alertas sem odd na API (manual): {m} (odd mínima sugerida ≥ {od:.2f})".format(
-            m=manual_mode_status,
-            od=MANUAL_MIN_ODD_HINT,
-        ),
-        "Banca virtual para sugestão: R$ {bk:.2f}".format(bk=BANKROLL_INITIAL),
         "Pressão mínima (score): {ps:.1f}".format(ps=MIN_PRESSURE_SCORE),
         "Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
         "Camada de jogadores (impacto): {pl}".format(pl=player_layer_status),
@@ -4317,7 +4086,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
-        "📊 Último status do EvRadar PRO:",
+        "📊 Último status do EvRadar PRO (MODIFICADO):",
         "",
         last_status_text,
         "",
@@ -4673,7 +4442,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if update.effective_chat:
             await update.effective_chat.send_message(
-                "🔍 Iniciando varredura manual de jogos ao vivo (cérebro v0.3-lite, odds reais + news + pré-jogo auto + jogadores)..."
+                "🔍 Iniciando varredura manual de jogos ao vivo (MODIFICADO: não depende de odds ao vivo)..."
             )
     except Exception:
         logging.exception("Erro ao enviar mensagem inicial do /scan")
@@ -4712,7 +4481,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return key[0:4] + "..." + key[-4:]
 
     lines = [
-        "🛠 Debug EvRadar PRO",
+        "🛠 Debug EvRadar PRO (MODIFICADO)",
         "",
         "LEAGUE_IDS: {ids}".format(ids=",".join(str(x) for x in LEAGUE_IDS) or "(nenhuma)"),
         "WINDOW_START/END: {ws}/{we}".format(ws=WINDOW_START, we=WINDOW_END),
@@ -4845,7 +4614,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     
     # Inicia o bot
-    logging.info("EvRadar PRO v0.3-lite iniciando...")
+    logging.info("EvRadar PRO v0.3-lite MODIFICADO iniciando...")
     
     try:
         # Run polling com allowed_updates
