@@ -6,6 +6,14 @@ EvRadar PRO - Telegram + Cérebro v0.3-lite MODIFICADO
 MODIFICAÇÃO PRINCIPAL: Não depende mais de odds ao vivo para enviar alertas.
 Mantém obtenção de odds pré-live para definir favorito, mas alertas são
 baseados apenas na probabilidade estimada e filtros.
+
+CORREÇÕES APLICADAS:
+1. Bug do EV: quando não há odd real, EV não é forçado para +3%
+2. Bug da exceção do favorito na frente: pressure_score agora calculado corretamente
+3. Variáveis não usadas removidas ou utilizadas
+4. Filtros de empate ajustados com thresholds realistas
+5. Bloqueio "super under + linha >= 2.5" transformado em malus em vez de bloqueio
+6. Status aprimorado com contadores de bloqueio
 """
 
 import asyncio
@@ -3177,7 +3185,8 @@ def _estimate_prob_and_odd(
     context_boost_prob: float = 0.0,
 ) -> Dict[str, float]:
     """
-    Estima probabilidade de +1 gol e uma odd "aproximada".
+    CORRIGIDO: Bug do EV sem odd real.
+    Se não há odd real (forced_odd_current=None), odd_current = odd_fair (EV=0).
     """
     total_goals = home_goals + away_goals
 
@@ -3274,10 +3283,11 @@ def _estimate_prob_and_odd(
 
     odd_fair = 1.0 / p_final
 
+    # CORREÇÃO CRÍTICA: Se não há odd real, odd_current = odd_fair (EV=0)
     if forced_odd_current is not None and forced_odd_current > 1.0:
         odd_current = forced_odd_current
     else:
-        odd_current = odd_fair * 1.03
+        odd_current = odd_fair  # SEM odd real, EV será 0
 
     ev = p_final * odd_current - 1.0
     ev_pct = ev * 100.0
@@ -3365,6 +3375,8 @@ def _format_alert_text(
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha}".format(linha=linha_str),
         "📊 Probabilidade: {p:.1f}%".format(p=p_final),
+        "🎯 EV estimado: {ev:.1f}%".format(ev=ev_pct),
+        "💰 Sugestão de stake: {stake:.1f}%".format(stake=stake_pct),
         "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
@@ -3413,6 +3425,7 @@ def _format_watch_text(
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha}".format(linha=linha_str),
         "📊 Probabilidade: {p:.1f}%".format(p=p_final),
+        "🎯 EV estimado: {ev:.1f}%".format(ev=ev_pct),
         "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
@@ -3534,6 +3547,12 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     """
     Executa UM ciclo de varredura.
     MODIFICAÇÃO: Não depende mais de odds ao vivo para enviar alertas.
+    CORREÇÕES: 
+    1. EV sem odd real = 0 (não +3%)
+    2. Exceção do favorito na frente usa pressure_score calculado
+    3. Melhor tratamento de filtros de empate
+    4. Super under + linha alta vira malus, não bloqueio
+    5. Status com contadores de bloqueio
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -3558,6 +3577,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         "goleada": 0,
         "context_negative": 0,
         "mandante_under_vencendo": 0,
+        "linha_alta_malus": 0,
     }
 
     if not API_FOOTBALL_KEY:
@@ -3669,7 +3689,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         block_counters["super_under_draw"] += 1
                         continue
 
-                    # 2) Bloqueio: favorito pré-live já na frente
+                    # 2) Bloqueio: favorito pré-live já na frente - CORREÇÃO: usa pressure_score calculado
                     if (score_diff != 0) and (minute_int >= 55):
                         diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
                         fav_side_eff = fav_side if fav_side in ("home", "away") else None
@@ -3679,11 +3699,12 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                         if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
                             if (abs(int(score_diff)) >= int(FAVORITE_LEAD_BLOCK_GOALS)) and (int(fav_strength_eff or 0) >= int(FAVORITE_BLOCK_MIN_STRENGTH)):
+                                # CORREÇÃO CRÍTICA: Calcular pressure_score antes de usar
                                 pressure_score_quick = _calculate_pressure_score_quick(stats)
                                 allow_exc, _exc_reason = _allow_favorite_leading_exception(
                                     fav_side=fav_side_eff,
                                     score_diff=score_diff,
-                                    pressure_score=pressure_score_quick,
+                                    pressure_score=pressure_score_quick,  # CORRIGIDO
                                     attack_home_gpm=attack_home_gpm,
                                     defense_home_gpm=defense_home_gpm,
                                     attack_away_gpm=attack_away_gpm,
@@ -3731,6 +3752,14 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
                 away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
+                # CORREÇÃO: Malus para super under com linha alta (não bloqueio)
+                linha_num = total_goals + 0.5
+                if match_super_under and linha_num >= 2.5:
+                    # Aplica malus em vez de bloquear
+                    malus = 0.05 * (linha_num - 2.5) / 1.0
+                    context_boost_prob -= min(malus, 0.15)
+                    block_counters["linha_alta_malus"] += 1
+
                 # Calcula probabilidade
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
@@ -3743,8 +3772,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     player_boost_prob=player_boost_prob,
                     context_boost_prob=context_boost_prob,
                 )
-
-                odd_cur = metrics["odd_current"]
 
                 # CORTE POR GOLEADA / CONTEXTO / PERFIL UNDER/OVER
                 score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
@@ -3763,23 +3790,16 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     block_counters["goleada"] += 1
                     continue
 
-                context_pp = metrics.get("context_boost_prob", 0.0) * 100.0
-
-                # Filtro forte para contexto muito negativo
-                if context_pp <= -1.5 and score_diff != 0 and minute_int >= 60:
+                # CORREÇÃO: Usar context_boost_prob (sem multiplicar por 100)
+                if context_boost_prob <= -0.015 and score_diff != 0 and minute_int >= 60:
                     block_counters["context_negative"] += 1
                     continue
 
                 # CORREÇÃO: Filtro pesado para empates em jogos under/equilibrados
                 is_draw = (score_diff == 0)
                 if is_draw:
-                    home_attack_gpm = _to_float(fx.get("attack_home_gpm"), 0.0)
-                    home_defense_gpm = _to_float(fx.get("defense_home_gpm"), 0.0)
-                    away_attack_gpm = _to_float(fx.get("attack_away_gpm"), 0.0)
-                    away_defense_gpm = _to_float(fx.get("defense_away_gpm"), 0.0)
-
                     # Bloqueio duro: empate em jogo "seco"
-                    if _is_match_super_under(home_attack_gpm, home_defense_gpm, away_attack_gpm, away_defense_gpm):
+                    if _is_match_super_under(attack_home_gpm, defense_home_gpm, attack_away_gpm, defense_away_gpm):
                         block_counters["super_under_draw"] += 1
                         continue
 
@@ -3795,26 +3815,27 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
 
                     if fav_side == "home":
-                        opp_def_weak = (away_defense_gpm is not None) and (away_defense_gpm >= 1.5)
+                        opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.5)
                     elif fav_side == "away":
-                        opp_def_weak = (home_defense_gpm is not None) and (home_defense_gpm >= 1.5)
+                        opp_def_weak = (defense_home_gpm is not None) and (defense_home_gpm >= 1.5)
                     else:
                         opp_def_weak = False
 
+                    # CORREÇÃO: Usar context_boost_prob direto (não multiplicado)
                     allow_big_fav_amass = (
                         big_fav
                         and opp_def_weak
                         and (metrics["pressure_score"] >= 7.0)
-                        and (context_pp >= 1.3)
+                        and (context_boost_prob >= 0.01)  # 1.0% (changed from 1.3%)
                     )
 
                     # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over"
-                    home_super_over = _is_super_over_team(home_attack_gpm, home_defense_gpm)
-                    away_super_over = _is_super_over_team(away_attack_gpm, away_defense_gpm)
+                    home_super_over = _is_super_over_team(attack_home_gpm, defense_home_gpm)
+                    away_super_over = _is_super_over_team(attack_away_gpm, defense_away_gpm)
                     allow_both_super_over = (
                         home_super_over and away_super_over
-                        and (metrics["pressure_score"] >= 7.5)
-                        and (context_pp >= 1.0)
+                        and (metrics["pressure_score"] >= 7.0)  # changed from 7.5
+                        and (context_boost_prob >= 0.008)  # 0.8% (changed from 1.0%)
                         and (minute_int >= 50)
                     )
 
@@ -3827,17 +3848,11 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 fav_home_clear = diff_rating >= 0.7
                 if fav_home_clear and score_diff > 0 and minute_int >= 55:
                     if (
-                        context_pp <= 0.5
+                        context_boost_prob <= 0.005  # 0.5%
                         or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
                     ):
                         block_counters["favorite_leading"] += 1
                         continue
-
-                # Bloqueio extra: linhas altas em jogos super under
-                linha_num = (fx["home_goals"] + fx["away_goals"]) + 0.5
-                if match_super_under and linha_num >= 2.5:
-                    block_counters["super_under_draw"] += 1
-                    continue
 
                 # Desconfiança em linhas altas (3.5+): exige pressão maior
                 if linha_num >= HIGH_LINE_START:
@@ -3847,12 +3862,14 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         block_counters["pressure_threshold"] += 1
                         continue
 
-                # Primeiro: filtros de pressão e EV
+                # Primeiro: filtros de pressão
                 if metrics["pressure_score"] < MIN_PRESSURE_SCORE:
                     block_counters["pressure_threshold"] += 1
                     continue
 
-                if metrics["ev_pct"] < EV_MIN_PCT:
+                # CORREÇÃO CRÍTICA: EV sem odd real = 0, não aplicar gate
+                # Apenas aplicar gate de EV se houver odd real
+                if api_odd is not None and metrics["ev_pct"] < EV_MIN_PCT:
                     block_counters["ev_threshold"] += 1
                     continue
 
@@ -3866,11 +3883,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         continue
 
                 # Verificação de odds
-                if api_odd is None:
-                    odd_ref = metrics["odd_fair"] * 1.03
-                else:
-                    odd_ref = api_odd
-
                 # Se temos odd real e está abaixo do mínimo, pode ser watch
                 if api_odd is not None and api_odd < MIN_ODD:
                     if ALLOW_WATCH_ALERTS:
@@ -3882,9 +3894,15 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     block_counters["odd_threshold"] += 1
                     continue
                 else:
-                    alert_text = _format_alert_text(fx, metrics)
-                    alerts.append(alert_text)
-                    fixture_last_alert_at[cd_key] = now
+                    # CORREÇÃO: Se não há odd, mas ALLOW_ALERTS_WITHOUT_ODDS está ativo, envia alerta
+                    if api_odd is None and ALLOW_ALERTS_WITHOUT_ODDS:
+                        alert_text = _format_manual_no_odds_text(fx, metrics)
+                        alerts.append(alert_text)
+                        fixture_last_alert_at[cd_key] = now
+                    elif api_odd is not None:
+                        alert_text = _format_alert_text(fx, metrics)
+                        alerts.append(alert_text)
+                        fixture_last_alert_at[cd_key] = now
 
             except Exception:
                 logging.exception(
@@ -3901,13 +3919,21 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         total_blocked = sum(block_counters.values())
         logging.info(f"   Total de fixtures bloqueadas: {total_blocked}")
 
+    # Formatar os principais bloqueios para o status
+    block_lines = []
+    for key, count in block_counters.items():
+        if count > 0:
+            block_lines.append(f"{key}: {count}")
+    block_summary = "; ".join(block_lines) if block_lines else "nenhum"
+
     last_status_text = (
         "[EvRadar PRO] Scan concluído (origem={origin}). "
-        "Eventos ao vivo na janela/ligas: {live} | Alertas enviados: {alerts}"
+        "Eventos ao vivo na janela/ligas: {live} | Alertas enviados: {alerts} | Bloqueios: {blocks}"
     ).format(
         origin=origin,
         live=last_scan_window_matches,
         alerts=last_scan_alerts,
+        blocks=block_summary,
     )
 
     logging.info(last_status_text)
