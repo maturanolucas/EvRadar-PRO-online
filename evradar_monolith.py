@@ -3812,7 +3812,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                     diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
 
-                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
+                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.5)
 
                     if fav_side == "home":
                         opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.5)
