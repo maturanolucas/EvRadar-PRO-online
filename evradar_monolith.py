@@ -1,4 +1,4 @@
-(#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 EvRadar PRO - Telegram + Cérebro v0.3-lite MODIFICADO
