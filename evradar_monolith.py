@@ -3815,9 +3815,9 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.5)
 
                     if fav_side == "home":
-                        opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.5)
+                        opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.3)
                     elif fav_side == "away":
-                        opp_def_weak = (defense_home_gpm is not None) and (defense_home_gpm >= 1.5)
+                        opp_def_weak = (defense_home_gpm is not None) and (defense_home_gpm >= 1.3)
                     else:
                         opp_def_weak = False
 
