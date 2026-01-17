@@ -3812,7 +3812,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                     diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
 
-                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.5)
+                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
 
                     if fav_side == "home":
                         opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.3)
@@ -3825,7 +3825,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     allow_big_fav_amass = (
                         big_fav
                         and opp_def_weak
-                        and (metrics["pressure_score"] >= 6.5)
+                        and (metrics["pressure_score"] >= 7.0)
                         and (context_boost_prob >= 0.01)  # 1.0% (changed from 1.3%)
                     )
 
@@ -3834,7 +3834,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     away_super_over = _is_super_over_team(attack_away_gpm, defense_away_gpm)
                     allow_both_super_over = (
                         home_super_over and away_super_over
-                        and (metrics["pressure_score"] >= 6.5)  # changed from 7.5
+                        and (metrics["pressure_score"] >= 7.0)  # changed from 7.5
                         and (context_boost_prob >= 0.008)  # 0.8% (changed from 1.0%)
                         and (minute_int >= 50)
                     )
