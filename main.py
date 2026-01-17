@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-EvRadar PRO entrypoint (flat layout).
+EvRadar PRO - Ponto de entrada principal
 """
-from evradar_monolith import main
+import evradar_monolith
 
 if __name__ == "__main__":
-    main()
+    # Chama a função main do módulo
+    evradar_monolith.main()
