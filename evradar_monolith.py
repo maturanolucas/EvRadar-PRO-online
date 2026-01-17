@@ -3578,6 +3578,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         "context_negative": 0,
         "mandante_under_vencendo": 0,
         "linha_alta_malus": 0,
+        "weak_attack_needs_goal": 0,  # NOVO: time que precisa do gol com ataque fraco
     }
 
     if not API_FOOTBALL_KEY:
@@ -3773,7 +3774,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     context_boost_prob=context_boost_prob,
                 )
 
-                # CORTE POR GOLEADA / CONTEXTO / PERFIL UNDER/OVER
+               # CORTE POR GOLEADA / CONTEXTO / PERFIL UNDER/OVER
                 score_diff = (fx["home_goals"] or 0) - (fx["away_goals"] or 0)
                 minute_int = fx["minute"] or 0
                 try:
@@ -3789,6 +3790,24 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 if abs(score_diff) >= 3 and minute_int >= 55:
                     block_counters["goleada"] += 1
                     continue
+
+                # CORREÇÃO: Usar context_boost_prob (sem multiplicar por 100)
+                if context_boost_prob <= -0.015 and score_diff != 0 and minute_int >= 60:
+                    block_counters["context_negative"] += 1
+                    continue
+
+                # NOVO FILTRO: Time que está perdendo com ataque fraco (< 1.3 gols/jogo)
+                if minute_int >= 55:
+                    # Se o time da casa está perdendo
+                    if score_diff < 0:  # Home losing
+                        if attack_home_gpm is not None and attack_home_gpm < 1.3:
+                            block_counters["weak_attack_needs_goal"] += 1
+                            continue
+                    # Se o time visitante está perdendo  
+                    elif score_diff > 0:  # Away losing
+                        if attack_away_gpm is not None and attack_away_gpm < 1.3:
+                            block_counters["weak_attack_needs_goal"] += 1
+                            continue
 
                 # CORREÇÃO: Usar context_boost_prob (sem multiplicar por 100)
                 if context_boost_prob <= -0.015 and score_diff != 0 and minute_int >= 60:
