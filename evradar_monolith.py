@@ -2703,10 +2703,10 @@ def _allow_favorite_leading_exception(
             return False, "missing_rates"
         if float(opp_attack) < float(FAVORITE_LEAD_EXC_OPP_ATTACK_MIN):
             return False, "opp_attack_low"
-        if float(fav_def) < float(FAVORITE_LEAD_EXC_FAV_DEF_MIN):
-            return False, "fav_def_low"
-
-        return True, "opp_over_and_fav_concedes"
+      if float(fav_def) > float(FAVORITE_LEAD_EXC_FAV_DEF_MIN):
+        return False, "fav_def_too_strong"
+    
+    return True, "opp_over_and_fav_concedes"
     except Exception:
         return False, "exception_err"
 
