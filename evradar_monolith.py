@@ -15,16 +15,9 @@ CORREÇÕES APLICADAS:
 5. Bloqueio "super under + linha >= 2.5" transformado em malus em vez de bloqueio
 6. Status aprimorado com contadores de bloqueio
 
-NOVA CORREÇÃO:
+NOVAS CORREÇÕES:
 7. Bloqueio quando o time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
-
-CORREÇÃO IMPORTANTE:
-8. REMOVIDO: Gols no jogo não contribuem para o pressure_score
-   Agora o pressure_score é calculado APENAS com:
-   - Chutes totais
-   - Chutes no alvo
-   - Ataques perigosos
-   Isso evita que muitos gols inflam artificialmente o pressure_score.
+8. BLOQUEIO NOVO: quando o time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo)
 """
 
 import asyncio
@@ -157,6 +150,10 @@ BLOCK_SUPER_UNDER_LEADING: int = _get_env_int("BLOCK_SUPER_UNDER_LEADING", 1)
 # NOVO: Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
 BLOCK_WEAK_ATTACK_NEEDS_GOAL: int = _get_env_int("BLOCK_WEAK_ATTACK_NEEDS_GOAL", 1)
 WEAK_ATTACK_THRESHOLD: float = _get_env_float("WEAK_ATTACK_THRESHOLD", 1.3)
+
+# NOVO: Bloqueio quando time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo)
+BLOCK_STRONG_DEFENSE_FACING: int = _get_env_int("BLOCK_STRONG_DEFENSE_FACING", 1)
+STRONG_DEFENSE_THRESHOLD: float = _get_env_float("STRONG_DEFENSE_THRESHOLD", 1.2)
 
 
 # Cooldown e pressão mínima
@@ -2752,6 +2749,13 @@ def _is_weak_attack(attack_gpm: Optional[float]) -> bool:
         return False
     return float(attack_gpm) < float(WEAK_ATTACK_THRESHOLD)
 
+# NOVA FUNÇÃO: Verifica se time tem defesa forte
+def _is_strong_defense(defense_gpm: Optional[float]) -> bool:
+    """Verifica se o time tem defesa forte (<1.2 gols sofridos por jogo)."""
+    if defense_gpm is None:
+        return False
+    return float(defense_gpm) < float(STRONG_DEFENSE_THRESHOLD)
+
 
 def _compute_score_context_boost(
     fixture: Dict[str, Any],
@@ -3578,8 +3582,9 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     3. Melhor tratamento de filtros de empate
     4. Super under + linha alta vira malus, não bloqueio
     5. Status com contadores de bloqueio
-    6. NOVO: Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
-    7. REMOVIDO: Gols no jogo não contribuem para o pressure_score
+    6. Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
+    7. BLOQUEIO NOVO: quando time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo)
+    8. REMOVIDO: Gols no jogo não contribuem para o pressure_score
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -3595,8 +3600,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         "super_under_draw": 0,
         "no_live_data": 0,
         "under_team_no_munition": 0,
-        "weak_attack_trailing": 0,          # NOVO: time perdendo com ataque fraco
-        "weak_attack_favorite_draw": 0,     # NOVO: favorito em empate com ataque fraco
+        "weak_attack_trailing": 0,          # time perdendo com ataque fraco
+        "weak_attack_favorite_draw": 0,     # favorito em empate com ataque fraco
+        "strong_defense_facing": 0,         # NOVO: time perdendo enfrenta defesa forte
+        "strong_defense_favorite_draw": 0,  # NOVO: favorito em empate enfrenta defesa forte
         "goalfest": 0,
         "draw_filter": 0,
         "pressure_threshold": 0,
@@ -3699,7 +3706,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     home_no_ammo = _is_team_no_ammo(attack_home_gpm, defense_home_gpm)
                     away_no_ammo = _is_team_no_ammo(attack_away_gpm, defense_away_gpm)
 
-                    # NOVO: 1) Se o time que está perdendo tem ataque fraco (<1.3)
+                    # 1) Se o time que está perdendo tem ataque fraco (<1.3)
                     if BLOCK_WEAK_ATTACK_NEEDS_GOAL and (score_diff != 0) and (minute_int >= 55):
                         trailing_side = "away" if score_diff > 0 else "home"
                         trailing_attack = attack_away_gpm if trailing_side == "away" else attack_home_gpm
@@ -3707,7 +3714,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             block_counters["weak_attack_trailing"] += 1
                             continue
 
-                    # NOVO: 2) Em empates, se o favorito tem ataque fraco (<1.3)
+                    # 2) Em empates, se o favorito tem ataque fraco (<1.3)
                     if BLOCK_WEAK_ATTACK_NEEDS_GOAL and (score_diff == 0):
                         if fav_side in ("home", "away"):
                             fav_attack = attack_home_gpm if fav_side == "home" else attack_away_gpm
@@ -3715,7 +3722,25 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                                 block_counters["weak_attack_favorite_draw"] += 1
                                 continue
 
-                    # 3) Se quem está perdendo tem "pouca munição"
+                    # NOVO 3) Se o time que está perdendo enfrenta defesa forte (<1.2)
+                    if BLOCK_STRONG_DEFENSE_FACING and (score_diff != 0) and (minute_int >= 55):
+                        trailing_side = "away" if score_diff > 0 else "home"
+                        # A defesa que o time perdendo enfrenta é a defesa do time líder
+                        facing_defense = defense_home_gpm if trailing_side == "away" else defense_away_gpm
+                        if _is_strong_defense(facing_defense):
+                            block_counters["strong_defense_facing"] += 1
+                            continue
+
+                    # NOVO 4) Em empates, se o favorito enfrenta defesa forte (<1.2)
+                    if BLOCK_STRONG_DEFENSE_FACING and (score_diff == 0):
+                        if fav_side in ("home", "away"):
+                            # A defesa que o favorito enfrenta é a defesa do adversário
+                            facing_defense = defense_away_gpm if fav_side == "home" else defense_home_gpm
+                            if _is_strong_defense(facing_defense):
+                                block_counters["strong_defense_favorite_draw"] += 1
+                                continue
+
+                    # 5) Se quem está perdendo tem "pouca munição"
                     if (score_diff != 0) and (minute_int >= 55):
                         trailing_side = "away" if score_diff > 0 else "home"
                         trailing_no_ammo = away_no_ammo if trailing_side == "away" else home_no_ammo
@@ -4034,6 +4059,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Camada de jogadores (impacto): {pl}".format(pl=player_layer_status),
         "Autoscan: {auto} (intervalo {sec}s)".format(auto=autoscan_status, sec=CHECK_INTERVAL),
         "Bloqueio ataque fraco (<1.3): {w}".format(w="ligado" if BLOCK_WEAK_ATTACK_NEEDS_GOAL else "desligado"),
+        "Bloqueio defesa forte (<1.2): {w}".format(w="ligado" if BLOCK_STRONG_DEFENSE_FACING else "desligado"),
         "",
         "Comandos:",
         "  /scan   → rodar varredura agora",
@@ -4464,6 +4490,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "BLOCK_SUPER_UNDER_LEADING: {v}".format(v=BLOCK_SUPER_UNDER_LEADING),
         "BLOCK_WEAK_ATTACK_NEEDS_GOAL: {v}".format(v=BLOCK_WEAK_ATTACK_NEEDS_GOAL),
         "WEAK_ATTACK_THRESHOLD: {v}".format(v=WEAK_ATTACK_THRESHOLD),
+        "BLOCK_STRONG_DEFENSE_FACING: {v}".format(v=BLOCK_STRONG_DEFENSE_FACING),
+        "STRONG_DEFENSE_THRESHOLD: {v}".format(v=STRONG_DEFENSE_THRESHOLD),
         "BLOCK_UNDER_TRAILER_VS_SOLID_DEF: {v}".format(v=BLOCK_UNDER_TRAILER_VS_SOLID_DEF),
         "FAVORITE_RATING_THRESH: {v}".format(v=FAVORITE_RATING_THRESH),
         "FAVORITE_POWER_THRESH: {v}".format(v=FAVORITE_POWER_THRESH),
