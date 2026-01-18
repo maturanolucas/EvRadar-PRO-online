@@ -3882,12 +3882,12 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                     diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
 
-                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.65)
+                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.50)
 
                     if fav_side == "home":
-                        opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.5)
+                        opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.3)
                     elif fav_side == "away":
-                        opp_def_weak = (defense_home_gpm is not None) and (defense_home_gpm >= 1.5)
+                        opp_def_weak = (defense_home_gpm is not None) and (defense_home_gpm >= 1.3)
                     else:
                         opp_def_weak = False
 
@@ -3896,7 +3896,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         big_fav
                         and opp_def_weak
                         and (metrics["pressure_score"] >= 4.0)
-                        and (context_boost_prob >= 0.01)  # 1.0% (changed from 1.3%)
+                        and (context_boost_prob >= 0.013)  # 1.0% (changed from 1.3%)
                     )
 
                     # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over"
