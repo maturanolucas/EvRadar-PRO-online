@@ -17,6 +17,14 @@ CORREÇÕES APLICADAS:
 
 NOVA CORREÇÃO:
 7. Bloqueio quando o time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
+
+CORREÇÃO IMPORTANTE:
+8. REMOVIDO: Gols no jogo não contribuem para o pressure_score
+   Agora o pressure_score é calculado APENAS com:
+   - Chutes totais
+   - Chutes no alvo
+   - Ataques perigosos
+   Isso evita que muitos gols inflam artificialmente o pressure_score.
 """
 
 import asyncio
@@ -2854,7 +2862,7 @@ def _compute_score_context_boost(
     if fav_side == "away" and away_under and score_diff <= 0:
         boost -= 0.010
 
-    # 4) Escala por minuto (tua janela)
+    # 4) Escala por minuto (teu janela)
     if minute_int < 50:
         scale = 0.6
     elif minute_int < 60:
@@ -3202,6 +3210,12 @@ def _estimate_prob_and_odd(
     """
     CORRIGIDO: Bug do EV sem odd real.
     Se não há odd real (forced_odd_current=None), odd_current = odd_fair (EV=0).
+    
+    CORREÇÃO IMPORTANTE: REMOVIDO gols no jogo do cálculo do pressure_score.
+    Agora o pressure_score é baseado APENAS em:
+    - Chutes totais
+    - Chutes no alvo
+    - Ataques perigosos
     """
     total_goals = home_goals + away_goals
 
@@ -3242,11 +3256,7 @@ def _estimate_prob_and_odd(
     elif total_dang >= 15:
         pressure_score += 1.0
 
-    # GOLS NO JOGO
-    if total_goals >= 3:
-        pressure_score += 1.0
-    elif total_goals == 2:
-        pressure_score += 0.5
+    # REMOVIDO: GOLS NO JOGO - muitos gols são ruins para o padrão
 
     if pressure_score < 0.0:
         pressure_score = 0.0
@@ -3569,6 +3579,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     4. Super under + linha alta vira malus, não bloqueio
     5. Status com contadores de bloqueio
     6. NOVO: Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
+    7. REMOVIDO: Gols no jogo não contribuem para o pressure_score
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -4012,6 +4023,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         "MODIFICAÇÃO: Alerta de gol iminente baseado apenas em probabilidade e filtros.",
         "Odd ao vivo é opcional (busca acima de 1.47 manualmente).",
+        "",
+        "CORREÇÃO IMPORTANTE: Pressure_score NÃO inclui gols no jogo (apenas chutes e ataques).",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
