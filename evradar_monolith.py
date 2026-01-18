@@ -3896,7 +3896,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         big_fav
                         and opp_def_weak
                         and (metrics["pressure_score"] >= 4.0)
-                        and (context_boost_prob >= 0.013)  # 1.0% (changed from 1.3%)
+                        and (context_boost_prob >= 0.007)  # 1.0% (changed from 1.3%)
                     )
 
                     # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over"
