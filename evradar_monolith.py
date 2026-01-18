@@ -3895,7 +3895,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     allow_big_fav_amass = (
                         big_fav
                         and opp_def_weak
-                        and (metrics["pressure_score"] >= 5.0)
+                        and (metrics["pressure_score"] >= 4.0)
                         and (context_boost_prob >= 0.01)  # 1.0% (changed from 1.3%)
                     )
 
