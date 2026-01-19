@@ -3905,7 +3905,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     allow_both_super_over = (
                         home_super_over and away_super_over
                         and (metrics["pressure_score"] >= 7.5)  # changed from 7.5
-                        and (context_boost_prob >= 0.008)  # 0.8% (changed from 1.0%)
+                        and (context_boost_prob >= 0.012)  # 0.8% (changed from 1.0%)
                         and (minute_int >= 50)
                     )
 
