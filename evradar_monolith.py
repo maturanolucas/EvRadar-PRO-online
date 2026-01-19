@@ -142,7 +142,7 @@ BLOCK_FAVORITE_LEADING: int = _get_env_int("BLOCK_FAVORITE_LEADING", 1)
 
 # Bloqueio adicional (teu perfil): evita jogos "muito encaminhados" no 2º tempo (qualquer lado abrindo 2+ gols).
 BLOCK_LEAD_BY_2: int = _get_env_int("BLOCK_LEAD_BY_2", 1)
-LEAD_BY_2_MINUTE: int = _get_env_int("LEAD_BY_2_MINUTE", 55)
+LEAD_BY_2_MINUTE: int = _get_env_int("LEAD_BY_2_MINUTE", 50)
 
 # Se o jogo é "super under" e já tem alguém na frente, normalmente trava — bloqueia por padrão.
 BLOCK_SUPER_UNDER_LEADING: int = _get_env_int("BLOCK_SUPER_UNDER_LEADING", 1)
@@ -252,7 +252,7 @@ FAVORITE_LEAD_EXC_FAV_DEF_MIN: float = _get_env_float("FAVORITE_LEAD_EXC_FAV_DEF
 FAVORITE_LEAD_EXC_ALLOW_ONLY_LEAD1: int = _get_env_int("FAVORITE_LEAD_EXC_ALLOW_ONLY_LEAD1", 1)
 
 
-# NOVO: warmup + persistência de odds pré-live (pra não depender do /odds quando o jogo já está em 55')
+# NOVO: warmup + persistência de odds pré-live (pra não depender do /odds quando o jogo já está em 50')
 PRELIVE_CACHE_FILE: str = _get_env_str("PRELIVE_CACHE_FILE", "prelive_cache.json")
 PRELIVE_WARMUP_ENABLE: int = _get_env_int("PRELIVE_WARMUP_ENABLE", 1)
 PRELIVE_WARMUP_INTERVAL_MIN: int = _get_env_int("PRELIVE_WARMUP_INTERVAL_MIN", 30)
@@ -3166,9 +3166,9 @@ def _compute_lucas_pattern_boost(
         boost += 0.03
 
     # Janela de tempo preferida
-    if 55 <= minute_int <= 70:
+    if 50 <= minute_int <= 70:
         boost += 0.02
-    elif 47 <= minute_int < 55 or 70 < minute_int <= 80:
+    elif 47 <= minute_int < 50 or 70 < minute_int <= 80:
         boost += 0.01
 
     # Necessidade de gol vinda do contexto
@@ -3176,13 +3176,13 @@ def _compute_lucas_pattern_boost(
         boost += min(context_boost_prob * 0.5, 0.03)
 
     # Em goleadas o próprio contexto já derruba bastante
-    if abs(score_diff) >= 3 and minute_int >= 55:
+    if abs(score_diff) >= 3 and minute_int >= 50:
         boost = 0.0
 
     # Penalização para contextos claramente negativos
     if context_boost_prob < 0.0:
         context_pp = context_boost_prob * 100.0
-        if context_pp <= -2.0 and minute_int >= 55:
+        if context_pp <= -2.0 and minute_int >= 50:
             boost *= 0.2
         elif context_pp < 0.0 and minute_int >= 50:
             boost *= 0.5
@@ -3272,7 +3272,7 @@ def _estimate_prob_and_odd(
     base_prob += (pressure_score / 10.0) * 0.37
 
     # Tempo de jogo
-    if minute <= 55:
+    if minute <= 50:
         base_prob += 0.05
     elif minute <= 65:
         base_prob += 0.03
@@ -3707,7 +3707,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     away_no_ammo = _is_team_no_ammo(attack_away_gpm, defense_away_gpm)
 
                     # 1) Se o time que está perdendo tem ataque fraco (<1.3)
-                    if BLOCK_WEAK_ATTACK_NEEDS_GOAL and (score_diff != 0) and (minute_int >= 55):
+                    if BLOCK_WEAK_ATTACK_NEEDS_GOAL and (score_diff != 0) and (minute_int >= 50):
                         trailing_side = "away" if score_diff > 0 else "home"
                         trailing_attack = attack_away_gpm if trailing_side == "away" else attack_home_gpm
                         if _is_weak_attack(trailing_attack):
@@ -3723,7 +3723,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                                 continue
 
                     # NOVO 3) Se o time que está perdendo enfrenta defesa forte (<1.2)
-                    if BLOCK_STRONG_DEFENSE_FACING and (score_diff != 0) and (minute_int >= 55):
+                    if BLOCK_STRONG_DEFENSE_FACING and (score_diff != 0) and (minute_int >= 50):
                         trailing_side = "away" if score_diff > 0 else "home"
                         # A defesa que o time perdendo enfrenta é a defesa do time líder
                         facing_defense = defense_home_gpm if trailing_side == "away" else defense_away_gpm
@@ -3741,7 +3741,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                                 continue
 
                     # 5) Se quem está perdendo tem "pouca munição"
-                    if (score_diff != 0) and (minute_int >= 55):
+                    if (score_diff != 0) and (minute_int >= 50):
                         trailing_side = "away" if score_diff > 0 else "home"
                         trailing_no_ammo = away_no_ammo if trailing_side == "away" else home_no_ammo
                         if trailing_no_ammo:
@@ -3755,12 +3755,12 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                     # 1c) Bloqueio: match super under com alguém já na frente
                     match_super_under = fx.get("match_super_under", False)
-                    if BLOCK_SUPER_UNDER_LEADING and match_super_under and (minute_int >= 55) and (score_diff != 0):
+                    if BLOCK_SUPER_UNDER_LEADING and match_super_under and (minute_int >= 50) and (score_diff != 0):
                         block_counters["super_under_draw"] += 1
                         continue
 
                     # 2) Bloqueio: favorito pré-live já na frente - CORREÇÃO: usa pressure_score calculado
-                    if (score_diff != 0) and (minute_int >= 55):
+                    if (score_diff != 0) and (minute_int >= 50):
                         diff_rating = float(rating_home or 0.0) - float(rating_away or 0.0)
                         fav_side_eff = fav_side if fav_side in ("home", "away") else None
                         fav_strength_eff = int(fav_strength or 0)
@@ -3856,7 +3856,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     block_counters["mandante_under_vencendo"] += 1
                     continue
 
-                if abs(score_diff) >= 3 and minute_int >= 55:
+                if abs(score_diff) >= 3 and minute_int >= 50:
                     block_counters["goleada"] += 1
                     continue
 
@@ -3916,7 +3916,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # Filtro específico: favorito forte vencendo em casa
                 diff_rating = rating_home - rating_away
                 fav_home_clear = diff_rating >= 0.7
-                if fav_home_clear and score_diff > 0 and minute_int >= 55:
+                if fav_home_clear and score_diff > 0 and minute_int >= 50:
                     if (
                         context_boost_prob <= 0.005  # 0.5%
                         or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
@@ -4173,7 +4173,7 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ])
 
     lines.append("")
-    lines.append("Dica: isso é exatamente o que garante favorito mesmo quando o jogo entra na janela 55'.")
+    lines.append("Dica: isso é exatamente o que garante favorito mesmo quando o jogo entra na janela 50'.")
 
     msg = "\n".join(lines)
 
