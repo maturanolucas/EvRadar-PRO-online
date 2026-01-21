@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EvRadar PRO - Telegram + Cérebro v0.3-lite MODIFICADO
+EvRadar PRO - Telegram + Cérebro v0.4-lite MODIFICADO
 -----------------------------------------------------
 MODIFICAÇÃO PRINCIPAL: Não depende mais de odds ao vivo para enviar alertas.
 Mantém obtenção de odds pré-live para definir favorito, mas alertas são
 baseados apenas na probabilidade estimada e filtros.
+
+NOVAS MELHORIAS:
+1. Cálculo de gols por jogo considerando liga nacional (doméstica) de cada time
+2. Sistema de pesos por importância das ligas (Premier League > Bundesliga > etc.)
+3. Ajustes nos bloqueios para reduzir falsos positivos
+4. Melhor tratamento para confrontos internacionais (Champions, Europa League)
 
 CORREÇÕES APLICADAS:
 1. Bug do EV: quando não há odd real, EV não é forçado para +3%
@@ -14,8 +20,6 @@ CORREÇÕES APLICADAS:
 4. Filtros de empate ajustados com thresholds realistas
 5. Bloqueio "super under + linha >= 2.5" transformado em malus em vez de bloqueio
 6. Status aprimorado com contadores de bloqueio
-
-NOVAS CORREÇÕES:
 7. Bloqueio quando o time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
 8. BLOQUEIO NOVO: quando o time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo)
 """
@@ -107,6 +111,50 @@ def _parse_odds_api_league_map(raw: str) -> Dict[int, str]:
         mapping[lid] = sport_key.strip()
     return mapping
 
+def _parse_league_weights(raw: str) -> Dict[int, float]:
+    """
+    Converte string "39:1.2;140:1.1;78:1.15" em {39: 1.2, 140: 1.1, 78: 1.15}.
+    Peso padrão para ligas não listadas é 1.0.
+    """
+    mapping: Dict[int, float] = {}
+    if not raw:
+        return mapping
+    parts = raw.split(";")
+    for part in parts:
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        lid_str, weight_str = part.split(":", 1)
+        try:
+            lid = int(lid_str.strip())
+            weight = float(weight_str.strip().replace(",", "."))
+            mapping[lid] = weight
+        except (ValueError, TypeError):
+            continue
+    return mapping
+
+def _parse_team_domestic_league_map(raw: str) -> Dict[int, int]:
+    """
+    Mapeia team_id -> league_id da liga doméstica (nacional).
+    Formato: "team_id:league_id;team_id:league_id"
+    Exemplo: "33:39;34:39" (Manchester United e City -> Premier League)
+    """
+    mapping: Dict[int, int] = {}
+    if not raw:
+        return mapping
+    parts = raw.split(";")
+    for part in parts:
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        team_str, league_str = part.split(":", 1)
+        try:
+            team_id = int(team_str.strip())
+            league_id = int(league_str.strip())
+            mapping[team_id] = league_id
+        except (ValueError, TypeError):
+            continue
+    return mapping
 
 # ---------------------------------------------------------------------------
 # Variáveis de ambiente
@@ -123,7 +171,6 @@ if _chat_raw:
 
 AUTOSTART: int = _get_env_int("AUTOSTART", 0)
 CHECK_INTERVAL: int = _get_env_int("CHECK_INTERVAL", 60)
-
 
 # Timeout padrão para chamadas HTTP (segundos)
 HTTP_TIMEOUT: float = _get_env_float("HTTP_TIMEOUT", 10.0)
@@ -148,13 +195,12 @@ LEAD_BY_2_MINUTE: int = _get_env_int("LEAD_BY_2_MINUTE", 50)
 BLOCK_SUPER_UNDER_LEADING: int = _get_env_int("BLOCK_SUPER_UNDER_LEADING", 1)
 
 # NOVO: Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
-BLOCK_WEAK_ATTACK_NEEDS_GOAL: int = _get_env_int("BLOCK_WEAK_ATTACK_NEEDS_GOAL", 1)
-WEAK_ATTACK_THRESHOLD: float = _get_env_float("WEAK_ATTACK_THRESHOLD", 1.3)
+BLOCK_WEAK_ATTACK_NEEDS_GOAL: int = _get_env_int("BLOCK_WEAK_ATTACK_NEEDS_GOAL", 0)  # DESLIGADO por padrão
+WEAK_ATTACK_THRESHOLD: float = _get_env_float("WEAK_ATTACK_THRESHOLD", 1.2)  # Ajustado para 1.2
 
 # NOVO: Bloqueio quando time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo)
-BLOCK_STRONG_DEFENSE_FACING: int = _get_env_int("BLOCK_STRONG_DEFENSE_FACING", 1)
-STRONG_DEFENSE_THRESHOLD: float = _get_env_float("STRONG_DEFENSE_THRESHOLD", 1.2)
-
+BLOCK_STRONG_DEFENSE_FACING: int = _get_env_int("BLOCK_STRONG_DEFENSE_FACING", 0)  # DESLIGADO por padrão
+STRONG_DEFENSE_THRESHOLD: float = _get_env_float("STRONG_DEFENSE_THRESHOLD", 1.3)  # Ajustado para 1.3
 
 # Cooldown e pressão mínima
 COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
@@ -251,7 +297,6 @@ FAVORITE_LEAD_EXC_OPP_ATTACK_MIN: float = _get_env_float("FAVORITE_LEAD_EXC_OPP_
 FAVORITE_LEAD_EXC_FAV_DEF_MIN: float = _get_env_float("FAVORITE_LEAD_EXC_FAV_DEF_MIN", 1.50)
 FAVORITE_LEAD_EXC_ALLOW_ONLY_LEAD1: int = _get_env_int("FAVORITE_LEAD_EXC_ALLOW_ONLY_LEAD1", 1)
 
-
 # NOVO: warmup + persistência de odds pré-live (pra não depender do /odds quando o jogo já está em 50')
 PRELIVE_CACHE_FILE: str = _get_env_str("PRELIVE_CACHE_FILE", "prelive_cache.json")
 PRELIVE_WARMUP_ENABLE: int = _get_env_int("PRELIVE_WARMUP_ENABLE", 1)
@@ -277,6 +322,17 @@ SOLID_DEFENSE_MAX: float = _get_env_float("SOLID_DEFENSE_MAX", 1.30)
 HIGH_LINE_START: float = _get_env_float("HIGH_LINE_START", 3.5)
 HIGH_LINE_STEP_MALUS_PROB: float = _get_env_float("HIGH_LINE_STEP_MALUS_PROB", 0.012)
 HIGH_LINE_PRESSURE_STEP: float = _get_env_float("HIGH_LINE_PRESSURE_STEP", 1.0)
+
+# NOVO: Sistema de pesos por importância das ligas
+LEAGUE_WEIGHTS_RAW: str = _get_env_str("LEAGUE_WEIGHTS", "39:1.2;140:1.1;78:1.15;135:1.1;61:1.1;88:1.1;94:1.0;203:1.0")
+LEAGUE_WEIGHTS: Dict[int, float] = _parse_league_weights(LEAGUE_WEIGHTS_RAW)
+
+# NOVO: Mapeamento de time para liga doméstica (para confrontos internacionais)
+TEAM_DOMESTIC_LEAGUE_MAP_RAW: str = _get_env_str("TEAM_DOMESTIC_LEAGUE_MAP", "")
+TEAM_DOMESTIC_LEAGUE_MAP: Dict[int, int] = _parse_team_domestic_league_map(TEAM_DOMESTIC_LEAGUE_MAP_RAW)
+
+# NOVO: Usar estatísticas da liga doméstica para times em competições internacionais
+USE_DOMESTIC_LEAGUE_STATS: int = _get_env_int("USE_DOMESTIC_LEAGUE_STATS", 1)
 
 # ---------------------------------------------------------------------------
 # Ratings pré-jogo (manual por enquanto)
@@ -328,6 +384,9 @@ last_news_boost_cache: Dict[int, float] = {}
 # Agora também guarda attack_gpm / defense_gpm (gols feitos/sofridos por jogo).
 pregame_auto_cache: Dict[str, Dict[str, Any]] = {}
 
+# NOVO: Cache de estatísticas de liga doméstica por time (chave: "team_id:season")
+domestic_league_stats_cache: Dict[str, Dict[str, Any]] = {}
+
 # Cooldown por jogo (chave = fixture_id + placar + linha SUM_PLUS_HALF)
 # Isso faz o cooldown "pular" quando sai gol (placar muda → linha muda).
 fixture_last_alert_at: Dict[str, datetime] = {}
@@ -344,7 +403,6 @@ team_player_ratings_ts: Dict[str, datetime] = {}
 # Controle simples de consumo diário da The Odds API (aproximado, só em memória)
 oddsapi_calls_today: int = 0
 oddsapi_calls_date_key: str = ""
-
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -436,7 +494,6 @@ def _save_prelive_cache_to_file(force: bool = False) -> None:
     except Exception:
         logging.exception("Falha ao salvar PRELIVE_CACHE_FILE")
 
-
 # aliases para normalizar nome de time entre APIs
 TEAM_NAME_ALIASES: Dict[str, str] = {
     "wolverhampton wanderers": "wolverhampton",
@@ -453,8 +510,11 @@ TEAM_NAME_ALIASES: Dict[str, str] = {
     "manchester utd": "manchester united",
     "manchester city": "manchester city",
     "man city": "manchester city",
+    "sporting cp": "sporting lisbon",
+    "sporting": "sporting lisbon",
+    "sporting lisbon": "sporting lisbon",
+    "sporting clube de portugal": "sporting lisbon",
 }
-
 
 def _normalize_team_name(name: str) -> str:
     """
@@ -487,14 +547,12 @@ def _normalize_team_name(name: str) -> str:
         s = alias
     return s
 
-
 def _update_last_odd_cache(fixture_id: int, total_goals: int, odd_val: float) -> None:
     """
     Atualiza cache de odd: guarda por fixture + total de gols (linha SUM_PLUS_HALF).
     Assim não reutilizamos odd de linha antiga depois que sai gol.
     """
     last_odd_cache[fixture_id] = (total_goals, odd_val)
-
 
 def _get_cached_odd_for_line(fixture_id: int, total_goals: int) -> Optional[float]:
     """
@@ -523,27 +581,348 @@ def _cooldown_key(fixture_id: int, home_goals: int, away_goals: int) -> str:
     line = float(total_goals) + 0.5
     return f"{int(fixture_id)}:{hg}-{ag}:over{line:.1f}"
 
-
 # ---------------------------------------------------------------------------
-# Funções auxiliares do cérebro
+# Funções auxiliares do cérebro - NOVAS FUNÇÕES PARA LIGAS DOMÉSTICAS
 # ---------------------------------------------------------------------------
 
-def _safe_get_stat(stats_list: List[Dict[str, Any]], stat_type: str) -> int:
-    """Extrai um valor inteiro da lista de estatísticas da API-FOOTBALL."""
-    for item in stats_list:
-        if item.get("type") == stat_type:
-            val = item.get("value")
-            if val is None:
-                return 0
-            try:
-                return int(val)
-            except (TypeError, ValueError):
-                try:
-                    return int(float(str(val).replace(",", ".")))
-                except (TypeError, ValueError):
-                    return 0
-    return 0
+def _get_league_weight(league_id: Optional[int]) -> float:
+    """Retorna o peso da liga baseado na importância. Padrão 1.0."""
+    if league_id is None:
+        return 1.0
+    return LEAGUE_WEIGHTS.get(int(league_id), 1.0)
 
+def _get_domestic_league_for_team(team_id: Optional[int]) -> Optional[int]:
+    """Retorna o ID da liga doméstica (nacional) para um time."""
+    if team_id is None:
+        return None
+    return TEAM_DOMESTIC_LEAGUE_MAP.get(int(team_id))
+
+async def _fetch_team_domestic_stats(
+    client: httpx.AsyncClient,
+    team_id: Optional[int],
+    season: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """
+    Busca estatísticas do time na sua liga doméstica (nacional).
+    Retorna dict com attack_gpm e defense_gpm ajustados pelo peso da liga.
+    """
+    if not API_FOOTBALL_KEY or not USE_DOMESTIC_LEAGUE_STATS:
+        return None
+    
+    if team_id is None or season is None:
+        return None
+    
+    # Verifica cache
+    cache_key = f"{team_id}:{season}"
+    cached = domestic_league_stats_cache.get(cache_key)
+    if cached:
+        ts = cached.get("ts")
+        if isinstance(ts, datetime):
+            if (_now_utc() - ts) <= timedelta(hours=PREGAME_CACHE_HOURS):
+                return cached
+    
+    # Primeiro, tenta obter a liga doméstica do time
+    domestic_league_id = _get_domestic_league_for_team(team_id)
+    
+    # Se não temos mapeamento, tenta descobrir via API
+    if not domestic_league_id:
+        try:
+            headers = {"x-apisports-key": API_FOOTBALL_KEY}
+            params = {"id": team_id, "season": season}
+            
+            resp = await client.get(
+                API_FOOTBALL_BASE_URL.rstrip("/") + "/teams",
+                headers=headers,
+                params=params,
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            
+            response = data.get("response") or []
+            if response:
+                team_data = response[0]
+                leagues = team_data.get("leagues") or []
+                
+                # Procura liga do tipo "League" (nacional)
+                for league in leagues:
+                    if league.get("type", "").lower() == "league":
+                        domestic_league_id = league.get("id")
+                        break
+        
+        except Exception:
+            logging.exception("Erro ao buscar liga doméstica para team=%s", team_id)
+            domestic_league_id = None
+    
+    # Se não encontrou liga doméstica, usa padrão
+    if not domestic_league_id:
+        return None
+    
+    # Busca estatísticas na liga doméstica
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    params = {
+        "team": team_id,
+        "league": domestic_league_id,
+        "season": season,
+    }
+    
+    try:
+        resp = await client.get(
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/teams/statistics",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception(
+            "Erro ao buscar estatísticas domésticas team=%s league=%s season=%s",
+            team_id,
+            domestic_league_id,
+            season,
+        )
+        return None
+    
+    stats = data.get("response") or {}
+    if not stats:
+        return None
+    
+    # Extrai gols por jogo
+    fixtures_info = stats.get("fixtures") or {}
+    played_total = ((fixtures_info.get("played") or {}).get("total")) or 0
+    
+    goals_info = stats.get("goals") or {}
+    gf_total = (
+        ((goals_info.get("for") or {}).get("total") or {}).get("total", 0) or 0
+    )
+    ga_total = (
+        ((goals_info.get("against") or {}).get("total") or {}).get("total", 0) or 0
+    )
+    
+    try:
+        played_total_int = int(played_total or 0)
+    except Exception:
+        played_total_int = 0
+    
+    gf_per = 0.0
+    ga_per = 0.0
+    
+    if played_total_int > 0:
+        gf_per = gf_total / float(played_total_int)
+        ga_per = ga_total / float(played_total_int)
+    
+    # Aplica peso da liga
+    league_weight = _get_league_weight(domestic_league_id)
+    
+    # Times de ligas mais fortes têm seus números de ataque aumentados,
+    # enquanto times de ligas mais fracas têm seus números reduzidos
+    gf_per_adjusted = gf_per * league_weight
+    ga_per_adjusted = ga_per * league_weight
+    
+    result = {
+        "attack_gpm": gf_per_adjusted,
+        "defense_gpm": ga_per_adjusted,
+        "league_id": domestic_league_id,
+        "league_weight": league_weight,
+        "played": played_total_int,
+        "ts": _now_utc(),
+    }
+    
+    # Salva no cache
+    domestic_league_stats_cache[cache_key] = result
+    
+    return result
+
+async def _get_team_auto_rating_enhanced(
+    client: httpx.AsyncClient,
+    team_id: Optional[int],
+    current_league_id: Optional[int],  # Liga da competição atual (ex: Champions)
+    season: Optional[int],
+) -> Tuple[float, float, float]:
+    """
+    Versão melhorada: calcula rating usando liga doméstica quando aplicável.
+    Retorna: (rating, attack_gpm, defense_gpm)
+    """
+    if not API_FOOTBALL_KEY or not USE_API_PREGAME:
+        return 0.0, 0.0, 0.0
+    
+    if team_id is None or season is None:
+        return 0.0, 0.0, 0.0
+    
+    # Tenta obter estatísticas da liga doméstica primeiro
+    domestic_stats = await _fetch_team_domestic_stats(client, team_id, season)
+    
+    if domestic_stats and domestic_stats.get("played", 0) >= 5:  # Pelo menos 5 jogos
+        attack_gpm = domestic_stats["attack_gpm"]
+        defense_gpm = domestic_stats["defense_gpm"]
+        league_weight = domestic_stats["league_weight"]
+        
+        # Calcula rating com base nos gols ajustados
+        gpm = attack_gpm + defense_gpm
+        rating = 0.0
+        
+        if gpm >= 3.2:
+            rating += 1.2
+        elif gpm >= 2.8:
+            rating += 0.9
+        elif gpm >= 2.4:
+            rating += 0.6
+        elif gpm >= 2.1:
+            rating += 0.3
+        elif gpm <= 1.3:
+            rating -= 0.7
+        elif gpm <= 1.6:
+            rating -= 0.4
+        
+        # Ajuste extra baseado na força da liga
+        if league_weight > 1.1:  # Liga forte
+            rating += 0.2
+        elif league_weight < 0.9:  # Liga fraca
+            rating -= 0.1
+        
+        return rating, attack_gpm, defense_gpm
+    
+    # Fallback para método antigo (competição atual)
+    cache_key = "{lg}:{ss}:{tm}".format(lg=current_league_id, ss=season, tm=team_id)
+    now = _now_utc()
+    
+    cached = pregame_auto_cache.get(cache_key)
+    if cached:
+        ts = cached.get("ts")
+        rating_cached = float(cached.get("rating", 0.0))
+        if isinstance(ts, datetime):
+            if (now - ts) <= timedelta(hours=PREGAME_CACHE_HOURS):
+                return (
+                    rating_cached,
+                    float(cached.get("attack_gpm", 0.0)),
+                    float(cached.get("defense_gpm", 0.0)),
+                )
+    
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    params = {
+        "team": team_id,
+        "league": current_league_id,
+        "season": season,
+    }
+    
+    try:
+        resp = await client.get(
+            API_FOOTBALL_BASE_URL.rstrip("/") + "/teams/statistics",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        logging.exception(
+            "Erro ao buscar estatísticas de time team=%s league=%s season=%s",
+            team_id,
+            current_league_id,
+            season,
+        )
+        pregame_auto_cache[cache_key] = {
+            "rating": 0.0,
+            "ts": now,
+            "attack_gpm": 0.0,
+            "defense_gpm": 0.0,
+        }
+        return 0.0, 0.0, 0.0
+    
+    stats = data.get("response") or {}
+    if not stats:
+        pregame_auto_cache[cache_key] = {
+            "rating": 0.0,
+            "ts": now,
+            "attack_gpm": 0.0,
+            "defense_gpm": 0.0,
+        }
+        return 0.0, 0.0, 0.0
+    
+    rating = 0.0
+    
+    fixtures_info = stats.get("fixtures") or {}
+    played_total = ((fixtures_info.get("played") or {}).get("total")) or 0
+    
+    goals_info = stats.get("goals") or {}
+    gf_total = (
+        ((goals_info.get("for") or {}).get("total") or {}).get("total", 0) or 0
+    )
+    ga_total = (
+        ((goals_info.get("against") or {}).get("total") or {}).get("total", 0) or 0
+    )
+    
+    try:
+        played_total_int = int(played_total or 0)
+    except Exception:
+        played_total_int = 0
+    
+    gf_per = 0.0
+    ga_per = 0.0
+    gpm = 0.0
+    if played_total_int > 0:
+        gf_per = gf_total / float(played_total_int)
+        ga_per = ga_total / float(played_total_int)
+        gpm = (gf_total + ga_total) / float(played_total_int)
+    
+    # Aplica peso da liga atual
+    league_weight = _get_league_weight(current_league_id)
+    gf_per_adjusted = gf_per * league_weight
+    ga_per_adjusted = ga_per * league_weight
+    gpm_adjusted = gf_per_adjusted + ga_per_adjusted
+    
+    if gpm_adjusted >= 3.2:
+        rating += 1.2
+    elif gpm_adjusted >= 2.8:
+        rating += 0.9
+    elif gpm_adjusted >= 2.4:
+        rating += 0.6
+    elif gpm_adjusted >= 2.1:
+        rating += 0.3
+    elif gpm_adjusted <= 1.3:
+        rating -= 0.7
+    elif gpm_adjusted <= 1.6:
+        rating -= 0.4
+    
+    form_str = (stats.get("form") or "").upper()
+    if form_str:
+        form_score = 0.0
+        count_chars = 0
+        for ch in form_str:
+            if ch not in ("W", "D", "L"):
+                continue
+            count_chars += 1
+            if ch == "W":
+                form_score += 0.15
+            elif ch == "D":
+                form_score += 0.05
+            elif ch == "L":
+                form_score -= 0.15
+        
+        if count_chars > 0:
+            rating += form_score
+    
+    if played_total_int > 0:
+        if gf_per_adjusted >= 1.8 and ga_per_adjusted >= 1.0:
+            rating += 0.3
+        elif gf_per_adjusted >= 1.8 and ga_per_adjusted < 0.8:
+            rating += 0.15
+    
+    if rating > 2.0:
+        rating = 2.0
+    if rating < -2.0:
+        rating = -2.0
+    
+    pregame_auto_cache[cache_key] = {
+        "rating": rating,
+        "ts": now,
+        "attack_gpm": gf_per_adjusted,
+        "defense_gpm": ga_per_adjusted,
+        "league_weight": league_weight,
+    }
+    
+    return rating, gf_per_adjusted, ga_per_adjusted
 
 async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     """Busca jogos ao vivo na API-FOOTBALL, já filtrando por liga e janela."""
@@ -793,7 +1172,6 @@ async def _fetch_upcoming_fixtures_for_prelive(client: httpx.AsyncClient) -> Lis
     
     return unique_fixtures
 
-
 async def _run_prelive_warmup_once() -> Dict[str, Any]:
     """Roda 1 warmup: busca fixtures futuros e tenta cachear 1x2 pré-live."""
     global prelive_last_warmup_at
@@ -875,7 +1253,6 @@ async def _run_prelive_warmup_once() -> Dict[str, Any]:
 
     return summary
 
-
 async def prelive_warmup_loop(application: Application) -> None:
     """Loop em background para manter o cache pré-live aquecido."""
     logging.info("Prelive warmup loop iniciado (intervalo=%smin)", PRELIVE_WARMUP_INTERVAL_MIN)
@@ -890,6 +1267,21 @@ async def prelive_warmup_loop(application: Application) -> None:
         sleep_s = max(60, int(PRELIVE_WARMUP_INTERVAL_MIN) * 60)
         await asyncio.sleep(sleep_s)
 
+def _safe_get_stat(stats_list: List[Dict[str, Any]], stat_type: str) -> int:
+    """Extrai um valor inteiro da lista de estatísticas da API-FOOTBALL."""
+    for item in stats_list:
+        if item.get("type") == stat_type:
+            val = item.get("value")
+            if val is None:
+                return 0
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                try:
+                    return int(float(str(val).replace(",", ".")))
+                except (TypeError, ValueError):
+                    return 0
+    return 0
 
 async def _fetch_statistics_for_fixture(
     client: httpx.AsyncClient,
@@ -945,7 +1337,6 @@ async def _fetch_statistics_for_fixture(
         "home_possession": home_possession,
         "away_possession": away_possession,
     }
-
 
 async def _fetch_live_odds_for_fixture(
     client: httpx.AsyncClient,
@@ -1156,7 +1547,6 @@ async def _fetch_live_odds_for_fixture(
     )
     return None
 
-
 # ---------------------------------------------------------------------------
 # Helper para The Odds API: linha SUM_PLUS_HALF
 # ---------------------------------------------------------------------------
@@ -1267,7 +1657,6 @@ def _pick_totals_over_sum_plus_half_from_the_odds_api(
 # Favorito pré-live via odds (API-FOOTBALL /odds)
 # ---------------------------------------------------------------------------
 
-
 def _implied_probs_from_odds(
     home_odd: Optional[float],
     draw_odd: Optional[float],
@@ -1291,7 +1680,6 @@ def _implied_probs_from_odds(
     if s <= 0:
         return None
     return {"home": inv_h / s, "draw": inv_d / s, "away": inv_a / s}
-
 
 def _favorite_strength_from_prob(p_win: Optional[float]) -> int:
     """Classifica força do favorito a partir da probabilidade de vitória (0..1)."""
@@ -1320,8 +1708,6 @@ def _favorite_strength_from_prob(p_win: Optional[float]) -> int:
     if p >= light_p:
         return 1
     return 0
-
-
 
 def _favorite_strength_from_odd(odd: Optional[float]) -> int:
     """Compat: classifica força do favorito a partir do preço (odd) pré-jogo (1x2)."""
@@ -1488,7 +1874,6 @@ async def _fetch_prelive_match_winner_odds_api_football(
             logging.exception("Erro ao buscar/parsear odds pré-live (API-FOOTBALL) fixture=%s bk=%s", fixture_id, bk)
 
     return None
-
 
 async def _ensure_prelive_favorite(
     client: httpx.AsyncClient,
@@ -1881,7 +2266,6 @@ async def _fetch_live_odds_for_fixture_odds_api(
     )
     return None
 
-
 # ---------------------------------------------------------------------------
 # Camada de jogadores: lineups, eventos e ratings
 # ---------------------------------------------------------------------------
@@ -1918,7 +2302,6 @@ async def _fetch_lineups_for_fixture(
     response = data.get("response") or []
     fixture_lineups_cache[fixture_id] = response
     return response
-
 
 async def _fetch_events_for_fixture(
     client: httpx.AsyncClient,
@@ -1959,7 +2342,6 @@ async def _fetch_events_for_fixture(
     response = data.get("response") or []
     fixture_events_cache[fixture_id] = {"ts": now, "events": response}
     return response
-
 
 async def _ensure_team_player_ratings(
     client: httpx.AsyncClient,
@@ -2102,7 +2484,6 @@ async def _ensure_team_player_ratings(
     team_player_ratings_ts[key] = now
 
     return ratings
-
 
 async def _compute_player_boost_for_fixture(
     client: httpx.AsyncClient,
@@ -2292,7 +2673,6 @@ async def _compute_player_boost_for_fixture(
 
     return boost
 
-
 # ---------------------------------------------------------------------------
 # News boost (heurística simples usando NewsAPI)
 # ---------------------------------------------------------------------------
@@ -2329,7 +2709,6 @@ _NEGATIVE_KEYWORDS = [
     "heavy pitch",
     "bad weather",
 ]
-
 
 async def _fetch_news_boost_for_fixture(
     client: httpx.AsyncClient,
@@ -2416,7 +2795,6 @@ async def _fetch_news_boost_for_fixture(
     last_news_boost_cache[fixture_id] = boost
     return boost
 
-
 # ---------------------------------------------------------------------------
 # Pré-jogo boost (manual + automático + contexto de placar/favorito)
 # ---------------------------------------------------------------------------
@@ -2439,174 +2817,6 @@ def _get_pregame_boost_manual(fixture: Dict[str, Any]) -> float:
         boost = -0.02
     return boost
 
-
-async def _get_team_auto_rating(
-    client: httpx.AsyncClient,
-    team_id: Optional[int],
-    league_id: Optional[int],
-    season: Optional[int],
-) -> float:
-    """
-    Rating em [-2, +2] indicando quão "golento" o time costuma ser.
-    """
-    if not API_FOOTBALL_KEY or not USE_API_PREGAME:
-        return 0.0
-
-    if team_id is None or league_id is None or season is None:
-        return 0.0
-
-    cache_key = "{lg}:{ss}:{tm}".format(lg=league_id, ss=season, tm=team_id)
-    now = _now_utc()
-
-    cached = pregame_auto_cache.get(cache_key)
-    if cached:
-        ts = cached.get("ts")
-        rating_cached = float(cached.get("rating", 0.0))
-        if isinstance(ts, datetime):
-            if (now - ts) <= timedelta(hours=PREGAME_CACHE_HOURS):
-                return rating_cached
-
-    headers = {"x-apisports-key": API_FOOTBALL_KEY}
-    params = {
-        "team": team_id,
-        "league": league_id,
-        "season": season,
-    }
-
-    try:
-        resp = await client.get(
-            API_FOOTBALL_BASE_URL.rstrip("/") + "/teams/statistics",
-            headers=headers,
-            params=params,
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        logging.exception(
-            "Erro ao buscar estatísticas de time (pré-jogo) team=%s league=%s season=%s",
-            team_id,
-            league_id,
-            season,
-        )
-        pregame_auto_cache[cache_key] = {
-            "rating": 0.0,
-            "ts": now,
-            "attack_gpm": 0.0,
-            "defense_gpm": 0.0,
-        }
-        return 0.0
-
-    stats = data.get("response") or {}
-    if not stats:
-        pregame_auto_cache[cache_key] = {
-            "rating": 0.0,
-            "ts": now,
-            "attack_gpm": 0.0,
-            "defense_gpm": 0.0,
-        }
-        return 0.0
-
-    rating = 0.0
-
-    fixtures_info = stats.get("fixtures") or {}
-    played_total = ((fixtures_info.get("played") or {}).get("total")) or 0
-
-    goals_info = stats.get("goals") or {}
-    gf_total = (
-        ((goals_info.get("for") or {}).get("total") or {}).get("total", 0) or 0
-    )
-    ga_total = (
-        ((goals_info.get("against") or {}).get("total") or {}).get("total", 0) or 0
-    )
-
-    try:
-        played_total_int = int(played_total or 0)
-    except Exception:
-        played_total_int = 0
-
-    gf_per = 0.0
-    ga_per = 0.0
-    gpm = 0.0
-    if played_total_int > 0:
-        gf_per = gf_total / float(played_total_int)
-        ga_per = ga_total / float(played_total_int)
-        gpm = (gf_total + ga_total) / float(played_total_int)
-
-    if gpm >= 3.2:
-        rating += 1.2
-    elif gpm >= 2.8:
-        rating += 0.9
-    elif gpm >= 2.4:
-        rating += 0.6
-    elif gpm >= 2.1:
-        rating += 0.3
-    elif gpm <= 1.3:
-        rating -= 0.7
-    elif gpm <= 1.6:
-        rating -= 0.4
-
-    form_str = (stats.get("form") or "").upper()
-    if form_str:
-        form_score = 0.0
-        count_chars = 0
-        for ch in form_str:
-            if ch not in ("W", "D", "L"):
-                continue
-            count_chars += 1
-            if ch == "W":
-                form_score += 0.15
-            elif ch == "D":
-                form_score += 0.05
-            elif ch == "L":
-                form_score -= 0.15
-
-        if count_chars > 0:
-            rating += form_score
-
-    if played_total_int > 0:
-        if gf_per >= 1.8 and ga_per >= 1.0:
-            rating += 0.3
-        elif gf_per >= 1.8 and ga_per < 0.8:
-            rating += 0.15
-
-    if rating > 2.0:
-        rating = 2.0
-    if rating < -2.0:
-        rating = -2.0
-
-    pregame_auto_cache[cache_key] = {
-        "rating": rating,
-        "ts": now,
-        "attack_gpm": gf_per,
-        "defense_gpm": ga_per,
-    }
-    return rating
-
-
-def _get_team_attack_defense_from_cache(
-    team_id: Optional[int],
-    league_id: Optional[int],
-    season: Optional[int],
-) -> Tuple[float, float]:
-    """
-    Lê do cache o perfil de ataque/defesa (gols marcados/sofridos por jogo).
-    """
-    if team_id is None or league_id is None or season is None:
-        return 0.0, 0.0
-    cache_key = "{lg}:{ss}:{tm}".format(lg=league_id, ss=season, tm=team_id)
-    cached = pregame_auto_cache.get(cache_key) or {}
-    try:
-        atk = float(cached.get("attack_gpm", 0.0))
-    except (TypeError, ValueError):
-        atk = 0.0
-    try:
-        dfn = float(cached.get("defense_gpm", 0.0))
-    except (TypeError, ValueError):
-        dfn = 0.0
-    return atk, dfn
-
-
 def _is_team_under_profile(attack_gpm: float, defense_gpm: float) -> bool:
     """
     Time claramente under:
@@ -2616,7 +2826,6 @@ def _is_team_under_profile(attack_gpm: float, defense_gpm: float) -> bool:
     if attack_gpm <= 0.0 or defense_gpm < 0.0:
         return False
     return attack_gpm < 1.3 and defense_gpm < 1.3
-
 
 def _is_match_super_under(
     home_attack_gpm: float,
@@ -2631,7 +2840,6 @@ def _is_match_super_under(
         away_attack_gpm, away_defense_gpm
     )
 
-
 def _to_float(value: Any, default: float = 0.0) -> float:
     """Converte qualquer valor para float com fallback."""
     if value is None:
@@ -2640,7 +2848,6 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
 
 def _calculate_pressure_score_quick(stats: Dict[str, Any]) -> float:
     """Calcula um pressure_score simplificado para uso na exceção do favorito na frente."""
@@ -2679,7 +2886,6 @@ def _calculate_pressure_score_quick(stats: Dict[str, Any]) -> float:
         pressure_score += 1.0
 
     return pressure_score
-
 
 def _allow_favorite_leading_exception(
     fav_side: Optional[str],
@@ -2728,13 +2934,11 @@ def _has_goal_ammo(attack_gpm: Optional[float], defense_gpm: Optional[float]) ->
         return True
     return (attack_gpm >= 1.5) or (defense_gpm >= 1.5)
 
-
 def _is_team_no_ammo(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
     """Sem munição: faz <1.5 E toma <1.5."""
     if attack_gpm is None or defense_gpm is None:
         return False
     return (attack_gpm < 1.5) and (defense_gpm < 1.5)
-
 
 def _is_super_over_team(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
     """Super over: faz muito ou toma muito (>=1.8)."""
@@ -2755,7 +2959,6 @@ def _is_strong_defense(defense_gpm: Optional[float]) -> bool:
     if defense_gpm is None:
         return False
     return float(defense_gpm) < float(STRONG_DEFENSE_THRESHOLD)
-
 
 def _compute_score_context_boost(
     fixture: Dict[str, Any],
@@ -2888,7 +3091,6 @@ def _compute_score_context_boost(
 
     return boost
 
-
 def _compute_knockout_malus(
     fixture: Dict[str, Any],
     context_boost_prob: float,
@@ -2953,7 +3155,6 @@ def _compute_knockout_malus(
 
     return malus
 
-
 async def _get_pregame_boost_auto(
     client: httpx.AsyncClient,
     fixture: Dict[str, Any],
@@ -2972,16 +3173,17 @@ async def _get_pregame_boost_auto(
     if league_id is None or season is None:
         return {"rating_home": 0.0, "rating_away": 0.0, "boost": 0.0}
 
-    rating_home = await _get_team_auto_rating(
+    rating_home, attack_home_gpm, defense_home_gpm = await _get_team_auto_rating_enhanced(
         client=client,
         team_id=home_team_id,
-        league_id=league_id,
+        current_league_id=league_id,
         season=season,
     )
-    rating_away = await _get_team_auto_rating(
+    
+    rating_away, attack_away_gpm, defense_away_gpm = await _get_team_auto_rating_enhanced(
         client=client,
         team_id=away_team_id,
-        league_id=league_id,
+        current_league_id=league_id,
         season=season,
     )
 
@@ -2993,12 +3195,20 @@ async def _get_pregame_boost_auto(
     if boost < -0.02:
         boost = -0.02
 
+    # Guarda os valores no fixture para uso posterior
+    fixture["attack_home_gpm"] = attack_home_gpm
+    fixture["defense_home_gpm"] = defense_home_gpm
+    fixture["attack_away_gpm"] = attack_away_gpm
+    fixture["defense_away_gpm"] = defense_away_gpm
+    fixture["match_super_under"] = _is_match_super_under(
+        attack_home_gpm, defense_home_gpm, attack_away_gpm, defense_away_gpm
+    )
+
     return {
         "rating_home": rating_home,
         "rating_away": rating_away,
         "boost": boost,
     }
-
 
 async def _get_pregame_boost_for_fixture(
     client: httpx.AsyncClient,
@@ -3036,33 +3246,14 @@ async def _get_pregame_boost_for_fixture(
             auto_boost = float(auto_data.get("boost", 0.0))
             rating_home = float(auto_data.get("rating_home", rating_home))
             rating_away = float(auto_data.get("rating_away", rating_away))
+            
+            # Já temos os valores de attack_gpm e defense_gpm do fixture
         except Exception:
             logging.exception(
                 "Erro inesperado ao calcular pré-jogo automático para fixture=%s",
                 fixture.get("fixture_id"),
             )
             auto_boost = 0.0
-
-    # Pega perfis de ataque/defesa (gols por jogo) do cache
-    attack_home_gpm, defense_home_gpm = _get_team_attack_defense_from_cache(
-        home_team_id, league_id, season
-    )
-    attack_away_gpm, defense_away_gpm = _get_team_attack_defense_from_cache(
-        away_team_id, league_id, season
-    )
-
-    fixture["attack_home_gpm"] = attack_home_gpm
-    fixture["defense_home_gpm"] = defense_home_gpm
-    fixture["attack_away_gpm"] = attack_away_gpm
-    fixture["defense_away_gpm"] = defense_away_gpm
-
-    match_super_under = _is_match_super_under(
-        attack_home_gpm,
-        defense_home_gpm,
-        attack_away_gpm,
-        defense_away_gpm,
-    )
-    fixture["match_super_under"] = match_super_under
 
     pregame_total = manual_boost + auto_boost
     if pregame_total > 0.03:
@@ -3086,6 +3277,11 @@ async def _get_pregame_boost_for_fixture(
 
     # Ajuste do contexto pelo tipo de time (over x under)
     try:
+        attack_home_gpm = fixture.get("attack_home_gpm", 0.0)
+        defense_home_gpm = fixture.get("defense_home_gpm", 0.0)
+        attack_away_gpm = fixture.get("attack_away_gpm", 0.0)
+        defense_away_gpm = fixture.get("defense_away_gpm", 0.0)
+        
         # times claramente over (ataque forte ou defesa vazada)
         home_overish = attack_home_gpm >= 1.8 or defense_away_gpm >= 1.6
         away_overish = attack_away_gpm >= 1.8 or defense_home_gpm >= 1.6
@@ -3125,7 +3321,6 @@ async def _get_pregame_boost_for_fixture(
         context_boost = -0.05
 
     return pregame_total, context_boost, rating_home, rating_away
-
 
 # ---------------------------------------------------------------------------
 # Boost extra "padrão Lucas" (faro de gol)
@@ -3194,7 +3389,6 @@ def _compute_lucas_pattern_boost(
         boost = 0.10
 
     return boost
-
 
 # ---------------------------------------------------------------------------
 # Estimador de probabilidade / odd / EV + sugestão de stake
@@ -3334,7 +3528,6 @@ def _estimate_prob_and_odd(
         "lucas_boost_prob": lucas_boost_prob,
     }
 
-
 def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
     """
     Sugestão de stake em % da banca.
@@ -3348,7 +3541,6 @@ def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
     if ev_pct >= 1.5:
         return 1.2
     return 0.8
-
 
 def _format_alert_text(
     fixture: Dict[str, Any],
@@ -3410,7 +3602,6 @@ def _format_alert_text(
     ]
     return "\n".join(lines)
 
-
 def _format_watch_text(
     fixture: Dict[str, Any],
     metrics: Dict[str, float],
@@ -3458,7 +3649,6 @@ def _format_watch_text(
         "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
-
 
 def _format_manual_no_odds_text(
     fixture: Dict[str, Any],
@@ -3518,7 +3708,6 @@ def _format_manual_no_odds_text(
     ]
     return "\n".join(lines)
 
-
 def _format_pattern_only_text(
     fixture: Dict[str, Any],
     metrics: Dict[str, float],
@@ -3567,7 +3756,6 @@ def _format_pattern_only_text(
     ]
     return "\n".join(lines)
 
-
 # ---------------------------------------------------------------------------
 # Função principal de scan (CÉREBRO) - MODIFICADA
 # ---------------------------------------------------------------------------
@@ -3582,9 +3770,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     3. Melhor tratamento de filtros de empate
     4. Super under + linha alta vira malus, não bloqueio
     5. Status com contadores de bloqueio
-    6. Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
-    7. BLOQUEIO NOVO: quando time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo)
+    6. Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo) - DESLIGADO por padrão
+    7. BLOQUEIO NOVO: quando time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo) - DESLIGADO por padrão
     8. REMOVIDO: Gols no jogo não contribuem para o pressure_score
+    9. NOVO: Sistema de pesos por importância das ligas e estatísticas de liga doméstica
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -3600,10 +3789,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         "super_under_draw": 0,
         "no_live_data": 0,
         "under_team_no_munition": 0,
-        "weak_attack_trailing": 0,          # time perdendo com ataque fraco
-        "weak_attack_favorite_draw": 0,     # favorito em empate com ataque fraco
-        "strong_defense_facing": 0,         # NOVO: time perdendo enfrenta defesa forte
-        "strong_defense_favorite_draw": 0,  # NOVO: favorito em empate enfrenta defesa forte
+        "weak_attack_trailing": 0,
+        "weak_attack_favorite_draw": 0,
+        "strong_defense_facing": 0,
+        "strong_defense_favorite_draw": 0,
         "goalfest": 0,
         "draw_filter": 0,
         "pressure_threshold": 0,
@@ -3774,7 +3963,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                                 allow_exc, _exc_reason = _allow_favorite_leading_exception(
                                     fav_side=fav_side_eff,
                                     score_diff=score_diff,
-                                    pressure_score=pressure_score_quick,  # CORRIGIDO
+                                    pressure_score=pressure_score_quick,
                                     attack_home_gpm=attack_home_gpm,
                                     defense_home_gpm=defense_home_gpm,
                                     attack_away_gpm=attack_away_gpm,
@@ -3896,7 +4085,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         big_fav
                         and opp_def_weak
                         and (metrics["pressure_score"] >= 4.0)
-                        and (context_boost_prob >= 0.007)  # 1.0% (changed from 1.3%)
+                        and (context_boost_prob >= 0.007)
                     )
 
                     # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over"
@@ -3904,8 +4093,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     away_super_over = _is_super_over_team(attack_away_gpm, defense_away_gpm)
                     allow_both_super_over = (
                         home_super_over and away_super_over
-                        and (metrics["pressure_score"] >= 7.5)  # changed from 7.5
-                        and (context_boost_prob >= 0.012)  # 0.8% (changed from 1.0%)
+                        and (metrics["pressure_score"] >= 7.5)
+                        and (context_boost_prob >= 0.012)
                         and (minute_int >= 50)
                     )
 
@@ -3918,7 +4107,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 fav_home_clear = diff_rating >= 0.7
                 if fav_home_clear and score_diff > 0 and minute_int >= 50:
                     if (
-                        context_boost_prob <= 0.005  # 0.5%
+                        context_boost_prob <= 0.005
                         or metrics["pressure_score"] < (MIN_PRESSURE_SCORE + 2.0)
                     ):
                         block_counters["favorite_leading"] += 1
@@ -3997,7 +4186,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     block_summary = "; ".join(block_lines) if block_lines else "nenhum"
 
     last_status_text = (
-        "[EvRadar PRO] Scan concluído (origem={origin}). "
+        "[EvRadar PRO v0.4] Scan concluído (origem={origin}). "
         "Eventos ao vivo na janela/ligas: {live} | Alertas enviados: {alerts} | Bloqueios: {blocks}"
     ).format(
         origin=origin,
@@ -4008,7 +4197,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
     logging.info(last_status_text)
     return alerts
-
 
 async def autoscan_loop(application: Application) -> None:
     """Loop de autoscan em background."""
@@ -4033,7 +4221,6 @@ async def autoscan_loop(application: Application) -> None:
             logging.exception("Erro no autoscan")
         await asyncio.sleep(CHECK_INTERVAL)
 
-
 # ---------------------------------------------------------------------------
 # Handlers de comando
 # ---------------------------------------------------------------------------
@@ -4044,12 +4231,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     manual_mode_status = "ligado" if ALLOW_ALERTS_WITHOUT_ODDS else "desligado"
 
     lines = [
-        "👋 EvRadar PRO online (cérebro v0.3-lite MODIFICADO: NÃO depende de odds ao vivo).",
+        "👋 EvRadar PRO v0.4 online (cérebro v0.4-lite MODIFICADO).",
         "",
-        "MODIFICAÇÃO: Alerta de gol iminente baseado apenas em probabilidade e filtros.",
-        "Odd ao vivo é opcional (busca acima de 1.47 manualmente).",
-        "",
-        "CORREÇÃO IMPORTANTE: Pressure_score NÃO inclui gols no jogo (apenas chutes e ataques).",
+        "PRINCIPAIS MELHORIAS:",
+        "1. Sistema de pesos por importância das ligas (Premier League > Bundesliga > etc.)",
+        "2. Cálculo de gols por jogo usando liga doméstica para confrontos internacionais",
+        "3. Bloqueios de ataque fraco/defesa forte DESLIGADOS por padrão",
+        "4. Ajustes para reduzir falsos positivos (ex: Sporting x PSG)",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
@@ -4058,8 +4246,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Cooldown por jogo: {cd} min".format(cd=COOLDOWN_MINUTES),
         "Camada de jogadores (impacto): {pl}".format(pl=player_layer_status),
         "Autoscan: {auto} (intervalo {sec}s)".format(auto=autoscan_status, sec=CHECK_INTERVAL),
-        "Bloqueio ataque fraco (<1.3): {w}".format(w="ligado" if BLOCK_WEAK_ATTACK_NEEDS_GOAL else "desligado"),
-        "Bloqueio defesa forte (<1.2): {w}".format(w="ligado" if BLOCK_STRONG_DEFENSE_FACING else "desligado"),
+        "Estatísticas liga doméstica: {dom}".format(dom="ligado" if USE_DOMESTIC_LEAGUE_STATS else "desligado"),
+        "Pesos de liga configurados: {n}".format(n=len(LEAGUE_WEIGHTS)),
         "",
         "Comandos:",
         "  /scan   → rodar varredura agora",
@@ -4080,10 +4268,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logging.exception("Erro ao enviar resposta do /start")
 
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
-        "📊 Último status do EvRadar PRO (MODIFICADO):",
+        "📊 Último status do EvRadar PRO v0.4 (MODIFICADO):",
         "",
         last_status_text,
         "",
@@ -4094,6 +4281,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Alertas enviados na última varredura: {al}".format(
             al=last_scan_alerts
         ),
+        "Cache pré-live: {c} registros".format(c=len(prelive_favorite_cache)),
+        "Cache liga doméstica: {c} registros".format(c=len(domestic_league_stats_cache)),
     ]
     text = "\n".join(lines)
     try:
@@ -4103,7 +4292,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     except Exception:
         logging.exception("Erro ao enviar resposta do /status")
-
 
 async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Executa um warmup manual do cache de odds pré-live."""
@@ -4185,8 +4373,6 @@ async def cmd_prelive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         logging.exception("Erro ao responder /prelive")
 
-
-
 async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Lista rapidamente os próximos fixtures encontrados."""
     if not API_FOOTBALL_KEY:
@@ -4253,7 +4439,6 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
-        # permite /prelive_next 30 para listar mais jogos
     n_show = 12
     try:
         if context.args and str(context.args[0]).strip().isdigit():
@@ -4295,8 +4480,6 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
     except Exception:
         logging.exception("Erro ao responder /prelive_next")
-
-
 
 async def cmd_prelive_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Mostra o que está cacheado para um fixture específico."""
@@ -4391,7 +4574,6 @@ async def cmd_prelive_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception:
         logging.exception("Erro ao responder /prelive_show")
 
-
 async def cmd_prelive_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Mostra o status atual do cache pré-live."""
     _load_prelive_cache_from_file()
@@ -4433,12 +4615,11 @@ async def cmd_prelive_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         logging.exception("Erro ao responder /prelive_status")
 
-
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if update.effective_chat:
             await update.effective_chat.send_message(
-                "🔍 Iniciando varredura manual de jogos ao vivo (MODIFICADO: não depende de odds ao vivo)..."
+                "🔍 Iniciando varredura manual de jogos ao vivo (v0.4: sistema de pesos de ligas ativo)..."
             )
     except Exception:
         logging.exception("Erro ao enviar mensagem inicial do /scan")
@@ -4467,7 +4648,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logging.exception("Erro ao enviar resumo final do /scan")
 
-
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     def _mask(key: str) -> str:
         if not key:
@@ -4477,7 +4657,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return key[0:4] + "..." + key[-4:]
 
     lines = [
-        "🛠 Debug EvRadar PRO (MODIFICADO)",
+        "🛠 Debug EvRadar PRO v0.4",
         "",
         "LEAGUE_IDS: {ids}".format(ids=",".join(str(x) for x in LEAGUE_IDS) or "(nenhuma)"),
         "WINDOW_START/END: {ws}/{we}".format(ws=WINDOW_START, we=WINDOW_END),
@@ -4488,15 +4668,27 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         "BLOCK_FAVORITE_LEADING: {v}".format(v=BLOCK_FAVORITE_LEADING),
         "BLOCK_SUPER_UNDER_LEADING: {v}".format(v=BLOCK_SUPER_UNDER_LEADING),
-        "BLOCK_WEAK_ATTACK_NEEDS_GOAL: {v}".format(v=BLOCK_WEAK_ATTACK_NEEDS_GOAL),
+        "BLOCK_WEAK_ATTACK_NEEDS_GOAL: {v} (DESLIGADO por padrão)".format(v=BLOCK_WEAK_ATTACK_NEEDS_GOAL),
         "WEAK_ATTACK_THRESHOLD: {v}".format(v=WEAK_ATTACK_THRESHOLD),
-        "BLOCK_STRONG_DEFENSE_FACING: {v}".format(v=BLOCK_STRONG_DEFENSE_FACING),
+        "BLOCK_STRONG_DEFENSE_FACING: {v} (DESLIGADO por padrão)".format(v=BLOCK_STRONG_DEFENSE_FACING),
         "STRONG_DEFENSE_THRESHOLD: {v}".format(v=STRONG_DEFENSE_THRESHOLD),
         "BLOCK_UNDER_TRAILER_VS_SOLID_DEF: {v}".format(v=BLOCK_UNDER_TRAILER_VS_SOLID_DEF),
         "FAVORITE_RATING_THRESH: {v}".format(v=FAVORITE_RATING_THRESH),
         "FAVORITE_POWER_THRESH: {v}".format(v=FAVORITE_POWER_THRESH),
         "PRELIVE_CACHE_SIZE: {v}".format(v=len(prelive_favorite_cache)),
-
+        "USE_DOMESTIC_LEAGUE_STATS: {v}".format(v=USE_DOMESTIC_LEAGUE_STATS),
+        "DOMESTIC_STATS_CACHE_SIZE: {v}".format(v=len(domestic_league_stats_cache)),
+        "",
+        "PESOS DE LIGA CONFIGURADOS ({n}):".format(n=len(LEAGUE_WEIGHTS)),
+    ]
+    
+    # Mostra os pesos de liga
+    for league_id, weight in sorted(LEAGUE_WEIGHTS.items())[:10]:  # Limita a 10
+        lines.append(f"  Liga {league_id}: {weight:.2f}")
+    if len(LEAGUE_WEIGHTS) > 10:
+        lines.append(f"  ... e mais {len(LEAGUE_WEIGHTS) - 10} ligas")
+    
+    lines.extend([
         "",
         "USE_API_FOOTBALL_ODDS: {v}".format(v=USE_API_FOOTBALL_ODDS),
         "BOOKMAKER_ID: {v}".format(v=BOOKMAKER_ID),
@@ -4516,7 +4708,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "API_FOOTBALL_KEY: {v}".format(v=_mask(API_FOOTBALL_KEY)),
         "ODDS_API_KEY: {v}".format(v=_mask(ODDS_API_KEY)),
         "NEWS_API_KEY: {v}".format(v=_mask(NEWS_API_KEY)),
-    ]
+    ])
     text = "\n".join(lines)
     try:
         if update.effective_chat:
@@ -4526,10 +4718,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logging.exception("Erro ao enviar resposta do /debug")
 
-
 async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
-        "🔗 Links úteis EvRadar PRO",
+        "🔗 Links úteis EvRadar PRO v0.4",
         "",
         "Casa/base para operar:",
         "- {book}: {url}".format(book=BOOKMAKER_NAME, url=BOOKMAKER_URL),
@@ -4550,7 +4741,6 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logging.exception("Erro ao enviar resposta do /links")
 
-
 # ---------------------------------------------------------------------------
 # Setup e main
 # ---------------------------------------------------------------------------
@@ -4569,7 +4759,6 @@ async def post_init(application: Application) -> None:
     if PRELIVE_WARMUP_ENABLE and USE_PRELIVE_FAVORITE:
         asyncio.create_task(prelive_warmup_loop(application))
         logging.info("Prelive warmup loop iniciado (background).")
-
 
 def main() -> None:
     """Função principal do bot."""
@@ -4614,7 +4803,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     
     # Inicia o bot
-    logging.info("EvRadar PRO v0.3-lite MODIFICADO iniciando...")
+    logging.info("EvRadar PRO v0.4-lite MODIFICADO iniciando...")
     
     try:
         # Run polling com allowed_updates
@@ -4626,7 +4815,6 @@ def main() -> None:
         logging.info("Bot interrompido pelo usuário.")
     finally:
         logging.info("EvRadar PRO encerrado.")
-
 
 if __name__ == "__main__":
     main()
