@@ -592,6 +592,21 @@ def _get_league_weight(league_id: Optional[int]) -> float:
         return 1.0
     return LEAGUE_WEIGHTS.get(int(league_id), 1.0)
 
+
+def _adjust_gf_ga_by_league_weight(gf_per: float, ga_per: float, league_weight: float) -> Tuple[float, float]:
+    """Ajusta GF/jogo e GA/jogo por força de liga.
+
+    - Ataque (GF/jogo): multiplicado pelo peso.
+    - Defesa (GA/jogo): dividido pelo peso (liga fraca => GA ajustado sobe; liga forte => GA ajustado cai).
+    """
+    try:
+        lw = float(league_weight)
+    except Exception:
+        lw = 1.0
+    if not lw or lw <= 0:
+        lw = 1.0
+    return gf_per * lw, ga_per / lw
+
 def _get_domestic_league_for_team(team_id: Optional[int]) -> Optional[int]:
     """Retorna o ID da liga doméstica (nacional) para um time."""
     if team_id is None:
@@ -719,8 +734,7 @@ async def _fetch_team_domestic_stats(
     # Ajuste por força de liga:
     # - Ataque (GF/jogo): multiplicado pelo peso.
     # - Defesa (GA/jogo): dividido pelo peso (liga fraca => GA ajustado sobe; liga forte => GA ajustado cai).
-    gf_per_adjusted = gf_per * league_weight
-    ga_per_adjusted = (ga_per / league_weight) if (league_weight and league_weight > 0) else ga_per
+    gf_per_adjusted, ga_per_adjusted = _adjust_gf_ga_by_league_weight(gf_per, ga_per, league_weight)
     
     result = {
         "attack_gpm": gf_per_adjusted,
@@ -872,8 +886,7 @@ async def _get_team_auto_rating_enhanced(
     # - Ataque (GF/jogo): × peso
     # - Defesa (GA/jogo): ÷ peso
     league_weight = _get_league_weight(current_league_id)
-    gf_per_adjusted = gf_per * league_weight
-    ga_per_adjusted = (ga_per / league_weight) if (league_weight and league_weight > 0) else ga_per
+    gf_per_adjusted, ga_per_adjusted = _adjust_gf_ga_by_league_weight(gf_per, ga_per, league_weight)
     gpm_adjusted = gf_per_adjusted + ga_per_adjusted
     
     if gpm_adjusted >= 3.2:
