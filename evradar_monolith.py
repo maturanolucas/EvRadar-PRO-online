@@ -716,10 +716,11 @@ async def _fetch_team_domestic_stats(
     # Aplica peso da liga
     league_weight = _get_league_weight(domestic_league_id)
     
-    # Times de ligas mais fortes têm seus números de ataque aumentados,
-    # enquanto times de ligas mais fracas têm seus números reduzidos
+    # Ajuste por força de liga:
+    # - Ataque (GF/jogo): multiplicado pelo peso.
+    # - Defesa (GA/jogo): dividido pelo peso (liga fraca => GA ajustado sobe; liga forte => GA ajustado cai).
     gf_per_adjusted = gf_per * league_weight
-    ga_per_adjusted = ga_per * league_weight
+    ga_per_adjusted = (ga_per / league_weight) if (league_weight and league_weight > 0) else ga_per
     
     result = {
         "attack_gpm": gf_per_adjusted,
@@ -867,10 +868,12 @@ async def _get_team_auto_rating_enhanced(
         ga_per = ga_total / float(played_total_int)
         gpm = (gf_total + ga_total) / float(played_total_int)
     
-    # Aplica peso da liga atual
+    # Ajuste por força de liga (mesma lógica do doméstico):
+    # - Ataque (GF/jogo): × peso
+    # - Defesa (GA/jogo): ÷ peso
     league_weight = _get_league_weight(current_league_id)
     gf_per_adjusted = gf_per * league_weight
-    ga_per_adjusted = ga_per * league_weight
+    ga_per_adjusted = (ga_per / league_weight) if (league_weight and league_weight > 0) else ga_per
     gpm_adjusted = gf_per_adjusted + ga_per_adjusted
     
     if gpm_adjusted >= 3.2:
