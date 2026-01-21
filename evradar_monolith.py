@@ -188,7 +188,8 @@ ALLOW_WATCH_ALERTS: int = _get_env_int("ALLOW_WATCH_ALERTS", 0)
 BLOCK_FAVORITE_LEADING: int = _get_env_int("BLOCK_FAVORITE_LEADING", 1)
 
 # Bloqueio adicional (teu perfil): evita jogos "muito encaminhados" no 2º tempo (qualquer lado abrindo 2+ gols).
-BLOCK_LEAD_BY_2: int = _get_env_int("BLOCK_LEAD_BY_2", 1)
+# MODIFICAÇÃO: DESLIGADO por padrão (0)
+BLOCK_LEAD_BY_2: int = _get_env_int("BLOCK_LEAD_BY_2", 0)
 LEAD_BY_2_MINUTE: int = _get_env_int("LEAD_BY_2_MINUTE", 50)
 
 # Se o jogo é "super under" e já tem alguém na frente, normalmente trava — bloqueia por padrão.
@@ -3049,6 +3050,19 @@ def _compute_score_context_boost(
     else:
         boost += 0.0
 
+    # BOOST ESPECIAL: Favorito perdendo por 2+ gols (melhor cenário)
+    if fav_side in ("home", "away"):
+        if fav_side == "home" and score_diff <= -2:
+            boost += 0.08  # +8pp de boost
+            logging.info(f"Fixture {fixture.get('fixture_id')}: FAVORITO CASA perdendo por 2+ → boost +8pp")
+            if minute_int >= 60:
+                boost += 0.04  # Boost extra se for mais tarde
+        elif fav_side == "away" and score_diff >= 2:
+            boost += 0.07  # +7pp de boost
+            logging.info(f"Fixture {fixture.get('fixture_id')}: FAVORITO FORA perdendo por 2+ → boost +7pp")
+            if minute_int >= 60:
+                boost += 0.03  # Boost extra se for mais tarde
+
     # 3) Perfil under/over real via gols por jogo (munição)
     home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
     away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
@@ -3406,8 +3420,7 @@ def _estimate_prob_and_odd(
     context_boost_prob: float = 0.0,
 ) -> Dict[str, float]:
     """
-    CORRIGIDO: Bug do EV sem odd real.
-    Se não há odd real (forced_odd_current=None), odd_current = odd_fair (EV=0).
+    MODIFICAÇÃO: NÃO usar odd real - sempre usar odd_fair (EV será 0).
     
     CORREÇÃO IMPORTANTE: REMOVIDO gols no jogo do cálculo do pressure_score.
     Agora o pressure_score é baseado APENAS em:
@@ -3506,11 +3519,8 @@ def _estimate_prob_and_odd(
 
     odd_fair = 1.0 / p_final
 
-    # CORREÇÃO CRÍTICA: Se não há odd real, odd_current = odd_fair (EV=0)
-    if forced_odd_current is not None and forced_odd_current > 1.0:
-        odd_current = forced_odd_current
-    else:
-        odd_current = odd_fair  # SEM odd real, EV será 0
+    # MODIFICAÇÃO: NÃO usar odd real - sempre usar odd_fair (EV será 0)
+    odd_current = odd_fair  # SEMPRE usar odd justa
 
     ev = p_final * odd_current - 1.0
     ev_pct = ev * 100.0
@@ -3774,6 +3784,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     7. BLOQUEIO NOVO: quando time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo) - DESLIGADO por padrão
     8. REMOVIDO: Gols no jogo não contribuem para o pressure_score
     9. NOVO: Sistema de pesos por importância das ligas e estatísticas de liga doméstica
+    10. REMOVIDO: Bloqueio de 2+ gols de diferença (BLOCK_LEAD_BY_2 desligado por padrão)
     """
     global last_status_text, last_scan_origin, last_scan_alerts
     global last_scan_live_events, last_scan_window_matches
@@ -3937,10 +3948,11 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                             block_counters["under_team_no_munition"] += 1
                             continue
 
-                    # 1b) Bloqueio: jogo já muito encaminhado
-                    if BLOCK_LEAD_BY_2 and (minute_int >= LEAD_BY_2_MINUTE) and (abs(score_diff) >= 2):
-                        block_counters["goalfest"] += 1
-                        continue
+                    # MODIFICAÇÃO: REMOVIDO BLOQUEIO DE 2+ GOLS
+                    # O bloco abaixo foi REMOVIDO:
+                    # if BLOCK_LEAD_BY_2 and (minute_int >= LEAD_BY_2_MINUTE) and (abs(score_diff) >= 2):
+                    #     block_counters["goalfest"] += 1
+                    #     continue
 
                     # 1c) Bloqueio: match super under com alguém já na frente
                     match_super_under = fx.get("match_super_under", False)
@@ -4126,11 +4138,11 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     block_counters["pressure_threshold"] += 1
                     continue
 
-                # CORREÇÃO CRÍTICA: EV sem odd real = 0, não aplicar gate
-                # Apenas aplicar gate de EV se houver odd real
-                if api_odd is not None and metrics["ev_pct"] < EV_MIN_PCT:
-                    block_counters["ev_threshold"] += 1
-                    continue
+                # MODIFICAÇÃO: NÃO aplicar gate de EV (já que não temos odd real)
+                # O bloco abaixo foi REMOVIDO:
+                # if api_odd is not None and metrics["ev_pct"] < EV_MIN_PCT:
+                #     block_counters["ev_threshold"] += 1
+                #     continue
 
                 now = _now_utc()
                 fixture_id = fx["fixture_id"]
@@ -4233,11 +4245,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         "👋 EvRadar PRO v0.4 online (cérebro v0.4-lite MODIFICADO).",
         "",
-        "PRINCIPAIS MELHORIAS:",
-        "1. Sistema de pesos por importância das ligas (Premier League > Bundesliga > etc.)",
-        "2. Cálculo de gols por jogo usando liga doméstica para confrontos internacionais",
-        "3. Bloqueios de ataque fraco/defesa forte DESLIGADOS por padrão",
-        "4. Ajustes para reduzir falsos positivos (ex: Sporting x PSG)",
+        "PRINCIPAIS MODIFICAÇÕES:",
+        "1. BLOQUEIO DE 2+ GOLS DESLIGADO por padrão",
+        "2. BOOST para favorito perdendo por 2+ gols (+7-8pp)",
+        "3. NÃO depende de odds ao vivo para EV (sempre usa odd_fair)",
+        "4. Sistema de pesos por importância das ligas (Premier League > Bundesliga > etc.)",
+        "5. Cálculo de gols por jogo usando liga doméstica para confrontos internacionais",
         "",
         "Janela padrão: {ws}–{we}ʼ".format(ws=WINDOW_START, we=WINDOW_END),
         "EV mínimo: {ev:.2f}%".format(ev=EV_MIN_PCT),
@@ -4619,7 +4632,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if update.effective_chat:
             await update.effective_chat.send_message(
-                "🔍 Iniciando varredura manual de jogos ao vivo (v0.4: sistema de pesos de ligas ativo)..."
+                "🔍 Iniciando varredura manual de jogos ao vivo (v0.4: bloqueio 2+ gols DESLIGADO, boost para favorito perdendo por 2+)..."
             )
     except Exception:
         logging.exception("Erro ao enviar mensagem inicial do /scan")
@@ -4667,6 +4680,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "COOLDOWN_MINUTES: {cd}".format(cd=COOLDOWN_MINUTES),
         "",
         "BLOCK_FAVORITE_LEADING: {v}".format(v=BLOCK_FAVORITE_LEADING),
+        "BLOCK_LEAD_BY_2: {v} (DESLIGADO por padrão)".format(v=BLOCK_LEAD_BY_2),
         "BLOCK_SUPER_UNDER_LEADING: {v}".format(v=BLOCK_SUPER_UNDER_LEADING),
         "BLOCK_WEAK_ATTACK_NEEDS_GOAL: {v} (DESLIGADO por padrão)".format(v=BLOCK_WEAK_ATTACK_NEEDS_GOAL),
         "WEAK_ATTACK_THRESHOLD: {v}".format(v=WEAK_ATTACK_THRESHOLD),
