@@ -119,30 +119,6 @@ def _parse_league_weights(raw: str) -> Dict[int, float]:
     mapping: Dict[int, float] = {}
     if not raw:
         return mapping
-
-def _parse_league_gpg(raw: str) -> Dict[int, float]:
-    """
-    Converte string "39:2.90;140:2.55" em {39: 2.90, 140: 2.55}.
-    Usado para ajustar penalidade de linhas altas pela média de gols da liga (GPG).
-    """
-    mapping: Dict[int, float] = {}
-    if not raw:
-        return mapping
-    for part in raw.split(";"):
-        part = part.strip()
-        if not part or ":" not in part:
-            continue
-        lid_str, val_str = part.split(":", 1)
-        try:
-            lid = int(lid_str.strip())
-            val = float(val_str.strip())
-        except ValueError:
-            continue
-        if val <= 0:
-            continue
-        mapping[lid] = val
-    return mapping
-
     parts = raw.split(";")
     for part in parts:
         part = part.strip()
@@ -222,15 +198,24 @@ BLOCK_SUPER_UNDER_LEADING: int = _get_env_int("BLOCK_SUPER_UNDER_LEADING", 1)
 # NOVO: Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
 BLOCK_WEAK_ATTACK_NEEDS_GOAL: int = _get_env_int("BLOCK_WEAK_ATTACK_NEEDS_GOAL", 0)  # DESLIGADO por padrão
 WEAK_ATTACK_THRESHOLD: float = _get_env_float("WEAK_ATTACK_THRESHOLD", 1.2)  # Ajustado para 1.2
-NEEDS_GOAL_MIN_ATTACK_GPM: float = _get_env_float("NEEDS_GOAL_MIN_ATTACK_GPM", WEAK_ATTACK_THRESHOLD)
-NEEDS_GOAL_MIN_CONCEDE_GPM: float = _get_env_float("NEEDS_GOAL_MIN_CONCEDE_GPM", 1.50)
-BLOCK_LOW_PROFILE_NEEDS_GOAL: int = _get_env_int("BLOCK_LOW_PROFILE_NEEDS_GOAL", 1)  # substitui no_ammo hardcoded
-
 
 # NOVO: Bloqueio quando time que precisa do gol enfrenta defesa forte (<1.2 gols sofridos/jogo)
 BLOCK_STRONG_DEFENSE_FACING: int = _get_env_int("BLOCK_STRONG_DEFENSE_FACING", 0)  # DESLIGADO por padrão
 STRONG_DEFENSE_THRESHOLD: float = _get_env_float("STRONG_DEFENSE_THRESHOLD", 1.3)  # Ajustado para 1.3
-STRONG_DEF_FAV_MIN_STRENGTH: int = _get_env_int("STRONG_DEF_FAV_MIN_STRENGTH", 4)  # Em empates vs defesa forte, só libera se favorito for 4/5
+
+# Exceções Lucas-style: permitir reação vs defesa forte por tiers de força
+# (aceita env legado STRONG_DEFENSE_BLOCK_MIN_FAV_STRENGTH)
+STRONG_DEF_FAV_MIN_STRENGTH: int = _get_env_int(
+    "STRONG_DEF_FAV_MIN_STRENGTH",
+    _get_env_int("STRONG_DEFENSE_BLOCK_MIN_FAV_STRENGTH", 4),
+)
+# Abaixo deste GA/jogo, consideramos "defesa ultra forte" (exceções ficam mais rígidas)
+STRONG_DEF_EXEMPT_ULTRA_GA: float = _get_env_float("STRONG_DEF_EXEMPT_ULTRA_GA", 0.95)
+# Para força 3: libera se ataque for bem forte (menos rigor que força 2)
+STRONG_DEF_EXEMPT_S3_MIN_ATTACK_GPM: float = _get_env_float("STRONG_DEF_EXEMPT_S3_MIN_ATTACK_GPM", 1.70)
+# Para força 2: libera só com ataque muito forte
+STRONG_DEF_EXEMPT_S2_MIN_ATTACK_GPM: float = _get_env_float("STRONG_DEF_EXEMPT_S2_MIN_ATTACK_GPM", 1.85)
+
 
 # Cooldown e pressão mínima
 COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
@@ -268,16 +253,6 @@ NEWS_TIME_WINDOW_HOURS: int = _get_env_int("NEWS_TIME_WINDOW_HOURS", 24)
 USE_API_PREGAME: int = _get_env_int("USE_API_PREGAME", 0)
 PREGAME_CACHE_HOURS: int = _get_env_int("PREGAME_CACHE_HOURS", 12)
 
-
-# Forma recente (últimos N jogos) — aplica malus/boost APENAS no "need/context" (não mexe na pressão)
-FORM_USE: int = _get_env_int("FORM_USE", 0)
-FORM_LAST_N: int = _get_env_int("FORM_LAST_N", 5)
-FORM_CACHE_HOURS: int = _get_env_int("FORM_CACHE_HOURS", 6)
-FORM_K: float = _get_env_float("FORM_K", 0.12)  # intensidade do ajuste
-FORM_MIN_MULT: float = _get_env_float("FORM_MIN_MULT", 0.95)  # piso do multiplicador
-FORM_MAX_MULT: float = _get_env_float("FORM_MAX_MULT", 1.05)  # teto do multiplicador
-
-
 # Impacto de jogadores (camada nova)
 USE_PLAYER_IMPACT: int = _get_env_int("USE_PLAYER_IMPACT", 0)
 PLAYER_STATS_CACHE_HOURS: int = _get_env_int("PLAYER_STATS_CACHE_HOURS", 24)
@@ -287,12 +262,7 @@ PLAYER_SUB_TRIGGER_WINDOW: int = _get_env_int("PLAYER_SUB_TRIGGER_WINDOW", 15)
 
 # The Odds API (integração de odds ao vivo)
 ODDS_API_KEY: str = _get_env_str("ODDS_API_KEY")
-ODDS_API_USE: int = _get_env_int("ODDS_API_USE", 0)
-ALLOW_LIVE_ODDS: int = _get_env_int("ALLOW_LIVE_ODDS", 0)  # 0 = nunca buscar odds ao vivo (padrão)
-if not ALLOW_LIVE_ODDS:
-    # Blindagem: desativa TODAS as rotas de odds ao vivo, mesmo se alguma ENV antiga estiver ligada
-    USE_API_FOOTBALL_ODDS = 0
-    ODDS_API_USE = 0
+ODDS_API_USE: int = _get_env_int("ODDS_API_USE", 1)
 ODDS_API_BASE_URL: str = _get_env_str(
     "ODDS_API_BASE_URL",
     "https://api.the-odds-api.com/v4",
@@ -321,8 +291,6 @@ MANUAL_MIN_ODD_HINT: float = _get_env_float("MANUAL_MIN_ODD_HINT", 1.47)
 # NOVO: detecção de favorito via odds pré-live (API-FOOTBALL /odds)
 USE_PRELIVE_FAVORITE: int = _get_env_int("USE_PRELIVE_FAVORITE", 1)
 PRELIVE_CACHE_HOURS: int = _get_env_int("PRELIVE_CACHE_HOURS", 24)
-# NOVO: expira cache pré-live próximo ao kickoff (economiza disco e evita "fantasma")
-PRELIVE_CACHE_POST_KICKOFF_HOURS: int = _get_env_int("PRELIVE_CACHE_POST_KICKOFF_HOURS", 6)
 PRELIVE_ODDS_BOOKMAKER_ID: int = _get_env_int("PRELIVE_ODDS_BOOKMAKER_ID", 0)
 
 # Thresholds do favorito pré-jogo (1X2). Padrão por faixas:
@@ -333,25 +301,9 @@ PRELIVE_STRONG_MAX_ODD: float = _get_env_float("PRELIVE_STRONG_MAX_ODD", 1.55)
 PRELIVE_FAVORITE_MAX_ODD: float = _get_env_float("PRELIVE_FAVORITE_MAX_ODD", 1.85)
 PRELIVE_LIGHT_MAX_ODD: float = _get_env_float("PRELIVE_LIGHT_MAX_ODD", 2.15)
 
-# Se o "favorito" pré-live cair em força 0 (jogo equilibrado), exigir cenário de "jogo bom pros dois lados":
-# - ambos ataques bons
-# - ambas defesas vulneráveis
-BALANCED_MIN_ATTACK_GPM: float = _get_env_float("BALANCED_MIN_ATTACK_GPM", 1.55)
-BALANCED_MIN_CONCEDE_GPM: float = _get_env_float("BALANCED_MIN_CONCEDE_GPM", 1.35)
-BALANCED_REQUIRE_BOTH_SIDES: int = _get_env_int("BALANCED_REQUIRE_BOTH_SIDES", 1)
-
 # Bloqueio quando o favorito pré-jogo está vencendo (por padrão, de "favorito" pra cima)
 FAVORITE_BLOCK_MIN_STRENGTH: int = _get_env_int("FAVORITE_BLOCK_MIN_STRENGTH", 2)
 
-# NOVO: bloqueio duro quando o FAVORITO está na frente por 2+ gols (cenário "pior" do Lucas).
-# - Independe de exceção por pressão (não deixa escapar 2–0 / 3–1 etc.).
-# - Pode ser ajustado por ENV.
-FAVORITE_AHEAD_HARD_BLOCK_ENABLE: int = _get_env_int("FAVORITE_AHEAD_HARD_BLOCK_ENABLE", 1)
-FAVORITE_AHEAD_HARD_BLOCK_DIFF: int = _get_env_int("FAVORITE_AHEAD_HARD_BLOCK_DIFF", 2)
-FAVORITE_AHEAD_HARD_BLOCK_MINUTE: int = _get_env_int("FAVORITE_AHEAD_HARD_BLOCK_MINUTE", 50)
-FAVORITE_AHEAD_HARD_BLOCK_MIN_STRENGTH: int = _get_env_int("FAVORITE_AHEAD_HARD_BLOCK_MIN_STRENGTH", 1)
-
-# Bloqueio quando o favorito pré-jogo está vencendo (por padrão, de "favorito" pra cima)
 # Bloqueio do favorito na frente: por padrão bloqueia com 1 gol de vantagem; exceção só em cenário MUITO forte.
 FAVORITE_LEAD_BLOCK_GOALS: int = _get_env_int("FAVORITE_LEAD_BLOCK_GOALS", 1)
 FAVORITE_LEAD_EXCEPTION_ENABLE: int = _get_env_int("FAVORITE_LEAD_EXCEPTION_ENABLE", 1)
@@ -382,35 +334,9 @@ UNDER_ATTACK_MAX: float = _get_env_float("UNDER_ATTACK_MAX", 1.30)
 SOLID_DEFENSE_MAX: float = _get_env_float("SOLID_DEFENSE_MAX", 1.30)
 
 # NOVO: desconfiança progressiva em linhas altas (3.5, 4.5, 5.5...)
-
-# Filtro de empate (draw_filter) — exceções por força do favorito + pressão/contexto
-DRAW_FAV_MIN_STRENGTH: int = _get_env_int("DRAW_FAV_MIN_STRENGTH", 2)
-DRAW_MIN_PRESSURE: float = _get_env_float("DRAW_MIN_PRESSURE", 4.0)
-DRAW_MIN_CONTEXT_BOOST: float = _get_env_float("DRAW_MIN_CONTEXT_BOOST", 0.01)
-DRAW_MIN_FAV_ATTACK_GPM: float = _get_env_float("DRAW_MIN_FAV_ATTACK_GPM", 1.45)
-DRAW_T2_EXTRA_PRESSURE: float = _get_env_float("DRAW_T2_EXTRA_PRESSURE", 0.8)
-DRAW_T2_EXTRA_CONTEXT: float = _get_env_float("DRAW_T2_EXTRA_CONTEXT", 0.004)
-DRAW_T2_EXTRA_ATTACK_GPM: float = _get_env_float("DRAW_T2_EXTRA_ATTACK_GPM", 0.05)
-
-# Elite/Super favorito pressionando (dispensa defesa fraca)
-DRAW_ELITE_MIN_STRENGTH: int = _get_env_int("DRAW_ELITE_MIN_STRENGTH", 4)
-DRAW_ELITE_MIN_PRESSURE: float = _get_env_float("DRAW_ELITE_MIN_PRESSURE", 4.0)
-DRAW_ELITE_MIN_CONTEXT_BOOST: float = _get_env_float("DRAW_ELITE_MIN_CONTEXT_BOOST", 0.008)
-DRAW_ELITE_MIN_MINUTE: int = _get_env_int("DRAW_ELITE_MIN_MINUTE", 50)
-
 HIGH_LINE_START: float = _get_env_float("HIGH_LINE_START", 3.5)
 HIGH_LINE_STEP_MALUS_PROB: float = _get_env_float("HIGH_LINE_STEP_MALUS_PROB", 0.012)
 HIGH_LINE_PRESSURE_STEP: float = _get_env_float("HIGH_LINE_PRESSURE_STEP", 1.0)
-
-# NOVO: Média de gols por jogo (GPG) por liga (para calibrar linhas altas por perfil da liga)
-LEAGUE_GPG_RAW: str = _get_env_str("LEAGUE_GPG", "")
-LEAGUE_GPG: Dict[int, float] = _parse_league_gpg(LEAGUE_GPG_RAW)
-
-# NOVO: calibração da penalidade de linha alta por GPG da liga
-HIGH_LINE_USE_LEAGUE_GPG: int = _get_env_int("HIGH_LINE_USE_LEAGUE_GPG", 1)
-HIGH_LINE_BASE_GPG: float = _get_env_float("HIGH_LINE_BASE_GPG", 2.5)
-HIGH_LINE_LEAGUE_MULT_MIN: float = _get_env_float("HIGH_LINE_LEAGUE_MULT_MIN", 0.75)
-HIGH_LINE_LEAGUE_MULT_MAX: float = _get_env_float("HIGH_LINE_LEAGUE_MULT_MAX", 1.50)
 
 # NOVO: Sistema de pesos por importância das ligas
 LEAGUE_WEIGHTS_RAW: str = _get_env_str("LEAGUE_WEIGHTS", "39:1.2;140:1.1;78:1.15;135:1.1;61:1.1;88:1.1;94:1.0;203:1.0")
@@ -472,9 +398,6 @@ last_news_boost_cache: Dict[int, float] = {}
 # Cache de pré-jogo auto por time (chave: "league:season:team_id")
 # Agora também guarda attack_gpm / defense_gpm (gols feitos/sofridos por jogo).
 pregame_auto_cache: Dict[str, Dict[str, Any]] = {}
- 
-# Cache de forma recente por time (team_id -> {ts, pts, form01})
-team_form_cache: Dict[int, Dict[str, Any]] = {}
 
 # NOVO: Cache de estatísticas de liga doméstica por time (chave: "team_id:season")
 domestic_league_stats_cache: Dict[str, Dict[str, Any]] = {}
@@ -683,79 +606,11 @@ def _get_league_weight(league_id: Optional[int]) -> float:
         return 1.0
     return LEAGUE_WEIGHTS.get(int(league_id), 1.0)
 
-
-def _adjust_gf_ga_by_league_weight(gf_per: float, ga_per: float, league_weight: float) -> Tuple[float, float]:
-    """Ajusta GF/jogo e GA/jogo por força de liga.
-
-    - Ataque (GF/jogo): multiplicado pelo peso.
-    - Defesa (GA/jogo): dividido pelo peso (liga fraca => GA ajustado sobe; liga forte => GA ajustado cai).
-    """
-    try:
-        lw = float(league_weight)
-    except Exception:
-        lw = 1.0
-    if not lw or lw <= 0:
-        lw = 1.0
-    return gf_per * lw, ga_per / lw
-
 def _get_domestic_league_for_team(team_id: Optional[int]) -> Optional[int]:
     """Retorna o ID da liga doméstica (nacional) para um time."""
     if team_id is None:
         return None
     return TEAM_DOMESTIC_LEAGUE_MAP.get(int(team_id))
-
-
-def _get_effective_league_gpg(fx: Dict[str, Any]) -> Optional[float]:
-    """GPG representativo para o fixture.
-    Preferência em copas/internacionais: média dos GPG das ligas domésticas dos dois times (se disponíveis).
-    Fallback: GPG da liga do fixture (fx['league_id']).
-    """
-    try:
-        lid = int(fx.get("league_id") or 0)
-    except Exception:
-        lid = 0
-
-    if USE_DOMESTIC_LEAGUE_STATS:
-        home_tid = fx.get("home_team_id")
-        away_tid = fx.get("away_team_id")
-        home_lid = _get_domestic_league_for_team(int(home_tid)) if home_tid is not None else None
-        away_lid = _get_domestic_league_for_team(int(away_tid)) if away_tid is not None else None
-
-        vals = []
-        if home_lid is not None:
-            g = LEAGUE_GPG.get(int(home_lid))
-            if g:
-                vals.append(float(g))
-        if away_lid is not None:
-            g = LEAGUE_GPG.get(int(away_lid))
-            if g:
-                vals.append(float(g))
-        if vals:
-            return sum(vals) / float(len(vals))
-
-    if lid and lid in LEAGUE_GPG:
-        return float(LEAGUE_GPG[lid])
-    return None
-
-def _high_line_league_multiplier(league_gpg: Optional[float]) -> float:
-    """Multiplicador do malus/exigência de pressão para linhas altas, baseado no GPG da liga."""
-    if not HIGH_LINE_USE_LEAGUE_GPG:
-        return 1.0
-    if league_gpg is None:
-        return 1.0
-    try:
-        g = float(league_gpg)
-    except Exception:
-        return 1.0
-    if g <= 0:
-        return 1.0
-    base = float(HIGH_LINE_BASE_GPG) if HIGH_LINE_BASE_GPG > 0 else 2.5
-    mult = base / g
-    if mult < float(HIGH_LINE_LEAGUE_MULT_MIN):
-        mult = float(HIGH_LINE_LEAGUE_MULT_MIN)
-    if mult > float(HIGH_LINE_LEAGUE_MULT_MAX):
-        mult = float(HIGH_LINE_LEAGUE_MULT_MAX)
-    return mult
 
 async def _fetch_team_domestic_stats(
     client: httpx.AsyncClient,
@@ -878,7 +733,8 @@ async def _fetch_team_domestic_stats(
     # Ajuste por força de liga:
     # - Ataque (GF/jogo): multiplicado pelo peso.
     # - Defesa (GA/jogo): dividido pelo peso (liga fraca => GA ajustado sobe; liga forte => GA ajustado cai).
-    gf_per_adjusted, ga_per_adjusted = _adjust_gf_ga_by_league_weight(gf_per, ga_per, league_weight)
+    gf_per_adjusted = gf_per * league_weight
+    ga_per_adjusted = (ga_per / league_weight) if (league_weight and league_weight > 0) else ga_per
     
     result = {
         "attack_gpm": gf_per_adjusted,
@@ -893,123 +749,6 @@ async def _fetch_team_domestic_stats(
     domestic_league_stats_cache[cache_key] = result
     
     return result
-
-
-def _form_strength_weight(fav_strength: int) -> float:
-    """Peso do impacto da forma conforme força do favorito (0..5).
-    Favorito fraco => forma pesa mais; favorito elite => forma pesa menos.
-    """
-    try:
-        s = int(fav_strength)
-    except Exception:
-        s = 0
-    if s <= 1:
-        return 1.0
-    if s == 2:
-        return 0.9
-    if s == 3:
-        return 0.6
-    if s == 4:
-        return 0.35
-    return 0.25  # 5
-
-async def _get_team_form_points(
-    client: httpx.AsyncClient,
-    team_id: Optional[int],
-    season: Optional[int],
-    last_n: int,
-) -> Optional[Dict[str, Any]]:
-    """Retorna forma recente do time (últimos N jogos FT) via API-FOOTBALL.
-    Saída: {'pts': int, 'form01': float, 'games': int}
-    Cache em memória por FORM_CACHE_HOURS.
-    """
-    if not API_FOOTBALL_KEY or not FORM_USE:
-        return None
-    if team_id is None or season is None:
-        return None
-    try:
-        team_id_int = int(team_id)
-        season_int = int(season)
-    except (TypeError, ValueError):
-        return None
-    if team_id_int <= 0 or season_int <= 0:
-        return None
-
-    # Cache
-    cached = team_form_cache.get(team_id_int)
-    if cached:
-        ts = cached.get("ts")
-        if isinstance(ts, datetime):
-            if (_now_utc() - ts) <= timedelta(hours=FORM_CACHE_HOURS):
-                return cached
-
-    # API call
-    headers = {"x-apisports-key": API_FOOTBALL_KEY}
-    n = last_n if last_n and last_n > 0 else 5
-    if n > 10:
-        n = 10  # limita custo
-    params = {
-        "team": team_id_int,
-        "season": season_int,
-        "last": n,
-        "status": "FT",
-    }
-
-    try:
-        resp = await client.get(
-            API_FOOTBALL_BASE_URL.rstrip("/") + "/fixtures",
-            headers=headers,
-            params=params,
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return None
-
-    items = data.get("response") or []
-    if not isinstance(items, list) or not items:
-        return None
-
-    pts = 0
-    games = 0
-
-    for it in items:
-        try:
-            teams = it.get("teams") or {}
-            home = teams.get("home") or {}
-            away = teams.get("away") or {}
-            hid = int((home.get("id") or 0))
-            aid = int((away.get("id") or 0))
-            if hid != team_id_int and aid != team_id_int:
-                continue
-            winner_home = home.get("winner")
-            winner_away = away.get("winner")
-
-            # winner_* pode ser True/False/None
-            if winner_home is None or winner_away is None:
-                # empate/indefinido -> 1 ponto
-                pts += 1
-            else:
-                if hid == team_id_int and bool(winner_home):
-                    pts += 3
-                elif aid == team_id_int and bool(winner_away):
-                    pts += 3
-                else:
-                    pts += 0
-            games += 1
-        except Exception:
-            continue
-
-    if games <= 0:
-        return None
-
-    denom = float(3 * games)
-    form01 = float(pts) / denom if denom > 0 else 0.0
-    out = {"ts": _now_utc(), "pts": int(pts), "form01": float(form01), "games": int(games)}
-    team_form_cache[team_id_int] = out
-    return out
-
 
 async def _get_team_auto_rating_enhanced(
     client: httpx.AsyncClient,
@@ -1147,7 +886,8 @@ async def _get_team_auto_rating_enhanced(
     # - Ataque (GF/jogo): × peso
     # - Defesa (GA/jogo): ÷ peso
     league_weight = _get_league_weight(current_league_id)
-    gf_per_adjusted, ga_per_adjusted = _adjust_gf_ga_by_league_weight(gf_per, ga_per, league_weight)
+    gf_per_adjusted = gf_per * league_weight
+    ga_per_adjusted = (ga_per / league_weight) if (league_weight and league_weight > 0) else ga_per
     gpm_adjusted = gf_per_adjusted + ga_per_adjusted
     
     if gpm_adjusted >= 3.2:
@@ -1299,7 +1039,6 @@ async def _fetch_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]
                     "fixture_id": int(fixture.get("id")),
                     "league_id": league_id,
                     "league_name": league.get("name") or "",
-                    "league_country": league.get("country") or "",
                     "league_type": league_type,
                     "league_round": league_round,
                     "season": season,
@@ -1415,7 +1154,6 @@ async def _fetch_upcoming_fixtures_for_prelive(client: httpx.AsyncClient) -> Lis
                         "fixture_id": int(fixture.get("id")),
                         "league_id": league_id,
                         "league_name": league.get("name") or "",
-                    "league_country": league.get("country") or "",
                         "season": league.get("season"),
                         "status_short": short,
                         "minute": 0,
@@ -1626,9 +1364,6 @@ async def _fetch_live_odds_for_fixture(
     """
     Busca odd em tempo real na API-FOOTBALL para a linha de gols do jogo.
     """
-    if not ALLOW_LIVE_ODDS:
-        return None
-
     if not API_FOOTBALL_KEY or not USE_API_FOOTBALL_ODDS:
         return None
 
@@ -1982,9 +1717,6 @@ def _favorite_strength_from_prob(p_win: Optional[float]) -> int:
     fav_p = 1.0 / float(PRELIVE_FAVORITE_MAX_ODD) if PRELIVE_FAVORITE_MAX_ODD else 1.0
     light_p = 1.0 / float(PRELIVE_LIGHT_MAX_ODD) if PRELIVE_LIGHT_MAX_ODD else 1.0
 
-    # 0..5 (inclui ELITE=5)
-    if p >= elite_p:
-        return 5
     if p >= super_p:
         return 4
     if p >= strong_p:
@@ -2176,31 +1908,15 @@ async def _ensure_prelive_favorite(
         return
 
     now = _now_utc()
-
-    # TTL dinâmico do cache: se tivermos kickoff_ts, mantém até (kickoff + Xh). Senão, fallback em PRELIVE_CACHE_HOURS.
-    kickoff_ts = fixture.get("kickoff_ts")
-    try:
-        if kickoff_ts:
-            expires_at_ts = int(kickoff_ts) + int(PRELIVE_CACHE_POST_KICKOFF_HOURS) * 3600
-        else:
-            expires_at_ts = int(now.timestamp()) + int(PRELIVE_CACHE_HOURS) * 3600
-    except Exception:
-        expires_at_ts = int(now.timestamp()) + int(PRELIVE_CACHE_HOURS) * 3600
-
     cached = prelive_favorite_cache.get(fixture_id)
     if cached:
         ts = cached.get("ts")
         if isinstance(ts, datetime):
             # cache positivo dura horas; cache negativo (sem favorite_side) expira rápido pra re-tentar
-            expires_at_ts = cached.get("expires_at_ts")
-            if isinstance(expires_at_ts, (int, float)):
-                valid = (_now_utc().timestamp() <= float(expires_at_ts))
+            if cached.get("favorite_side") in ("home", "away"):
+                valid = (now - ts) <= timedelta(hours=PRELIVE_CACHE_HOURS)
             else:
-                # fallback antigo: janela fixa por tipo (positivo vs negativo)
-                if cached.get("favorite_side") in ("home", "away"):
-                    valid = (now - ts) <= timedelta(hours=PRELIVE_CACHE_HOURS)
-                else:
-                    valid = (now - ts) <= timedelta(minutes=PRELIVE_NEGATIVE_TTL_MIN)
+                valid = (now - ts) <= timedelta(minutes=PRELIVE_NEGATIVE_TTL_MIN)
             if valid:
                 for k, v in cached.items():
                     if k != "ts":
@@ -2218,7 +1934,6 @@ async def _ensure_prelive_favorite(
             "ts": now,
             "league_id": fixture.get("league_id"),
             "kickoff_ts": fixture.get("kickoff_ts"),
-        "expires_at_ts": expires_at_ts,
             "home_team": home_team,
             "away_team": away_team,
             "prelive_home_team": home_team,
@@ -2260,19 +1975,10 @@ async def _ensure_prelive_favorite(
         fav_prob = probs.get(fav_side)
     fav_strength = _favorite_strength_from_prob(fav_prob)
 
-    # Clamp final: se a odd do favorito é maior que o limite de "leve favorito", força deve ser 0
-    try:
-        if fav_odd is not None and float(fav_odd) > float(PRELIVE_LIGHT_MAX_ODD):
-            fav_strength = 0
-    except Exception:
-        pass
-
-
     cache_payload: Dict[str, Any] = {
         "ts": now,
         "league_id": fixture.get("league_id"),
         "kickoff_ts": fixture.get("kickoff_ts"),
-        "expires_at_ts": expires_at_ts,
         "home_team": home_team,
         "away_team": away_team,
         "prelive_home_team": home_team,
@@ -2309,9 +2015,6 @@ async def _fetch_live_odds_for_fixture_odds_api(
     """
     Busca odd em tempo real via The Odds API para a linha Over (soma do placar + 0,5).
     """
-    if not ALLOW_LIVE_ODDS:
-        return None
-
     if not ODDS_API_KEY or not ODDS_API_USE:
         return None
 
@@ -3249,23 +2952,11 @@ def _has_goal_ammo(attack_gpm: Optional[float], defense_gpm: Optional[float]) ->
         return True
     return (attack_gpm >= 1.5) or (defense_gpm >= 1.5)
 
-def _is_team_low_profile_needs_goal(attack_gpm: Optional[float], concede_gpm: Optional[float]) -> bool:
-    """Perfil fraco/under para "precisa de gol": ataque baixo E concede pouco (tende a "não ter munição").
-
-    Regras (tudo já deve vir AJUSTADO pelo LEAGUE_WEIGHT):
-      - attack_gpm < NEEDS_GOAL_MIN_ATTACK_GPM
-      - concede_gpm < NEEDS_GOAL_MIN_CONCEDE_GPM
-
-    Se BLOCK_LOW_PROFILE_NEEDS_GOAL=0, nunca bloqueia por este motivo.
-    """
-    if not BLOCK_LOW_PROFILE_NEEDS_GOAL:
+def _is_team_no_ammo(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
+    """Sem munição: faz <1.5 E toma <1.5."""
+    if attack_gpm is None or defense_gpm is None:
         return False
-    if attack_gpm is None or concede_gpm is None:
-        return False
-    try:
-        return (float(attack_gpm) < float(NEEDS_GOAL_MIN_ATTACK_GPM)) and (float(concede_gpm) < float(NEEDS_GOAL_MIN_CONCEDE_GPM))
-    except Exception:
-        return False
+    return (attack_gpm < 1.5) and (defense_gpm < 1.5)
 
 def _is_super_over_team(attack_gpm: Optional[float], defense_gpm: Optional[float]) -> bool:
     """Super over: faz muito ou toma muito (>=1.8)."""
@@ -3288,42 +2979,40 @@ def _is_strong_defense(defense_gpm: Optional[float]) -> bool:
     return float(defense_gpm) < float(STRONG_DEFENSE_THRESHOLD)
 
 
-def _balanced_strength0_gate(
+def _strong_defense_exempt(
     fav_strength: int,
-    attack_home_gpm: Optional[float],
-    attack_away_gpm: Optional[float],
-    defense_home_gpm: Optional[float],
-    defense_away_gpm: Optional[float],
-) -> Tuple[bool, str]:
-    """Quando o 'favorito' é força 0 (jogo equilibrado), só permite sinal se o jogo tiver perfil realmente bom pros dois lados.
+    fav_attack_gpm: float,
+    facing_defense_gpm: float,
+) -> bool:
+    """Exceções para não bloquear automaticamente quando enfrenta defesa forte.
 
-    Regras (Lucas):
-    - exigir que os DOIS ataques sejam bons
-    - exigir que as DUAS defesas sejam vulneráveis (ruins)
+    Regras (Lucas-style):
+    - Força >= STRONG_DEF_FAV_MIN_STRENGTH: libera mais facilmente.
+    - Força 3: libera se ataque for bem forte e a defesa não for "ultra".
+    - Força 2: libera com mais rigor (ataque ainda mais forte) e defesa não "ultra".
     """
-    if int(fav_strength or 0) != 0:
-        return True, ""
-    if not BALANCED_REQUIRE_BOTH_SIDES:
-        return True, ""
     try:
-        ah = float(attack_home_gpm) if attack_home_gpm is not None else None
-        aa = float(attack_away_gpm) if attack_away_gpm is not None else None
-        dh = float(defense_home_gpm) if defense_home_gpm is not None else None
-        da = float(defense_away_gpm) if defense_away_gpm is not None else None
-    except Exception:
-        return False, "balanced_strength0:bad_stats"
+        s = int(fav_strength)
+    except (TypeError, ValueError):
+        s = 0
 
-    if ah is None or aa is None or dh is None or da is None:
-        return False, "balanced_strength0:no_stats"
+    a = float(fav_attack_gpm or 0.0)
+    d = float(facing_defense_gpm or 0.0)
 
-    if ah < float(BALANCED_MIN_ATTACK_GPM) or aa < float(BALANCED_MIN_ATTACK_GPM):
-        return False, f"balanced_strength0:attack<{BALANCED_MIN_ATTACK_GPM:.2f}"
+    if s >= int(STRONG_DEF_FAV_MIN_STRENGTH):
+        return True
 
-    # defense_gpm aqui é 'gols sofridos por jogo' (quanto MAIOR, mais fraca/vulnerável)
-    if dh < float(BALANCED_MIN_CONCEDE_GPM) or da < float(BALANCED_MIN_CONCEDE_GPM):
-        return False, f"balanced_strength0:defense<{BALANCED_MIN_CONCEDE_GPM:.2f}"
+    # Se a defesa é ultra forte, só liberamos a partir do tier SUPER/ELITE
+    if d < float(STRONG_DEF_EXEMPT_ULTRA_GA):
+        return False
 
-    return True, ""
+    if s >= 3:
+        return a >= float(STRONG_DEF_EXEMPT_S3_MIN_ATTACK_GPM)
+
+    if s >= 2:
+        return a >= float(STRONG_DEF_EXEMPT_S2_MIN_ATTACK_GPM)
+
+    return False
 
 def _compute_score_context_boost(
     fixture: Dict[str, Any],
@@ -3356,10 +3045,6 @@ def _compute_score_context_boost(
         fav_strength = int(fixture.get("favorite_strength") or 0)
     except (TypeError, ValueError):
         fav_strength = 0
-
-    # Se a força do "favorito" é 0, tratar como jogo equilibrado: NÃO aplicar boosts baseados em favorito
-    if int(fav_strength or 0) <= 0:
-        fav_side = None
 
     # Pegar perfis de ataque/defesa
     attack_home_gpm = fixture.get("attack_home_gpm")
@@ -3418,60 +3103,20 @@ def _compute_score_context_boost(
     else:
         boost += 0.0
 
-
-    # BOOST PROGRESSIVO: Favorito perdendo por 1 gol (desde força 1)
-    # Ideia Lucas-style: força 1 já empurra, mas em tier menor; força maior empurra mais.
+    # BOOST ESPECIAL: Favorito perdendo por 2+ gols (melhor cenário)
     if fav_side in ("home", "away"):
-        try:
-            st = int(fav_strength or 0)
-        except (TypeError, ValueError):
-            st = 0
-        st = max(0, min(5, st))
-        tier_map = {1: 0.010, 2: 0.016, 3: 0.022, 4: 0.030, 5: 0.038}
-        tier = tier_map.get(st, 0.0)
-
-        losing_by_1 = ((fav_side == "home" and score_diff == -1) or (fav_side == "away" and score_diff == 1))
-        if losing_by_1 and tier > 0.0:
-            boost += tier
-            # Extra leve no fim do jogo (sem exagerar pra não abrir torneira)
+        if fav_side == "home" and score_diff <= -2:
+            boost += 0.08  # +8pp de boost
+            logging.info(f"Fixture {fixture.get('fixture_id')}: FAVORITO CASA perdendo por 2+ → boost +8pp")
             if minute_int >= 60:
-                boost += 0.004
-            if minute_int >= 70:
-                boost += 0.003
-            logging.info(
-                f"Fixture {fixture.get('fixture_id')}: FAVORITO {fav_side.upper()} perdendo por 1 (força={st}) → boost +{tier*100:.1f}pp"
-            )    # BOOST (progressivo): Favorito perdendo por 2+ gols
-    # Ideia: seguir a mesma filosofia do "perdendo por 1", porém com um empurrão um pouco maior,
-    # sem ficar engessado em um valor fixo.
-    if fav_side in ("home", "away"):
-        if fav_side == "home":
-            deficit = max(0, -score_diff)  # score_diff = home - away
-        else:
-            deficit = max(0, score_diff)
-
-        if deficit >= 2:
-            # Incremento base: 2 gols atrás = +4pp; 3 gols = +7pp; 4+ = cap em +10pp
-            inc = min(0.04 + 0.03 * (deficit - 2), 0.10)
-
-            # Leve progressão pelo relógio (maior urgência)
+                boost += 0.04  # Boost extra se for mais tarde
+        elif fav_side == "away" and score_diff >= 2:
+            boost += 0.07  # +7pp de boost
+            logging.info(f"Fixture {fixture.get('fixture_id')}: FAVORITO FORA perdendo por 2+ → boost +7pp")
             if minute_int >= 60:
-                inc += 0.01
-            if minute_int >= 70:
-                inc += 0.01
-
-            # Muito tarde para buscar 2–3 gols: reduz o efeito (evita falso positivo no fim)
-            if minute_int >= 82:
-                inc *= 0.35
-            elif minute_int >= 78:
-                inc *= 0.55
-
-            boost += inc
-            logging.info(
-                f"Fixture {fixture.get('fixture_id')}: FAVORITO {fav_side.upper()} perdendo por {deficit} → boost +{inc*100:.1f}pp (progressivo)"
-            )
+                boost += 0.03  # Boost extra se for mais tarde
 
     # 3) Perfil under/over real via gols por jogo (munição)
-
     home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
     away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
@@ -3792,17 +3437,9 @@ def _compute_lucas_pattern_boost(
     if context_boost_prob > 0.0:
         boost += min(context_boost_prob * 0.5, 0.03)
 
-    # Em goleadas, reduzir (não zerar) o boost: ainda pode haver reação no meio do 2º tempo,
-    # mas perto do fim costuma "morrer" (evita falso positivo).
+    # Em goleadas o próprio contexto já derruba bastante
     if abs(score_diff) >= 3 and minute_int >= 50:
-        if minute_int >= 82:
-            boost = 0.0
-        elif minute_int >= 76:
-            boost *= 0.25
-        elif minute_int >= 68:
-            boost *= 0.45
-        else:
-            boost *= 0.65
+        boost = 0.0
 
     # Penalização para contextos claramente negativos
     if context_boost_prob < 0.0:
@@ -3834,7 +3471,6 @@ def _estimate_prob_and_odd(
     pregame_boost_prob: float = 0.0,
     player_boost_prob: float = 0.0,
     context_boost_prob: float = 0.0,
-    league_gpg: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     MODIFICAÇÃO: NÃO usar odd real - sempre usar odd_fair (EV será 0).
@@ -3930,8 +3566,7 @@ def _estimate_prob_and_odd(
     if linha_gols >= HIGH_LINE_START:
         steps_high = int((linha_gols - 2.5) // 1.0)
         if steps_high > 0:
-            hl_mult = _high_line_league_multiplier(league_gpg)
-            base_prob -= steps_high * float(HIGH_LINE_STEP_MALUS_PROB) * hl_mult
+            base_prob -= steps_high * float(HIGH_LINE_STEP_MALUS_PROB)
 
     p_final = max(0.20, min(0.93, base_prob))
 
@@ -3954,7 +3589,6 @@ def _estimate_prob_and_odd(
         "player_boost_prob": player_boost_prob,
         "context_boost_prob": context_boost_prob,
         "lucas_boost_prob": lucas_boost_prob,
-        "high_line_mult": _high_line_league_multiplier(league_gpg),
     }
 
 def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
@@ -4021,11 +3655,13 @@ def _format_alert_text(
     nota = " / ".join(nota_parts)
 
     lines = [
-        "🚨Alerta de gol",
-        "",
         "🏟️ {jogo}".format(jogo=jogo),
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
         "⚙️ Linha: {linha}".format(linha=linha_str),
+        "📊 Probabilidade: {p:.1f}%".format(p=p_final),
+        "🎯 EV estimado: {ev:.1f}%".format(ev=ev_pct),
+        "💰 Sugestão de stake: {stake:.1f}%".format(stake=stake_pct),
+        "🧩 Nota: {nota}".format(nota=nota),
     ]
     return "\n".join(lines)
 
@@ -4067,19 +3703,14 @@ def _format_watch_text(
     nota = " / ".join(nota_parts)
 
     lines = [
-
-        "🚨Alerta de gol",
-
-        "",
-
+        "👀 Observação de gol",
         "🏟️ {jogo}".format(jogo=jogo),
-
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
-
         "⚙️ Linha: {linha}".format(linha=linha_str),
-
+        "📊 Probabilidade: {p:.1f}%".format(p=p_final),
+        "🎯 EV estimado: {ev:.1f}%".format(ev=ev_pct),
+        "🧩 Nota: {nota}".format(nota=nota),
     ]
-
     return "\n".join(lines)
 
 def _format_manual_no_odds_text(
@@ -4127,20 +3758,17 @@ def _format_manual_no_odds_text(
 
     nota = " / ".join(nota_parts)
 
-    lines = [
-
-        "🚨Alerta de gol",
-
-        "",
-
+    lines: List[str] = [
+        "⚠️ Observação (dados incompletos)",
         "🏟️ {jogo}".format(jogo=jogo),
-
         "⏱️ {minuto}' | 🔢 {placar}".format(minuto=minuto, placar=placar),
-
-        "⚙️ Linha: {linha}".format(linha=linha_str),
-
+        "⚙️ Linha sugerida: {linha}".format(linha=linha_str),
+        "📊 Probabilidade do modelo: {p:.1f}% | Odd justa: {odd_j:.2f}".format(
+            p=p_final,
+            odd_j=odd_fair,
+        ),
+        "🧩 Nota: {nota}".format(nota=nota),
     ]
-
     return "\n".join(lines)
 
 def _format_pattern_only_text(
@@ -4222,13 +3850,11 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
     # Inicializar contadores de bloqueio
     block_counters = {
         "favorite_leading": 0,
-        "favorite_ahead_hard": 0,
         "super_under_draw": 0,
         "no_live_data": 0,
         "under_team_no_munition": 0,
         "weak_attack_trailing": 0,
         "weak_attack_favorite_draw": 0,
-        "balanced_strength0": 0,
         "strong_defense_facing": 0,
         "strong_defense_favorite_draw": 0,
         "goalfest": 0,
@@ -4241,11 +3867,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         "context_negative": 0,
         "mandante_under_vencendo": 0,
         "linha_alta_malus": 0,
-        
     }
-
-    # Contador de ajustes (não é bloqueio): forma recente
-    form_adjustments = 0
 
     if not API_FOOTBALL_KEY:
         last_status_text = (
@@ -4280,8 +3902,17 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 except (TypeError, ValueError):
                     minute_int = 0
 
-                # Odds ao vivo removidas do ciclo de scan (usa apenas PRE-LIVE p/ favorito)
+                # Tenta obter odds ao vivo
                 api_odd: Optional[float] = None
+                try:
+                    api_odd = await _fetch_live_odds_for_fixture(
+                        client=client,
+                        fixture_id=fx["fixture_id"],
+                        total_goals=total_goals,
+                    )
+                except Exception:
+                    pass
+
                 # Boosts que não dependem de odd
                 news_boost_prob = 0.0
                 try:
@@ -4325,67 +3956,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     attack_away_gpm = _to_float(fx.get("attack_away_gpm", fx.get("away_attack_gpm", 0.0)), 0.0)
                     defense_away_gpm = _to_float(fx.get("defense_away_gpm", fx.get("away_defense_gpm", 0.0)), 0.0)
 
-                    home_low_profile = _is_team_low_profile_needs_goal(attack_home_gpm, defense_home_gpm)
-                    away_low_profile = _is_team_low_profile_needs_goal(attack_away_gpm, defense_away_gpm)
-
-
-                    # Forma recente
-                    # NOVO (Lucas): se o "favorito" é força 0 (jogo equilibrado), só considerar sinal se o jogo for bom pros dois lados
-                    ok_bal0, bal0_reason = _balanced_strength0_gate(
-                        fav_strength, attack_home_gpm, attack_away_gpm, defense_home_gpm, defense_away_gpm
-                    )
-                    if not ok_bal0:
-                        block_counters["balanced_strength0"] += 1
-                        continue
-
-                    # Forma recente (malus/boost) — aplica SOMENTE nos boosts de contexto/need (pregame/context)
-                    # Isso reduz sinais de favorito fraco em má fase (ex.: Utrecht @2.00), sem mexer na pressão ao vivo.
-                    try:
-                        if FORM_USE:
-                            fav_side = fx.get("favorite_side")
-                            try:
-                                fav_strength_int = int(fx.get("favorite_strength") or 0)
-                            except (TypeError, ValueError):
-                                fav_strength_int = 0
-                            fav_team_id = None
-                            if fav_side == "home":
-                                fav_team_id = fx.get("home_team_id")
-                            elif fav_side == "away":
-                                fav_team_id = fx.get("away_team_id")
-
-                            form_last_n = int(FORM_LAST_N) if FORM_LAST_N else 5
-                            if form_last_n <= 0:
-                                form_last_n = 5
-
-                            form_obj = await _get_team_form_points(
-                                client=client,
-                                team_id=fav_team_id,
-                                season=fx.get("season"),
-                                last_n=form_last_n,
-                            )
-
-                            if form_obj and isinstance(form_obj, dict):
-                                form01 = _to_float(form_obj.get("form01"), None)
-                                if form01 is not None:
-                                    delta = form01 - 0.50  # neutro em 0.50
-                                    w = _form_strength_weight(fav_strength_int)
-                                    mult = 1.0 + (delta * float(FORM_K) * float(w))
-
-                                    # clamp
-                                    if mult < float(FORM_MIN_MULT):
-                                        mult = float(FORM_MIN_MULT)
-                                    if mult > float(FORM_MAX_MULT):
-                                        mult = float(FORM_MAX_MULT)
-
-                                    if abs(mult - 1.0) >= 0.01:
-                                        pregame_boost_prob *= mult
-                                        context_boost_prob *= mult
-                                        form_adjustments += 1
-                                        fx["form_mult"] = float(mult)
-                                        fx["form01"] = float(form01)
-                    except Exception:
-                        pass
-
+                    home_no_ammo = _is_team_no_ammo(attack_home_gpm, defense_home_gpm)
+                    away_no_ammo = _is_team_no_ammo(attack_away_gpm, defense_away_gpm)
 
                     # 1) Se o time que está perdendo tem ataque fraco (<1.3)
                     if BLOCK_WEAK_ATTACK_NEEDS_GOAL and (score_diff != 0) and (minute_int >= 50):
@@ -4403,34 +3975,50 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                                 block_counters["weak_attack_favorite_draw"] += 1
                                 continue
 
-                    # NOVO 3) Se o time que está perdendo enfrenta defesa forte (<1.2)
+                    # NOVO 3) Se o time que está perdendo enfrenta defesa forte (<STRONG_DEFENSE_THRESHOLD)
+                    # Regra do Lucas: se quem está perdendo é o FAVORITO SUPER/ELITE (força >= STRONG_DEF_FAV_MIN_STRENGTH),
+                    # não bloqueia só por enfrentar defesa forte (permitimos a reação). Caso contrário, bloqueia.
                     if BLOCK_STRONG_DEFENSE_FACING and (score_diff != 0) and (minute_int >= 50):
                         trailing_side = "away" if score_diff > 0 else "home"
                         # A defesa que o time perdendo enfrenta é a defesa do time líder
                         facing_defense = defense_home_gpm if trailing_side == "away" else defense_away_gpm
-                        if _is_strong_defense(facing_defense):
-                            block_counters["strong_defense_facing"] += 1
-                            continue
 
-                    # NOVO 4) Em empates, se o favorito enfrenta defesa forte (<STRONG_DEFENSE_THRESHOLD)
-                    # Regra do Lucas: só bloqueia de verdade se o favorito NÃO for SUPER/ELITE (força < 4)
-                    if BLOCK_STRONG_DEFENSE_FACING and (score_diff == 0):
-                        if fav_side in ("home", "away"):
-                            try:
-                                fav_strength_sd = int(fx.get("favorite_strength") or 0)
-                            except (TypeError, ValueError):
-                                fav_strength_sd = 0
-                            # A defesa que o favorito enfrenta é a defesa do adversário
-                            facing_defense = defense_away_gpm if fav_side == "home" else defense_home_gpm
-                            if _is_strong_defense(facing_defense) and (fav_strength_sd < STRONG_DEF_FAV_MIN_STRENGTH):
-                                block_counters["strong_defense_favorite_draw"] += 1
+                        try:
+                            fav_side_sd = fx.get("favorite_side")
+                            fav_strength_sd = int(fx.get("favorite_strength") or 0)
+                        except (TypeError, ValueError):
+                            fav_side_sd = None
+                            fav_strength_sd = 0
+
+                        is_fav_trailing = (fav_side_sd in ("home", "away")) and (fav_side_sd == trailing_side)
+                        fav_attack_trailing = attack_away_gpm if trailing_side == "away" else attack_home_gpm
+
+                        if _is_strong_defense(facing_defense):
+                            # Exceções por tier: força 4/5 libera mais; força 3 libera com menos rigor; força 2 com mais rigor
+                            if is_fav_trailing and _strong_defense_exempt(fav_strength_sd, fav_attack_trailing, facing_defense):
+                                pass
+                            else:
+                                block_counters["strong_defense_facing"] += 1
                                 continue
 
-                    # 5) Se quem está perdendo tem "pouca munição"
+# NOVO 4) Em empates, se o favorito enfrenta defesa forte (<STRONG_DEFENSE_THRESHOLD)
+                    if BLOCK_STRONG_DEFENSE_FACING and (score_diff == 0):
+                        if fav_side in ("home", "away"):
+                            # A defesa que o favorito enfrenta é a defesa do adversário
+                            facing_defense = defense_away_gpm if fav_side == "home" else defense_home_gpm
+                            if _is_strong_defense(facing_defense):
+                                fav_attack_draw = attack_home_gpm if fav_side == "home" else attack_away_gpm
+                                if _strong_defense_exempt(fav_strength, fav_attack_draw, facing_defense):
+                                    pass
+                                else:
+                                    block_counters["strong_defense_favorite_draw"] += 1
+                                    continue
+
+# 5) Se quem está perdendo tem "pouca munição"
                     if (score_diff != 0) and (minute_int >= 50):
                         trailing_side = "away" if score_diff > 0 else "home"
-                        trailing_low_profile = away_low_profile if trailing_side == "away" else home_low_profile
-                        if trailing_low_profile:
+                        trailing_no_ammo = away_no_ammo if trailing_side == "away" else home_no_ammo
+                        if trailing_no_ammo:
                             block_counters["under_team_no_munition"] += 1
                             continue
 
@@ -4455,20 +4043,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         leader_side = "home" if score_diff > 0 else "away"
 
                         if BLOCK_FAVORITE_LEADING and fav_side_eff and leader_side and (fav_side_eff == leader_side):
-                            # NOVO: hard block do favorito na frente por 2+ gols (evita sinal tipo 2–0 aos 52')
-                            if FAVORITE_AHEAD_HARD_BLOCK_ENABLE:
-                                try:
-                                    lead_abs = abs(int(score_diff))
-                                except Exception:
-                                    lead_abs = 0
-                                if (
-                                    (lead_abs >= int(FAVORITE_AHEAD_HARD_BLOCK_DIFF))
-                                    and (int(minute_int) >= int(FAVORITE_AHEAD_HARD_BLOCK_MINUTE))
-                                    and (int(fav_strength_eff or 0) >= int(FAVORITE_AHEAD_HARD_BLOCK_MIN_STRENGTH))
-                                ):
-                                    block_counters["favorite_ahead_hard"] += 1
-                                    continue
-
                             if (abs(int(score_diff)) >= int(FAVORITE_LEAD_BLOCK_GOALS)) and (int(fav_strength_eff or 0) >= int(FAVORITE_BLOCK_MIN_STRENGTH)):
                                 # CORREÇÃO CRÍTICA: Calcular pressure_score antes de usar
                                 pressure_score_quick = _calculate_pressure_score_quick(stats)
@@ -4532,7 +4106,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     block_counters["linha_alta_malus"] += 1
 
                 # Calcula probabilidade
-                league_gpg = _get_effective_league_gpg(fx)
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
                     stats=stats,
@@ -4543,7 +4116,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     pregame_boost_prob=pregame_boost_prob,
                     player_boost_prob=player_boost_prob,
                     context_boost_prob=context_boost_prob,
-                    league_gpg=league_gpg,
                 )
 
                 # CORTE POR GOLEADA / CONTEXTO / PERFIL UNDER/OVER
@@ -4560,17 +4132,8 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     continue
 
                 if abs(score_diff) >= 3 and minute_int >= 50:
-                    # Ultra-accuracy: só bloquear "goleada" quando ela é cenário morto.
-                    # - Se o FAVORITO estiver na frente por 3+, costuma matar a chance de novo gol "necessário".
-                    # - Se o FAVORITO estiver ATRÁS por 3+, ainda pode haver reação no meio do 2º tempo.
-                    fav_ahead_by_3 = (
-                        (fav_side == "home" and score_diff >= 3) or
-                        (fav_side == "away" and score_diff <= -3)
-                    )
-                    if fav_ahead_by_3 or minute_int >= 82:
-                        block_counters["goleada"] += 1
-                        continue
-
+                    block_counters["goleada"] += 1
+                    continue
 
                 # CORREÇÃO: Usar context_boost_prob (sem multiplicar por 100)
                 if context_boost_prob <= -0.015 and score_diff != 0 and minute_int >= 60:
@@ -4585,12 +4148,16 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         block_counters["super_under_draw"] += 1
                         continue
 
-                    # EXCEÇÃO A: favorito forte pressionando (empate)
+                    # EXCEÇÃO A: amplo favorito pressionando
                     fav_side = fx.get("favorite_side")
                     try:
                         fav_strength = int(fx.get("favorite_strength") or 0)
                     except (TypeError, ValueError):
                         fav_strength = 0
+
+                    diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
+
+                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.50)
 
                     if fav_side == "home":
                         opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.3)
@@ -4599,53 +4166,13 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     else:
                         opp_def_weak = False
 
-                    # Defesa do adversário (para calibrar exceções no empate)
-                    if fav_side == "home":
-                        facing_defense_draw = defense_away_gpm
-                    elif fav_side == "away":
-                        facing_defense_draw = defense_home_gpm
-                    else:
-                        facing_defense_draw = None
-                    opp_def_strong_draw = _is_strong_defense(facing_defense_draw)
-
-                    # Regra:
-                    # - Força >= DRAW_FAV_MIN_STRENGTH: libera empate se houver defesa fraca + pressão/contexto mínimos
-                    # - Força >= DRAW_ELITE_MIN_STRENGTH: libera empate mesmo sem defesa fraca, se pressão/contexto forem fortes (elite/super)
-                    # Gate extra (Lucas): em empate, favorito com ataque fraco não empurra sinal
-                    fav_attack_gpm = 0.0
-                    if fav_side == "home":
-                        fav_attack_gpm = attack_home_gpm
-                    elif fav_side == "away":
-                        fav_attack_gpm = attack_away_gpm
-                    if (fav_side in ("home","away")) and (fav_attack_gpm < DRAW_MIN_FAV_ATTACK_GPM):
-                        block_counters["weak_attack_favorite_draw"] += 1
-                        continue
-                    # Empate: liberar a partir da força 2, mas com critérios mais fortes quando for só "força 2"
-                    draw_min_pressure = float(DRAW_MIN_PRESSURE)
-                    draw_min_context = float(DRAW_MIN_CONTEXT_BOOST)
-                    draw_min_attack = float(DRAW_MIN_FAV_ATTACK_GPM)
-                    if int(fav_strength) == 2:
-                        draw_min_pressure += float(DRAW_T2_EXTRA_PRESSURE)
-                        draw_min_context += float(DRAW_T2_EXTRA_CONTEXT)
-                        draw_min_attack += float(DRAW_T2_EXTRA_ATTACK_GPM)
-
-                    allow_draw_fav = (
-                        (fav_strength >= DRAW_FAV_MIN_STRENGTH) and (fav_side in ("home", "away"))
+                    # CORREÇÃO: Usar context_boost_prob direto (não multiplicado)
+                    allow_big_fav_amass = (
+                        big_fav
                         and opp_def_weak
-                        and (metrics["pressure_score"] >= draw_min_pressure)
-                        and (context_boost_prob >= draw_min_context)
-                        and (fav_attack_gpm >= draw_min_attack)
+                        and (metrics["pressure_score"] >= 4.0)
+                        and (context_boost_prob >= 0.007)
                     )
-
-                    allow_draw_elite = (
-                        (fav_strength >= DRAW_ELITE_MIN_STRENGTH) and (fav_side in ("home", "away"))
-                        and (metrics["pressure_score"] >= DRAW_ELITE_MIN_PRESSURE)
-                        and (context_boost_prob >= DRAW_ELITE_MIN_CONTEXT_BOOST)
-                        and (fav_attack_gpm >= DRAW_MIN_FAV_ATTACK_GPM)
-                        and (minute_int >= DRAW_ELITE_MIN_MINUTE)
-                    )
-
-                    allow_big_fav_amass = (allow_draw_fav or allow_draw_elite)
 
                     # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over"
                     home_super_over = _is_super_over_team(attack_home_gpm, defense_home_gpm)
@@ -4655,10 +4182,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         and (metrics["pressure_score"] >= 7.5)
                         and (context_boost_prob >= 0.012)
                         and (minute_int >= 50)
-                        # Blindagem: empate sem favorito identificado NÃO passa
-                        and (fav_strength >= DRAW_FAV_MIN_STRENGTH)
-                        # Se o favorito enfrenta defesa forte, só libera se for SUPER/ELITE (4/5)
-                        and ((not opp_def_strong_draw) or (fav_strength >= STRONG_DEF_FAV_MIN_STRENGTH))
                     )
 
                     if not (allow_big_fav_amass or allow_both_super_over):
@@ -4679,7 +4202,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # Desconfiança em linhas altas (3.5+): exige pressão maior
                 if linha_num >= HIGH_LINE_START:
                     steps_high = int((linha_num - 2.5) // 1.0)
-                    req_pressure = MIN_PRESSURE_SCORE + (HIGH_LINE_PRESSURE_STEP * steps_high * _high_line_league_multiplier(league_gpg))
+                    req_pressure = MIN_PRESSURE_SCORE + (HIGH_LINE_PRESSURE_STEP * steps_high)
                     if metrics["pressure_score"] < req_pressure:
                         block_counters["pressure_threshold"] += 1
                         continue
@@ -4740,9 +4263,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
         logging.info(f"🔍 RESUMO DE BLOQUEIOS: {block_counters}")
         total_blocked = sum(block_counters.values())
         logging.info(f"   Total de fixtures bloqueadas: {total_blocked}")
-
-    if form_adjustments > 0:
-        logging.info(f"ℹ️ Ajustes de forma aplicados (não bloqueia): {form_adjustments}")
 
     # Formatar os principais bloqueios para o status
     block_lines = []
@@ -5031,12 +4551,10 @@ async def cmd_prelive_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         dt_utc = datetime.fromtimestamp(max(0, ts), tz=timezone.utc)
         dt_local = dt_utc.astimezone(tz) if tz else dt_utc
         hhmm = dt_local.strftime("%d/%m %H:%M")
-        lines.append("{t} — {home} vs {away} — {lname}{lc} (fixture={fid}, liga={lid})".format(
+        lines.append("{t} — {home} vs {away} (fixture={fid}, liga={lid})".format(
             t=hhmm,
             home=str(fx.get("home_team") or "?"),
             away=str(fx.get("away_team") or "?"),
-            lname=str(fx.get("league_name") or ""),
-            lc=(" — " + str(fx.get("league_country") or "")) if (fx.get("league_country") or "") else "",
             fid=int(fx.get("fixture_id") or 0),
             lid=int(fx.get("league_id") or 0),
         ))
