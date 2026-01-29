@@ -119,6 +119,30 @@ def _parse_league_weights(raw: str) -> Dict[int, float]:
     mapping: Dict[int, float] = {}
     if not raw:
         return mapping
+
+def _parse_league_gpg(raw: str) -> Dict[int, float]:
+    """
+    Converte string "39:2.90;140:2.55" em {39: 2.90, 140: 2.55}.
+    Usado para ajustar penalidade de linhas altas pela média de gols da liga (GPG).
+    """
+    mapping: Dict[int, float] = {}
+    if not raw:
+        return mapping
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        lid_str, val_str = part.split(":", 1)
+        try:
+            lid = int(lid_str.strip())
+            val = float(val_str.strip())
+        except ValueError:
+            continue
+        if val <= 0:
+            continue
+        mapping[lid] = val
+    return mapping
+
     parts = raw.split(";")
     for part in parts:
         part = part.strip()
@@ -377,6 +401,16 @@ DRAW_ELITE_MIN_MINUTE: int = _get_env_int("DRAW_ELITE_MIN_MINUTE", 50)
 HIGH_LINE_START: float = _get_env_float("HIGH_LINE_START", 3.5)
 HIGH_LINE_STEP_MALUS_PROB: float = _get_env_float("HIGH_LINE_STEP_MALUS_PROB", 0.012)
 HIGH_LINE_PRESSURE_STEP: float = _get_env_float("HIGH_LINE_PRESSURE_STEP", 1.0)
+
+# NOVO: Média de gols por jogo (GPG) por liga (para calibrar linhas altas por perfil da liga)
+LEAGUE_GPG_RAW: str = _get_env_str("LEAGUE_GPG", "")
+LEAGUE_GPG: Dict[int, float] = _parse_league_gpg(LEAGUE_GPG_RAW)
+
+# NOVO: calibração da penalidade de linha alta por GPG da liga
+HIGH_LINE_USE_LEAGUE_GPG: int = _get_env_int("HIGH_LINE_USE_LEAGUE_GPG", 1)
+HIGH_LINE_BASE_GPG: float = _get_env_float("HIGH_LINE_BASE_GPG", 2.5)
+HIGH_LINE_LEAGUE_MULT_MIN: float = _get_env_float("HIGH_LINE_LEAGUE_MULT_MIN", 0.75)
+HIGH_LINE_LEAGUE_MULT_MAX: float = _get_env_float("HIGH_LINE_LEAGUE_MULT_MAX", 1.50)
 
 # NOVO: Sistema de pesos por importância das ligas
 LEAGUE_WEIGHTS_RAW: str = _get_env_str("LEAGUE_WEIGHTS", "39:1.2;140:1.1;78:1.15;135:1.1;61:1.1;88:1.1;94:1.0;203:1.0")
@@ -669,6 +703,59 @@ def _get_domestic_league_for_team(team_id: Optional[int]) -> Optional[int]:
     if team_id is None:
         return None
     return TEAM_DOMESTIC_LEAGUE_MAP.get(int(team_id))
+
+
+def _get_effective_league_gpg(fx: Dict[str, Any]) -> Optional[float]:
+    """GPG representativo para o fixture.
+    Preferência em copas/internacionais: média dos GPG das ligas domésticas dos dois times (se disponíveis).
+    Fallback: GPG da liga do fixture (fx['league_id']).
+    """
+    try:
+        lid = int(fx.get("league_id") or 0)
+    except Exception:
+        lid = 0
+
+    if USE_DOMESTIC_LEAGUE_STATS:
+        home_tid = fx.get("home_team_id")
+        away_tid = fx.get("away_team_id")
+        home_lid = _get_domestic_league_for_team(int(home_tid)) if home_tid is not None else None
+        away_lid = _get_domestic_league_for_team(int(away_tid)) if away_tid is not None else None
+
+        vals = []
+        if home_lid is not None:
+            g = LEAGUE_GPG.get(int(home_lid))
+            if g:
+                vals.append(float(g))
+        if away_lid is not None:
+            g = LEAGUE_GPG.get(int(away_lid))
+            if g:
+                vals.append(float(g))
+        if vals:
+            return sum(vals) / float(len(vals))
+
+    if lid and lid in LEAGUE_GPG:
+        return float(LEAGUE_GPG[lid])
+    return None
+
+def _high_line_league_multiplier(league_gpg: Optional[float]) -> float:
+    """Multiplicador do malus/exigência de pressão para linhas altas, baseado no GPG da liga."""
+    if not HIGH_LINE_USE_LEAGUE_GPG:
+        return 1.0
+    if league_gpg is None:
+        return 1.0
+    try:
+        g = float(league_gpg)
+    except Exception:
+        return 1.0
+    if g <= 0:
+        return 1.0
+    base = float(HIGH_LINE_BASE_GPG) if HIGH_LINE_BASE_GPG > 0 else 2.5
+    mult = base / g
+    if mult < float(HIGH_LINE_LEAGUE_MULT_MIN):
+        mult = float(HIGH_LINE_LEAGUE_MULT_MIN)
+    if mult > float(HIGH_LINE_LEAGUE_MULT_MAX):
+        mult = float(HIGH_LINE_LEAGUE_MULT_MAX)
+    return mult
 
 async def _fetch_team_domestic_stats(
     client: httpx.AsyncClient,
@@ -3747,6 +3834,7 @@ def _estimate_prob_and_odd(
     pregame_boost_prob: float = 0.0,
     player_boost_prob: float = 0.0,
     context_boost_prob: float = 0.0,
+    league_gpg: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     MODIFICAÇÃO: NÃO usar odd real - sempre usar odd_fair (EV será 0).
@@ -3842,7 +3930,8 @@ def _estimate_prob_and_odd(
     if linha_gols >= HIGH_LINE_START:
         steps_high = int((linha_gols - 2.5) // 1.0)
         if steps_high > 0:
-            base_prob -= steps_high * float(HIGH_LINE_STEP_MALUS_PROB)
+            hl_mult = _high_line_league_multiplier(league_gpg)
+            base_prob -= steps_high * float(HIGH_LINE_STEP_MALUS_PROB) * hl_mult
 
     p_final = max(0.20, min(0.93, base_prob))
 
@@ -3865,6 +3954,7 @@ def _estimate_prob_and_odd(
         "player_boost_prob": player_boost_prob,
         "context_boost_prob": context_boost_prob,
         "lucas_boost_prob": lucas_boost_prob,
+        "high_line_mult": _high_line_league_multiplier(league_gpg),
     }
 
 def _suggest_stake_pct(ev_pct: float, odd_current: float) -> float:
@@ -4442,6 +4532,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     block_counters["linha_alta_malus"] += 1
 
                 # Calcula probabilidade
+                league_gpg = _get_effective_league_gpg(fx)
                 metrics = _estimate_prob_and_odd(
                     minute=fx["minute"],
                     stats=stats,
@@ -4452,6 +4543,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     pregame_boost_prob=pregame_boost_prob,
                     player_boost_prob=player_boost_prob,
                     context_boost_prob=context_boost_prob,
+                    league_gpg=league_gpg,
                 )
 
                 # CORTE POR GOLEADA / CONTEXTO / PERFIL UNDER/OVER
@@ -4587,7 +4679,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 # Desconfiança em linhas altas (3.5+): exige pressão maior
                 if linha_num >= HIGH_LINE_START:
                     steps_high = int((linha_num - 2.5) // 1.0)
-                    req_pressure = MIN_PRESSURE_SCORE + (HIGH_LINE_PRESSURE_STEP * steps_high)
+                    req_pressure = MIN_PRESSURE_SCORE + (HIGH_LINE_PRESSURE_STEP * steps_high * _high_line_league_multiplier(league_gpg))
                     if metrics["pressure_score"] < req_pressure:
                         block_counters["pressure_threshold"] += 1
                         continue
