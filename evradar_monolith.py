@@ -349,20 +349,6 @@ HIGH_LINE_PRESSURE_STEP: float = _get_env_float("HIGH_LINE_PRESSURE_STEP", 1.0)
 LEAGUE_WEIGHTS_RAW: str = _get_env_str("LEAGUE_WEIGHTS", "39:1.2;140:1.1;78:1.15;135:1.1;61:1.1;88:1.1;94:1.0;203:1.0")
 LEAGUE_WEIGHTS: Dict[int, float] = _parse_league_weights(LEAGUE_WEIGHTS_RAW)
 
-# Ajustes opcionais para copas/torneios (tendem a ser mais caóticos que ligas)
-CUP_LEAGUE_IDS_RAW: str = _get_env_str("CUP_LEAGUE_IDS", "")  # ex: "2,3,4,5"
-CUP_LEAGUE_IDS: set = set([int(x) for x in re.split(r"[;,\s]+", CUP_LEAGUE_IDS_RAW.strip()) if x.strip().isdigit()]) if CUP_LEAGUE_IDS_RAW.strip() else set()
-
-CUP_PREMATCH_MULT: float = _get_env_float("CUP_PREMATCH_MULT", 0.90)   # reduz peso do pré-jogo em copas
-CUP_CONTEXT_MULT: float = _get_env_float("CUP_CONTEXT_MULT", 0.95)     # leve redução no contexto em copas
-CUP_MIN_PRESSURE_ADD: float = _get_env_float("CUP_MIN_PRESSURE_ADD", 0.5)  # pressão mínima adicional em copas
-CUP_DRAW_EXTRA_CONTEXT: float = _get_env_float("CUP_DRAW_EXTRA_CONTEXT", 0.002)  # exigência extra em empates
-
-# Log opcional de eventos (para calibrar o "faro de gol" com o tempo)
-ENABLE_EVENT_LOG: int = _get_env_int("ENABLE_EVENT_LOG", 1)
-EVENT_LOG_PATH: str = _get_env_str("EVENT_LOG_PATH", "evradar_events.jsonl")
-
-
 # NOVO: Mapeamento de time para liga doméstica (para confrontos internacionais)
 TEAM_DOMESTIC_LEAGUE_MAP_RAW: str = _get_env_str("TEAM_DOMESTIC_LEAGUE_MAP", "")
 TEAM_DOMESTIC_LEAGUE_MAP: Dict[int, int] = _parse_team_domestic_league_map(TEAM_DOMESTIC_LEAGUE_MAP_RAW)
@@ -626,33 +612,6 @@ def _get_league_weight(league_id: Optional[int]) -> float:
     if league_id is None:
         return 1.0
     return LEAGUE_WEIGHTS.get(int(league_id), 1.0)
-
-def _is_cup_competition(league_id: Optional[int], league_name: Optional[str]) -> bool:
-    """Heurística simples para identificar copas/torneios."""
-    try:
-        if league_id is not None and int(league_id) in CUP_LEAGUE_IDS:
-            return True
-    except Exception:
-        pass
-    name = (league_name or "").lower()
-    if any(k in name for k in ["uefa", "champions", "europa", "conference", "copa", "cup", "taça", "taca", "knockout", "mata-mata"]):
-        return True
-    return False
-
-def _log_event(kind: str, payload: Dict[str, Any]) -> None:
-    if not ENABLE_EVENT_LOG:
-        return
-    try:
-        import json as _json
-        from datetime import datetime as _dt
-        rec = {"ts": _dt.utcnow().isoformat(), "kind": kind}
-        if isinstance(payload, dict):
-            rec.update(payload)
-        line = _json.dumps(rec, ensure_ascii=False)
-        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        return
 
 def _get_domestic_league_for_team(team_id: Optional[int]) -> Optional[int]:
     """Retorna o ID da liga doméstica (nacional) para um time."""
@@ -3416,12 +3375,6 @@ async def _get_pregame_boost_for_fixture(
         )
         context_boost = 0.0
 
-    # Ajuste extra para copas/torneios (mais variância/rotação)
-    is_cup_comp = _is_cup_competition(fixture.get("league_id"), fixture.get("league_name"))
-    if is_cup_comp:
-        pregame_total *= float(CUP_PREMATCH_MULT)
-        context_boost *= float(CUP_CONTEXT_MULT)
-
     # Ajuste do contexto pelo tipo de time (over x under)
     try:
         attack_home_gpm = fixture.get("attack_home_gpm", 0.0)
@@ -3608,11 +3561,8 @@ def _estimate_prob_and_odd(
         pressure_score = 10.0
 
     # Base levemente mais agressiva que a versão anterior
-    base_prob = 0.40
-    base_prob += (pressure_score / 10.0) * 0.26
-    # Pressão muito alta ganha um extra leve (sem dominar o contexto)
-    if pressure_score >= 7.0:
-        base_prob += ((pressure_score - 7.0) / 3.0) * 0.05
+    base_prob = 0.38
+    base_prob += (pressure_score / 10.0) * 0.37
 
     # Tempo de jogo
     if minute <= 50:
@@ -4240,7 +4190,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                     diff_rating = (rating_home or 0.0) - (rating_away or 0.0)
 
-                    big_fav = ((fav_side in ("home","away")) and ((fav_strength >= 2) or (abs(diff_rating) >= 0.50)))
+                    big_fav = (fav_strength >= 2) or (abs(diff_rating) >= 0.50)
 
                     if fav_side == "home":
                         opp_def_weak = (defense_away_gpm is not None) and (defense_away_gpm >= 1.3)
@@ -4250,12 +4200,11 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                         opp_def_weak = False
 
                     # CORREÇÃO: Usar context_boost_prob direto (não multiplicado)
-                    is_cup_comp = _is_cup_competition(fx.get("league_id"), fx.get("league_name"))
                     allow_big_fav_amass = (
                         big_fav
                         and opp_def_weak
-                        and (metrics["pressure_score"] >= (4.0 + (CUP_MIN_PRESSURE_ADD if is_cup_comp else 0.0)))
-                        and (context_boost_prob >= (0.007 + (CUP_DRAW_EXTRA_CONTEXT if is_cup_comp else 0.0)))
+                        and (metrics["pressure_score"] >= 4.0)
+                        and (context_boost_prob >= 0.007)
                     )
 
                     # EXCEÇÃO B: mesmo equilibrado, só libera se os dois forem "super over"
@@ -4317,20 +4266,6 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if ALLOW_WATCH_ALERTS:
                         alert_text = _format_watch_text(fx, metrics)
                         alerts.append(alert_text)
-                        _log_event("alert", {
-                            "fixture_id": fx.get("fixture_id"),
-                            "league_id": fx.get("league_id"),
-                            "league": fx.get("league_name"),
-                            "minute": fx.get("minute"),
-                            "score": "{hg}–{ag}".format(hg=fx.get("home_goals"), ag=fx.get("away_goals")),
-                            "line": (int(fx.get("home_goals") or 0) + int(fx.get("away_goals") or 0) + 0.5),
-                            "pressure": metrics.get("pressure_score"),
-                            "context": metrics.get("context_boost_prob"),
-                            "pregame": metrics.get("pregame_boost_prob"),
-                            "news": metrics.get("news_boost_prob"),
-                            "fav_strength": fx.get("favorite_strength"),
-                            "fav_side": fx.get("favorite_side"),
-                        })
                         fixture_last_alert_at[cd_key] = now
                     continue
                 elif api_odd is not None and api_odd > MAX_ODD:
@@ -4341,38 +4276,10 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                     if api_odd is None and ALLOW_ALERTS_WITHOUT_ODDS:
                         alert_text = _format_manual_no_odds_text(fx, metrics)
                         alerts.append(alert_text)
-                        _log_event("alert", {
-                            "fixture_id": fx.get("fixture_id"),
-                            "league_id": fx.get("league_id"),
-                            "league": fx.get("league_name"),
-                            "minute": fx.get("minute"),
-                            "score": "{hg}–{ag}".format(hg=fx.get("home_goals"), ag=fx.get("away_goals")),
-                            "line": (int(fx.get("home_goals") or 0) + int(fx.get("away_goals") or 0) + 0.5),
-                            "pressure": metrics.get("pressure_score"),
-                            "context": metrics.get("context_boost_prob"),
-                            "pregame": metrics.get("pregame_boost_prob"),
-                            "news": metrics.get("news_boost_prob"),
-                            "fav_strength": fx.get("favorite_strength"),
-                            "fav_side": fx.get("favorite_side"),
-                        })
                         fixture_last_alert_at[cd_key] = now
                     elif api_odd is not None:
                         alert_text = _format_alert_text(fx, metrics)
                         alerts.append(alert_text)
-                        _log_event("alert", {
-                            "fixture_id": fx.get("fixture_id"),
-                            "league_id": fx.get("league_id"),
-                            "league": fx.get("league_name"),
-                            "minute": fx.get("minute"),
-                            "score": "{hg}–{ag}".format(hg=fx.get("home_goals"), ag=fx.get("away_goals")),
-                            "line": (int(fx.get("home_goals") or 0) + int(fx.get("away_goals") or 0) + 0.5),
-                            "pressure": metrics.get("pressure_score"),
-                            "context": metrics.get("context_boost_prob"),
-                            "pregame": metrics.get("pregame_boost_prob"),
-                            "news": metrics.get("news_boost_prob"),
-                            "fav_strength": fx.get("favorite_strength"),
-                            "fav_side": fx.get("favorite_side"),
-                        })
                         fixture_last_alert_at[cd_key] = now
 
             except Exception:
