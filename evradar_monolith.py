@@ -30,7 +30,6 @@ import signal
 import logging
 import os
 import json
-import re
 import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
