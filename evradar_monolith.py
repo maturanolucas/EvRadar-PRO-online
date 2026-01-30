@@ -216,13 +216,6 @@ STRONG_DEF_EXEMPT_S3_MIN_ATTACK_GPM: float = _get_env_float("STRONG_DEF_EXEMPT_S
 # Para força 2: libera só com ataque muito forte
 STRONG_DEF_EXEMPT_S2_MIN_ATTACK_GPM: float = _get_env_float("STRONG_DEF_EXEMPT_S2_MIN_ATTACK_GPM", 1.85)
 
-# NOVO: Reduz boost quando o "underdog" (time que está na frente) está em boa fase/perfil sólido.
-# Ideia Lucas-style: se o líder não é frágil, o boost de "favorito perdendo" não deve disparar no automático.
-UNDERDOG_GOODFORM_REDUCE_ENABLE: int = _get_env_int("UNDERDOG_GOODFORM_REDUCE_ENABLE", 1)
-UNDERDOG_GOODFORM_ATTACK_MIN: float = _get_env_float("UNDERDOG_GOODFORM_ATTACK_MIN", 1.55)
-UNDERDOG_GOODFORM_DEF_MAX: float = _get_env_float("UNDERDOG_GOODFORM_DEF_MAX", 1.35)
-UNDERDOG_GOODFORM_REDUCE_FACTOR: float = _get_env_float("UNDERDOG_GOODFORM_REDUCE_FACTOR", 0.75)
-
 
 # Cooldown e pressão mínima
 COOLDOWN_MINUTES: int = _get_env_int("COOLDOWN_MINUTES", 6)
@@ -3142,32 +3135,6 @@ def _compute_score_context_boost(
         boost -= 0.012
     if fav_side == "away" and away_under and score_diff <= 0:
         boost -= 0.010
-
-    # 3.5) Lucas-style: se o líder (underdog) é sólido (boa fase/perfil), reduz o boost de "favorito perdendo".
-    # Isso evita sinais "menos claros" quando o favorito está atrás, mas o adversário não é frágil.
-    if UNDERDOG_GOODFORM_REDUCE_ENABLE and fav_side in ("home", "away"):
-        trailing_by_1 = (
-            (fav_side == "home" and score_diff == -1) or
-            (fav_side == "away" and score_diff == 1)
-        )
-        if trailing_by_1:
-            # líder é o lado oposto ao favorito
-            leader_attack = attack_away_gpm if fav_side == "home" else attack_home_gpm
-            leader_defense = defense_away_gpm if fav_side == "home" else defense_home_gpm
-            try:
-                la = float(leader_attack or 0.0)
-                ld = float(leader_defense or 9.9)
-            except (TypeError, ValueError):
-                la, ld = 0.0, 9.9
-            # Se o líder tem ataque ok e defesa sólida, o cenário não é "underdog frágil".
-            if la >= float(UNDERDOG_GOODFORM_ATTACK_MIN) and ld <= float(UNDERDOG_GOODFORM_DEF_MAX):
-                # Aplica redução apenas em boost positivo (não mexe em penalidades).
-                if boost > 0:
-                    factor = max(0.40, min(1.00, float(UNDERDOG_GOODFORM_REDUCE_FACTOR)))
-                    boost *= factor
-                    logging.info(
-                        f"Fixture {fixture.get('fixture_id')}: líder sólido (atk={la:.2f}, def={ld:.2f}) → reduz boost favorito perdendo (x{factor:.2f})"
-                    )
 
     # 4) Escala por minuto (teu janela)
     if minute_int < 50:
