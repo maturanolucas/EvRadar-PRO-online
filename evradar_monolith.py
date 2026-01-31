@@ -29,6 +29,7 @@ import contextlib
 import signal
 import logging
 import os
+import re
 import json
 import tempfile
 from typing import Optional, List, Dict, Any, Tuple
@@ -196,8 +197,8 @@ LEAD_BY_2_MINUTE: int = _get_env_int("LEAD_BY_2_MINUTE", 50)
 BLOCK_SUPER_UNDER_LEADING: int = _get_env_int("BLOCK_SUPER_UNDER_LEADING", 1)
 
 # NOVO: Bloqueio quando time que precisa do gol tem ataque fraco (<1.3 gols/jogo)
-BLOCK_WEAK_ATTACK_NEEDS_GOAL: int = _get_env_int("BLOCK_WEAK_ATTACK_NEEDS_GOAL", 0)  # DESLIGADO por padrão
-WEAK_ATTACK_THRESHOLD: float = _get_env_float("WEAK_ATTACK_THRESHOLD", 1.2)  # Ajustado para 1.2
+BLOCK_WEAK_ATTACK_NEEDS_GOAL: int = _get_env_int("BLOCK_WEAK_ATTACK_NEEDS_GOAL", _get_env_int("BLOCK_LOW_PROFILE_NEEDS_GOAL", 1))  # ligado por padrão (herda BLOCK_LOW_PROFILE_NEEDS_GOAL)
+WEAK_ATTACK_THRESHOLD: float = _get_env_float("WEAK_ATTACK_THRESHOLD", 1.45)  # ataque mínimo "ok" (padrão Lucas)
 NEEDS_GOAL_MIN_ATTACK_GPM: float = _get_env_float("NEEDS_GOAL_MIN_ATTACK_GPM", WEAK_ATTACK_THRESHOLD)
 NEEDS_GOAL_MIN_CONCEDE_GPM: float = _get_env_float("NEEDS_GOAL_MIN_CONCEDE_GPM", 1.50)
 BLOCK_LOW_PROFILE_NEEDS_GOAL: int = _get_env_int("BLOCK_LOW_PROFILE_NEEDS_GOAL", 1)  # substitui no_ammo hardcoded
@@ -365,6 +366,14 @@ DRAW_MIN_PRESSURE: float = _get_env_float("DRAW_MIN_PRESSURE", 4.0)
 DRAW_MIN_CONTEXT_BOOST: float = _get_env_float("DRAW_MIN_CONTEXT_BOOST", 0.01)
 DRAW_MIN_FAV_ATTACK_GPM: float = _get_env_float("DRAW_MIN_FAV_ATTACK_GPM", 1.45)
 DRAW_T2_EXTRA_PRESSURE: float = _get_env_float("DRAW_T2_EXTRA_PRESSURE", 0.8)
+DRAW_BOTH_WEAK_ATTACK_MAX: float = _get_env_float("DRAW_BOTH_WEAK_ATTACK_MAX", 1.35)
+DRAW_BLOCK_BOTH_WEAK_ATTACK: int = _get_env_int("DRAW_BLOCK_BOTH_WEAK_ATTACK", 1)
+DRAW_BOTH_WEAK_ATTACK_ALLOW_PRESSURE: float = _get_env_float("DRAW_BOTH_WEAK_ATTACK_ALLOW_PRESSURE", 5.5)
+DRAW_BOTH_WEAK_ATTACK_ALLOW_CONTEXT: float = _get_env_float("DRAW_BOTH_WEAK_ATTACK_ALLOW_CONTEXT", 0.018)
+FORCE0_DRAW_MIN_ATTACK_GPM: float = _get_env_float("FORCE0_DRAW_MIN_ATTACK_GPM", 1.55)
+FORCE0_DRAW_MIN_DEFENSE_BAD_GPM: float = _get_env_float("FORCE0_DRAW_MIN_DEFENSE_BAD_GPM", 1.35)
+FORCE0_BLOCK_DRAWS: int = _get_env_int("FORCE0_BLOCK_DRAWS", 1)
+
 DRAW_T2_EXTRA_CONTEXT: float = _get_env_float("DRAW_T2_EXTRA_CONTEXT", 0.004)
 DRAW_T2_EXTRA_ATTACK_GPM: float = _get_env_float("DRAW_T2_EXTRA_ATTACK_GPM", 0.05)
 
@@ -625,24 +634,17 @@ def _get_cached_odd_for_line(fixture_id: int, total_goals: int) -> Optional[floa
         return cached_odd
     return None
 
-def _cooldown_key(fixture_id: int, home_goals: int, away_goals: int) -> str:
-    """Gera chave de cooldown que muda quando o placar muda (logo, muda a linha)."""
+def _cooldown_key(fixture_id: int, home_goals: int, away_goals: int, linha_num: Optional[float] = None) -> str:
+    """Chave de cooldown por fixture + placar + linha (evita spam do mesmo cenário)."""
     try:
-        hg = int(home_goals)
+        ln = float(linha_num) if linha_num is not None else -1.0
     except Exception:
-        hg = 0
-    try:
-        ag = int(away_goals)
-    except Exception:
-        ag = 0
-    total_goals = hg + ag
-    line = float(total_goals) + 0.5
-    return f"{int(fixture_id)}:{hg}-{ag}:over{line:.1f}"
-
-# ---------------------------------------------------------------------------
-# Funções auxiliares do cérebro - NOVAS FUNÇÕES PARA LIGAS DOMÉSTICAS
-# ---------------------------------------------------------------------------
-
+        ln = -1.0
+    if ln >= 0:
+        ln_bucket = round(ln * 2) / 2.0
+    else:
+        ln_bucket = -1.0
+    return f"{fixture_id}:{home_goals}-{away_goals}:{ln_bucket}"
 def _get_league_weight(league_id: Optional[int]) -> float:
     """Retorna o peso da liga baseado na importância. Padrão 1.0."""
     if league_id is None:
@@ -4433,8 +4435,20 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
                 home_under = _is_team_under_profile(attack_home_gpm, defense_home_gpm)
                 away_under = _is_team_under_profile(attack_away_gpm, defense_away_gpm)
 
+                # BLOQUEIO DURO: empate com time under (teu padrão) -> não manda sinal
+                if (score_diff == 0) and (home_under or away_under or match_super_under):
+                    block_counters["super_under_draw"] += 1
+                    continue
+
+
                 # CORREÇÃO: Malus para super under com linha alta (não bloqueio)
                 linha_num = total_goals + 0.5
+
+                # Força 0 = jogo equilibrado: não aceitamos linha alta (3.5+) aqui
+                if (fav_strength == 0) and (linha_num >= 3.5):
+                    block_counters["linha_alta_malus"] += 1
+                    continue
+
                 if match_super_under and linha_num >= 2.5:
                     # Aplica malus em vez de bloquear
                     malus = 0.05 * (linha_num - 2.5) / 1.0
@@ -4605,7 +4619,7 @@ async def run_scan_cycle(origin: str, application: Application) -> List[str]:
 
                 now = _now_utc()
                 fixture_id = fx["fixture_id"]
-                cd_key = _cooldown_key(fixture_id, fx.get("home_goals", 0), fx.get("away_goals", 0))
+                cd_key = _cooldown_key(fixture_id, fx.get("home_goals", 0), fx.get("away_goals", 0), linha_num)
                 last_ts = fixture_last_alert_at.get(cd_key)
                 if last_ts is not None:
                     if (now - last_ts) < timedelta(minutes=COOLDOWN_MINUTES):
