@@ -3861,18 +3861,15 @@ def _estimate_prob_and_odd(
     base_prob += player_boost_prob
     base_prob += context_boost_prob
 
-    # Boost extra "padrão Lucas"
     lucas_boost_prob = _compute_lucas_pattern_boost(
         minute=minute,
         home_goals=home_goals,
         away_goals=away_goals,
         pressure_score=pressure_score,
         context_boost_prob=context_boost_prob,
+    )
 
-    # =========================
-    # CONTEXT ENGINE LUCAS
-    # =========================
-
+    base_prob += lucas_boost_prob
     recent_attack_bonus = 0.0
     recent_defense_bonus = 0.0
     chaos_bonus = 0.0
